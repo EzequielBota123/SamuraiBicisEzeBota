@@ -7,18 +7,20 @@ import {
   updateProduct,
   deleteProductById,
   subscribeProducts,
+  listProductsByBrand,
+  uploadProductImages,
 } from "../../services/products";
 import { LoadingOverlay } from "../../components/ui/LoadingIndicators";
 import { subscribeProductTypes } from "../../services/productTypes";
 import { ensureSheetJs } from "../../utils/sheetjs";
 
 const statusStyles = {
-  true: "border border-emerald-200 bg-emerald-50 text-emerald-600",
-  false: "border border-slate-200 bg-slate-100 text-slate-500",
+  true: "border border-emerald-200 bg-emerald-50 text-emerald-600 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400",
+  false: "border border-slate-200 bg-slate-100 text-slate-500 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-400",
 };
 
-function money(n) {
-  return Number(n || 0).toLocaleString("en-US", { style: "currency", currency: "USD" });
+function moneyArs(n) {
+  return Number(n || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 });
 }
 
 const LEGACY_PREFIX = "legacy:";
@@ -54,6 +56,44 @@ export default function Products() {
   const [syncStatus, setSyncStatus]   = useState(null);
   const [syncing, setSyncing]         = useState(false);
   const [syncMessage, setSyncMessage] = useState("");
+  const [bowieUploading, setBowieUploading] = useState(false);
+  const [bowieMessage, setBowieMessage] = useState("");
+
+  // Herramienta de un solo uso: reparte 3 fotos (una por color) a los 9
+  // productos Bowie segun el color mencionado en el nombre de cada uno.
+  async function handleBowiePhotos(e) {
+    const files = Array.from(e.target.files || []);
+    e.target.value = "";
+    if (files.length === 0) return;
+    setBowieUploading(true);
+    setBowieMessage("");
+    try {
+      const colorByFile = (name) => {
+        const n = name.toLowerCase();
+        if (n.includes("gris-celeste") || n.includes("gris_celeste")) return "GRIS-CELESTE";
+        if (n.includes("azul-celeste") || n.includes("azul_celeste")) return "AZUL-CELESTE";
+        if (n.includes("negro-gris") || n.includes("negro_gris")) return "NEGRO-GRIS";
+        return null;
+      };
+      const products = await listProductsByBrand("Bowie");
+      let updated = 0;
+      for (const file of files) {
+        const color = colorByFile(file.name);
+        if (!color) continue;
+        const matches = products.filter((p) => (p.name || "").toUpperCase().includes(color));
+        for (const p of matches) {
+          const [url] = await uploadProductImages(p.id, [file]);
+          await updateProduct(p.id, { images: [url] });
+          updated++;
+        }
+      }
+      setBowieMessage(`Listo, ${updated} producto(s) actualizados con foto.`);
+    } catch (err) {
+      setBowieMessage(err.message || "Error subiendo las fotos.");
+    } finally {
+      setBowieUploading(false);
+    }
+  }
 
   useEffect(() => {
     const unsub = subscribeToSyncStatus(setSyncStatus);
@@ -66,7 +106,7 @@ export default function Products() {
     setSyncMessage("");
     try {
       const result = await triggerSync();
-      setSyncMessage(`Sync completada: ${result.updated} productos actualizados de ${result.total}.`);
+      setSyncMessage(`Sync completada: ${result.updated} producto(s) del catálogo actualizados (revisamos ${result.total} conceptos en Contabilium).`);
     } catch (err) {
       setSyncMessage(`Error: ${err.message}`);
     } finally {
@@ -184,16 +224,16 @@ export default function Products() {
 
   return (
     <div className="space-y-8">
-      <section className="relative overflow-hidden rounded-3xl border border-slate-200 bg-white p-8 shadow-[0_45px_80px_-50px_rgba(15,23,42,0.2)]">
+      <section className="relative overflow-hidden rounded-3xl border border-slate-200 bg-white p-8 shadow-[0_45px_80px_-50px_rgba(15,23,42,0.2)] dark:border-neutral-800 dark:bg-neutral-900 dark:shadow-none dark:ring-1 dark:ring-white/5">
         <div className="absolute -right-28 top-1/2 h-64 w-64 -translate-y-1/2 rounded-full bg-fuchsia-500/25 blur-3xl" />
         <div className="relative flex flex-col gap-6 sm:flex-row sm:items-center sm:justify-between">
           <div className="space-y-3">
-            <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-4 py-2 text-xs uppercase tracking-[0.3em] text-slate-500">
+            <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-4 py-2 text-xs uppercase tracking-[0.3em] text-slate-500 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-400">
               Inventario vivo
             </div>
             <div>
-              <h1 className="text-3xl font-semibold text-slate-900">Productos</h1>
-              <p className="mt-3 max-w-xl text-sm text-slate-500">
+              <h1 className="text-3xl font-semibold text-slate-900 dark:text-white">Productos</h1>
+              <p className="mt-3 max-w-xl text-sm text-slate-500 dark:text-neutral-400">
                 Administrá catálogo y stock con feedback inmediato y animaciones suaves durante las operaciones.
               </p>
             </div>
@@ -202,13 +242,13 @@ export default function Products() {
             <button
               onClick={handleExport}
               disabled={exporting || filtered.length === 0}
-              className="inline-flex items-center justify-center rounded-2xl border border-slate-200 bg-white px-6 py-3 text-sm font-semibold text-slate-600 shadow-sm transition hover:-translate-y-0.5 hover:border-sky-300 hover:text-sky-600 disabled:cursor-not-allowed disabled:opacity-60"
+              className="inline-flex items-center justify-center rounded-2xl border border-slate-200 bg-white px-6 py-3 text-sm font-semibold text-slate-600 shadow-sm transition hover:-translate-y-0.5 hover:border-sky-300 hover:text-sky-600 disabled:cursor-not-allowed disabled:opacity-60 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-300"
             >
               {exporting ? "Exportando…" : "Exportar Excel"}
             </button>
             <button
               onClick={() => setImportOpen(true)}
-              className="inline-flex items-center justify-center rounded-2xl border border-slate-200 bg-white px-6 py-3 text-sm font-semibold text-slate-600 shadow-sm transition hover:-translate-y-0.5 hover:border-sky-300 hover:text-sky-600"
+              className="inline-flex items-center justify-center rounded-2xl border border-slate-200 bg-white px-6 py-3 text-sm font-semibold text-slate-600 shadow-sm transition hover:-translate-y-0.5 hover:border-sky-300 hover:text-sky-600 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-300"
             >
               Importar Excel
             </button>
@@ -222,16 +262,16 @@ export default function Products() {
         </div>
       </section>
 
-      <div className="rounded-3xl border border-emerald-200 bg-emerald-50 px-6 py-4 shadow-sm">
+      <div className="rounded-3xl border border-emerald-200 bg-emerald-50 px-6 py-4 shadow-sm dark:border-emerald-500/30 dark:bg-emerald-500/10">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <div className="flex items-center gap-2 text-sm font-semibold text-emerald-800">
+            <div className="flex items-center gap-2 text-sm font-semibold text-emerald-800 dark:text-emerald-300">
               <span className="h-2 w-2 rounded-full bg-emerald-500" />
               Sincronización con Contabilium
             </div>
-            <div className="mt-1 text-xs text-emerald-700">
+            <div className="mt-1 text-xs text-emerald-700 dark:text-emerald-400">
               {syncStatus
-                ? `Última sync: ${syncStatus.lastSync ? syncStatus.lastSync.toLocaleString("es-AR") : "—"} · ${syncStatus.updated} actualizados de ${syncStatus.total}${syncStatus.errors?.length ? ` · ${syncStatus.errors.length} error(es)` : ""}`
+                ? `Última sync: ${syncStatus.lastSync ? syncStatus.lastSync.toLocaleString("es-AR") : "—"} · ${syncStatus.updated} del catálogo actualizados (${syncStatus.total} conceptos revisados en Contabilium)${syncStatus.errors?.length ? ` · ${syncStatus.errors.length} error(es)` : ""}`
                 : "Sin datos de sincronización aún"}
             </div>
             {syncMessage && (
@@ -248,22 +288,42 @@ export default function Products() {
         </div>
       </div>
 
+      <div className="rounded-3xl border border-indigo-200 bg-indigo-50 px-6 py-4 shadow-sm dark:border-indigo-500/30 dark:bg-indigo-500/10">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <div className="flex items-center gap-2 text-sm font-semibold text-indigo-800 dark:text-indigo-300">
+              <span className="h-2 w-2 rounded-full bg-indigo-500" />
+              Fotos Bowie (uso único)
+            </div>
+            <div className="mt-1 text-xs text-indigo-700 dark:text-indigo-400">
+              Seleccioná las 3 fotos con fondo blanco (gris-celeste, azul-celeste, negro-gris) — se reparten solas a los 9 productos por color.
+            </div>
+            {bowieMessage && <div className="mt-1 text-xs text-indigo-600">{bowieMessage}</div>}
+          </div>
+          <label className="inline-flex cursor-pointer items-center justify-center rounded-2xl bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:-translate-y-0.5 hover:bg-indigo-700">
+            {bowieUploading ? "Subiendo…" : "Elegir fotos"}
+            <input type="file" accept="image/*" multiple hidden disabled={bowieUploading} onChange={handleBowiePhotos} />
+          </label>
+        </div>
+      </div>
+
+
       {exportMessage && (
-        <div className="rounded-3xl border border-sky-200 bg-sky-50 px-6 py-4 text-sm text-sky-700">
+        <div className="rounded-3xl border border-sky-200 bg-sky-50 px-6 py-4 text-sm text-sky-700 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-400">
           {exportMessage}
         </div>
       )}
 
-      <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-[0_35px_65px_-45px_rgba(15,23,42,0.18)]">
+      <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-[0_35px_65px_-45px_rgba(15,23,42,0.18)] dark:border-neutral-800 dark:bg-neutral-900 dark:shadow-none dark:ring-1 dark:ring-white/5">
         <div className="grid gap-4 md:grid-cols-4">
           <input
-            className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-2 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40"
+            className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-2 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white dark:placeholder:text-neutral-500"
             placeholder="Buscar por nombre, SKU o ID…"
             value={q}
             onChange={(e) => setQ(e.target.value)}
           />
           <select
-            className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-2 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40"
+            className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-2 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
             value={onlyActive}
             onChange={(e) => setOnlyActive(e.target.value)}
           >
@@ -272,7 +332,7 @@ export default function Products() {
             <option value="false">Solo inactivos</option>
           </select>
           <select
-            className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-2 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40"
+            className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-2 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
             value={category}
             onChange={(e) => setCategory(e.target.value)}
           >
@@ -288,13 +348,13 @@ export default function Products() {
               );
             })}
           </select>
-          <div className="flex items-center justify-end text-sm text-slate-500">
+          <div className="flex items-center justify-end text-sm text-slate-500 dark:text-neutral-400">
             {loading ? "Cargando…" : `${filtered.length} resultados`}
           </div>
         </div>
       </div>
 
-      <div className="relative overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-[0_40px_70px_-45px_rgba(15,23,42,0.18)]">
+      <div className="relative overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-[0_40px_70px_-45px_rgba(15,23,42,0.18)] dark:border-neutral-800 dark:bg-neutral-900 dark:shadow-none dark:ring-1 dark:ring-white/5">
         {loading && (
           <LoadingOverlay
             label="Sincronizando productos…"
@@ -302,72 +362,124 @@ export default function Products() {
             labelClassName="text-slate-600"
           />
         )}
-        <table className="min-w-full divide-y divide-slate-200 text-sm text-slate-600">
-          <thead className="bg-slate-100 text-slate-500">
-            <tr>
-              <th className="px-4 py-3 text-left">Producto</th>
-              <th className="px-4 py-3 text-left">Categoría</th>
-              <th className="px-4 py-3 text-right">Precio (USD)</th>
-              <th className="px-4 py-3 text-right">Stock</th>
-              <th className="px-4 py-3 text-left">Estado</th>
-              <th className="px-4 py-3 text-right">Acciones</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-slate-100">
-            {filtered.map((p) => (
-              <tr key={p.id}>
-                <td className="px-4 py-4">
+        {!loading && filtered.length === 0 && (
+          <p className="p-12 text-center text-sm text-slate-500 dark:text-neutral-400">Sin resultados.</p>
+        )}
+
+        {filtered.length > 0 && (
+          <>
+            {/* Mobile: tarjetas */}
+            <ul className="divide-y divide-slate-100 dark:divide-neutral-800 md:hidden">
+              {filtered.map((p) => (
+                <li key={p.id} className="space-y-3 p-4">
                   <div className="flex items-center gap-3">
                     {(p.images?.[0] ?? p.imageUrl) ? (
-                      <img src={p.images?.[0] ?? p.imageUrl} alt={p.name} className="h-12 w-12 rounded-xl object-cover" />
+                      <img src={p.images?.[0] ?? p.imageUrl} alt={p.name} className="h-12 w-12 shrink-0 rounded-xl object-cover" />
                     ) : (
-                      <div className="h-12 w-12 rounded-xl border border-slate-200 bg-slate-50" />
+                      <div className="h-12 w-12 shrink-0 rounded-xl border border-slate-200 bg-slate-50 dark:border-neutral-700 dark:bg-neutral-800" />
                     )}
-                    <div>
-                      <div className="text-sm font-semibold text-slate-900">{p.name}</div>
-                      <div className="text-xs text-slate-500">
-                        {p.sku ? `SKU: ${p.sku}` : "Sin SKU"}
-                      </div>
-                      <div className="text-[11px] text-slate-400">ID: {p.id}</div>
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-semibold text-slate-900 dark:text-white">{p.name}</p>
+                      <p className="text-xs text-slate-500 dark:text-neutral-400">{p.sku ? `SKU: ${p.sku}` : "Sin SKU"}</p>
                     </div>
+                    <span className={`shrink-0 inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] ${statusStyles[p.active]}`}>
+                      <span className="h-1.5 w-1.5 rounded-full bg-current" />
+                      {p.active ? "Activo" : "Inactivo"}
+                    </span>
                   </div>
-                </td>
-                <td className="px-4 py-4 capitalize text-slate-500">{p.productTypeTitle || p.category || "general"}</td>
-                <td className="px-4 py-4 text-right font-semibold text-slate-900">{money(p.price)}</td>
-                <td className="px-4 py-4 text-right text-slate-500">{p.stock ?? 0}</td>
-                <td className="px-4 py-4">
-                  <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs ${statusStyles[p.active]}`}>
-                    <span className="h-2 w-2 rounded-full bg-current" />
-                    {p.active ? "Activo" : "Inactivo"}
-                  </span>
-                </td>
-                <td className="px-4 py-4">
-                  <div className="flex justify-end gap-2">
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500">
+                    <span className="rounded-full bg-slate-100 px-2.5 py-1 capitalize dark:bg-neutral-800 dark:text-neutral-300">
+                      {p.productTypeTitle || p.category || "general"}
+                    </span>
+                    <span className="rounded-full bg-slate-100 px-2.5 py-1 font-semibold text-slate-700 dark:bg-neutral-800 dark:text-neutral-300">
+                      {p.priceArs != null ? moneyArs(p.priceArs) : "Sin sincronizar"}
+                    </span>
+                    <span className="rounded-full bg-slate-100 px-2.5 py-1 dark:bg-neutral-800 dark:text-neutral-300">Stock: {p.stock ?? 0}</span>
+                  </div>
+                  <div className="flex gap-2">
                     <button
-                      className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-600 transition hover:border-sky-400 hover:text-slate-900"
+                      className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-600 transition hover:border-sky-400 hover:text-slate-900 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-300 dark:hover:text-white"
                       onClick={() => setEditing(p)}
                     >
                       Editar
                     </button>
                     <button
-                      className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-600 transition hover:border-rose-400 hover:text-slate-900"
+                      className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-600 transition hover:border-rose-400 hover:text-slate-900 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-300 dark:hover:text-white"
                       onClick={() => handleDelete(p.id)}
                     >
                       Eliminar
                     </button>
                   </div>
-                </td>
-              </tr>
-            ))}
-            {!loading && filtered.length === 0 && (
-              <tr>
-                <td className="px-4 py-12 text-center text-slate-500" colSpan={6}>
-                  Sin resultados.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+                </li>
+              ))}
+            </ul>
+
+            {/* Desktop: tabla */}
+            <div className="hidden overflow-x-auto md:block">
+            <table className="min-w-full divide-y divide-slate-200 text-sm text-slate-600 dark:divide-neutral-800 dark:text-neutral-300">
+              <thead className="bg-slate-100 text-slate-500 dark:bg-neutral-800 dark:text-neutral-400">
+                <tr>
+                  <th className="px-4 py-3 text-left">Producto</th>
+                  <th className="px-4 py-3 text-left">Categoría</th>
+                  <th className="px-4 py-3 text-right">Precio</th>
+                  <th className="px-4 py-3 text-right">Stock</th>
+                  <th className="px-4 py-3 text-left">Estado</th>
+                  <th className="px-4 py-3 text-right">Acciones</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 dark:divide-neutral-800">
+                {filtered.map((p) => (
+                  <tr key={p.id}>
+                    <td className="px-4 py-4">
+                      <div className="flex items-center gap-3">
+                        {(p.images?.[0] ?? p.imageUrl) ? (
+                          <img src={p.images?.[0] ?? p.imageUrl} alt={p.name} className="h-12 w-12 rounded-xl object-cover" />
+                        ) : (
+                          <div className="h-12 w-12 rounded-xl border border-slate-200 bg-slate-50 dark:border-neutral-700 dark:bg-neutral-800" />
+                        )}
+                        <div>
+                          <div className="text-sm font-semibold text-slate-900 dark:text-white">{p.name}</div>
+                          <div className="text-xs text-slate-500 dark:text-neutral-400">
+                            {p.sku ? `SKU: ${p.sku}` : "Sin SKU"}
+                          </div>
+                          <div className="text-[11px] text-slate-400 dark:text-neutral-500">ID: {p.id}</div>
+                        </div>
+                      </div>
+                    </td>
+                    <td className="px-4 py-4 capitalize text-slate-500 dark:text-neutral-400">{p.productTypeTitle || p.category || "general"}</td>
+                    <td className="px-4 py-4 text-right font-semibold text-slate-900 dark:text-white">
+                      {p.priceArs != null ? moneyArs(p.priceArs) : <span className="text-slate-400 dark:text-neutral-500">Sin sincronizar</span>}
+                    </td>
+                    <td className="px-4 py-4 text-right text-slate-500 dark:text-neutral-400">{p.stock ?? 0}</td>
+                    <td className="px-4 py-4">
+                      <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs ${statusStyles[p.active]}`}>
+                        <span className="h-2 w-2 rounded-full bg-current" />
+                        {p.active ? "Activo" : "Inactivo"}
+                      </span>
+                    </td>
+                    <td className="px-4 py-4">
+                      <div className="flex justify-end gap-2">
+                        <button
+                          className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-600 transition hover:border-sky-400 hover:text-slate-900 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-300 dark:hover:text-white"
+                          onClick={() => setEditing(p)}
+                        >
+                          Editar
+                        </button>
+                        <button
+                          className="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-1 text-xs text-slate-600 transition hover:border-rose-400 hover:text-slate-900 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-300 dark:hover:text-white"
+                          onClick={() => handleDelete(p.id)}
+                        >
+                          Eliminar
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            </div>
+          </>
+        )}
       </div>
 
       <ProductForm open={modalOpen} onClose={() => setModalOpen(false)} onSubmit={handleCreate} />

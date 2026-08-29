@@ -31,13 +31,16 @@ type ProductFormProps = {
 export default function ProductForm({ open, onClose, initial, onSaved }: ProductFormProps) {
   const [name, setName] = useState(initial?.name || "");
   const [sku, setSku] = useState(initial?.sku ? String(initial.sku) : "");
+  const [brand, setBrand] = useState(initial?.brand || "");
   const [priceUsd, setPriceUsd] = useState<string>(
     initial?.price != null ? String(initial.price) : ""
   );
   const [priceArs, setPriceArs] = useState<string>("");
+  const [costArs, setCostArs] = useState<string>(initial?.costArs != null ? String(initial.costArs) : "");
   const [stock, setStock] = useState<number | string>(initial?.stock ?? 0);
   const [description, setDescription] = useState<string>(initial?.description || "");
   const [active, setActive] = useState<boolean>(initial?.active ?? true);
+  const [showInCatalog, setShowInCatalog] = useState<boolean>(initial?.showInCatalog ?? true);
   const [existingImages, setExistingImages] = useState<string[]>(
     initial?.images?.length ? initial.images : initial?.imageUrl ? [initial.imageUrl] : []
   );
@@ -64,11 +67,13 @@ export default function ProductForm({ open, onClose, initial, onSaved }: Product
   useEffect(() => {
     setName(initial?.name || "");
     setSku(initial?.sku ? String(initial.sku) : "");
+    setBrand(initial?.brand || "");
     setPriceUsd(initial?.price != null ? String(initial.price) : "");
     setPriceArs("");
     setStock(initial?.stock ?? 0);
     setDescription(initial?.description || "");
     setActive(initial?.active ?? true);
+    setShowInCatalog(initial?.showInCatalog ?? true);
     setExistingImages(
       initial?.images?.length ? initial.images : initial?.imageUrl ? [initial.imageUrl] : []
     );
@@ -202,6 +207,7 @@ export default function ProductForm({ open, onClose, initial, onSaved }: Product
     setErrorMsg(null);
 
     const priceNum = Number(priceUsd ?? 0);
+    const costNum = costArs.trim() === "" ? null : Number(costArs);
     const stockNum = Number(stock ?? 0);
     const normalizedTypeTitle = (productTypeTitle || "").trim() || "general";
     const normalizedDescription = (description || "").trim();
@@ -229,12 +235,15 @@ export default function ProductForm({ open, onClose, initial, onSaved }: Product
         await updateProduct(initial.id, {
           name,
           sku: normalizedSku || null,
+          brand: brand.trim() || null,
           price: priceNum,
+          costArs: costNum,
           stock: stockNum,
           category: normalizedTypeTitle,
           productTypeId,
           productTypeTitle: normalizedTypeTitle,
           active,
+          showInCatalog,
           description: normalizedDescription,
           images: allImages,
         });
@@ -247,6 +256,7 @@ export default function ProductForm({ open, onClose, initial, onSaved }: Product
           ...(initial as Product),
           name,
           sku: normalizedSku || null,
+          brand: brand.trim() || null,
           price: priceNum,
           stock: stockNum,
           category: normalizedTypeTitle,
@@ -254,6 +264,7 @@ export default function ProductForm({ open, onClose, initial, onSaved }: Product
           productTypeTitle: normalizedTypeTitle,
           description: normalizedDescription,
           active,
+          showInCatalog,
           images: allImages,
           imageUrl: allImages[0] ?? "",
         } as Product;
@@ -262,13 +273,16 @@ export default function ProductForm({ open, onClose, initial, onSaved }: Product
         const created = await createProduct({
           name,
           sku: normalizedSku || null,
+          brand: brand.trim() || null,
           price: priceNum,
+          costArs: costNum,
           stock: stockNum,
           description: normalizedDescription,
           category: normalizedTypeTitle,
           productTypeId,
           productTypeTitle: normalizedTypeTitle,
           active,
+          showInCatalog,
         });
 
         let newUrls: string[] = [];
@@ -336,6 +350,10 @@ export default function ProductForm({ open, onClose, initial, onSaved }: Product
                 <input className={inputCls} value={name} onChange={e => setName(e.target.value)} required disabled={loading} placeholder="Nombre del producto" />
               </div>
               <div>
+                <label className="mb-1.5 block text-sm font-medium text-slate-700">Marca</label>
+                <input className={inputCls} value={brand} onChange={e => setBrand(e.target.value)} disabled={loading} placeholder="Ej: Samurai, Bowie" />
+              </div>
+              <div>
                 <label className="mb-1.5 block text-sm font-medium text-slate-700">Descripción</label>
                 <textarea
                   className={`${inputCls} resize-none`}
@@ -352,9 +370,18 @@ export default function ProductForm({ open, onClose, initial, onSaved }: Product
             {/* Sección: Precios */}
             <section className="space-y-4">
               <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">Precios</h3>
+              {initial?.priceArs != null && (
+                <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+                  Precio real sincronizado desde Contabilium:{" "}
+                  <strong>
+                    {Number(initial.priceArs).toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 })}
+                  </strong>
+                  . Es el que ven tus clientes; se actualiza solo cada 5 minutos y pisa la estimación de abajo.
+                </div>
+              )}
               <div className="grid gap-4 sm:grid-cols-2">
                 <div>
-                  <label className="mb-1.5 block text-sm font-medium text-slate-700">Precio (USD)</label>
+                  <label className="mb-1.5 block text-sm font-medium text-slate-700">Precio base (USD)</label>
                   <div className="relative">
                     <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-sm text-slate-400">$</span>
                     <input
@@ -386,7 +413,7 @@ export default function ProductForm({ open, onClose, initial, onSaved }: Product
                   </p>
                 </div>
                 <div>
-                  <label className="mb-1.5 block text-sm font-medium text-slate-700">Precio (ARS)</label>
+                  <label className="mb-1.5 block text-sm font-medium text-slate-700">Precio (ARS) estimado</label>
                   <div className="relative">
                     <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-sm text-slate-400">$</span>
                     <input
@@ -407,7 +434,26 @@ export default function ProductForm({ open, onClose, initial, onSaved }: Product
                       disabled={loading}
                     />
                   </div>
-                  <p className="mt-1.5 text-xs text-slate-400">Calculado automáticamente. El precio guardado es siempre en USD.</p>
+                  <p className="mt-1.5 text-xs text-slate-400">
+                    Solo una estimación para productos nuevos. El precio guardado es siempre en USD hasta que Contabilium sincronice el real.
+                  </p>
+                </div>
+                <div>
+                  <label className="mb-1.5 block text-sm font-medium text-slate-700">Costo (ARS)</label>
+                  <div className="relative">
+                    <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-sm text-slate-400">$</span>
+                    <input
+                      type="number" min={0} step="0.01"
+                      className={`${inputCls} pl-7`}
+                      value={costArs}
+                      onChange={(e) => setCostArs(e.target.value)}
+                      disabled={loading}
+                      placeholder="Lo que nos cuesta a nosotros"
+                    />
+                  </div>
+                  <p className="mt-1.5 text-xs text-slate-400">
+                    Interno, no se muestra a clientes — se usa para calcular margen en el dashboard de gestión.
+                  </p>
                 </div>
               </div>
             </section>
@@ -466,6 +512,18 @@ export default function ProductForm({ open, onClose, initial, onSaved }: Product
                 </div>
                 <span className="text-sm font-medium text-slate-700">Producto activo</span>
               </label>
+              <label className="inline-flex cursor-pointer items-center gap-3">
+                <div
+                  onClick={() => !loading && setShowInCatalog(v => !v)}
+                  className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${showInCatalog ? "bg-sky-500" : "bg-slate-300"} ${loading ? "opacity-50" : "cursor-pointer"}`}
+                >
+                  <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform ${showInCatalog ? "translate-x-4" : "translate-x-0.5"}`} />
+                </div>
+                <span className="text-sm font-medium text-slate-700">Visible en el catálogo público</span>
+              </label>
+              <p className="-mt-2 text-xs text-slate-400">
+                Si lo apagás, sigue contando en el stock total y en el stock de los distribuidores, pero no se muestra en /catalogo.
+              </p>
             </section>
 
             {/* Sección: Imágenes */}

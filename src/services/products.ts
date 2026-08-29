@@ -1,7 +1,7 @@
 import {
   collection, addDoc, updateDoc, deleteDoc, doc,
   serverTimestamp, query, orderBy, limit, getDocs,
-  where, startAfter, QueryDocumentSnapshot, DocumentData, onSnapshot
+  where, startAfter, QueryDocumentSnapshot, DocumentData, onSnapshot,
 } from "firebase/firestore";
 import { ref, uploadBytes, uploadBytesResumable, getDownloadURL, deleteObject } from "firebase/storage";
 import { db, storage } from "../firebase"; // 👈 asegurate que exista src/firebase.ts|js con {db,storage}
@@ -13,13 +13,17 @@ export type Product = {
   nameLower: string;
   sku?: string | null;
   skuNumber?: number | null;
+  brand?: string | null;
   price: number;
+  priceArs?: number | null;
+  costArs?: number | null;
   stock: number;
   description?: string;
   category: string;
   productTypeId?: string | null;
   productTypeTitle?: string | null;
   active: boolean;
+  showInCatalog?: boolean;
   imageUrl: string;
   images?: string[];
   createdAt?: any; updatedAt?: any;
@@ -57,24 +61,30 @@ async function ensureSkuAvailable(
 export async function createProduct({
   name,
   sku,
+  brand,
   price,
+  costArs,
   stock,
   description,
   category,
   productTypeId,
   productTypeTitle,
   active,
+  showInCatalog,
   imageFile,
 }: {
   name: string;
   sku?: string | number | null;
+  brand?: string | null;
   price?: number | string;
+  costArs?: number | string | null;
   stock?: number | string;
   description?: string | null;
   category?: string;
   productTypeId?: string | null;
   productTypeTitle?: string | null;
   active?: boolean;
+  showInCatalog?: boolean;
   imageFile?: File | null;
 }) {
   const normalizedTypeTitle =
@@ -89,13 +99,16 @@ export async function createProduct({
     nameLower: normalize(name),
     sku: normalizedSku,
     skuNumber: skuNumber,
+    brand: (brand || "").trim() || null,
     price: Number(price ?? 0),
+    costArs: costArs != null && costArs !== "" ? Number(costArs) : null,
     stock: Number(stock ?? 0),
     description: description || "",
     category: category || effectiveTypeTitle || "general",
     productTypeId: productTypeId || null,
     productTypeTitle: effectiveTypeTitle || "general",
     active: active ?? true,
+    showInCatalog: showInCatalog ?? true,
     imageUrl: "",
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
@@ -112,30 +125,37 @@ export async function createProduct({
 export async function updateProduct(id: string, {
   name,
   sku,
+  brand,
   price,
+  costArs,
   stock,
   description,
   category,
   productTypeId,
   productTypeTitle,
   active,
+  showInCatalog,
   imageFile,
   images,
 }: {
   name?: string;
   sku?: string | number | null;
+  brand?: string | null;
   price?: number | string;
+  costArs?: number | string | null;
   stock?: number | string;
   description?: string | null;
   category?: string;
   productTypeId?: string | null;
   productTypeTitle?: string | null;
   active?: boolean;
+  showInCatalog?: boolean;
   imageFile?: File | null;
   images?: string[];
 }) {
   const patch: any = { updatedAt: serverTimestamp() };
   if (name !== undefined) { patch.name = name; patch.nameLower = normalize(name); }
+  if (brand !== undefined) patch.brand = (brand || "").trim() || null;
   if (sku !== undefined) {
     const { value: normalizedSku, number: skuNumber } = normalizeSku(sku);
     if (normalizedSku) {
@@ -145,6 +165,7 @@ export async function updateProduct(id: string, {
     patch.skuNumber = skuNumber;
   }
   if (price !== undefined) patch.price = Number(price);
+  if (costArs !== undefined) patch.costArs = costArs != null && costArs !== "" ? Number(costArs) : null;
   if (stock !== undefined) patch.stock = Number(stock);
   if (description !== undefined) patch.description = description || "";
   if (category !== undefined) patch.category = category || "general";
@@ -159,12 +180,18 @@ export async function updateProduct(id: string, {
     }
   }
   if (active !== undefined) patch.active = !!active;
+  if (showInCatalog !== undefined) patch.showInCatalog = !!showInCatalog;
   if (imageFile) { const url = await uploadProductImage(id, imageFile); patch.imageUrl = url; }
   if (images !== undefined) {
     patch.images = images;
     if (images.length > 0) patch.imageUrl = images[0];
   }
   await updateDoc(doc(db, "products", id), patch);
+}
+
+export async function listProductsByBrand(brand: string): Promise<Product[]> {
+  const snap = await getDocs(query(colRef, where("brand", "==", brand)));
+  return snap.docs.map((d) => ({ id: d.id, ...(d.data() as Product) }));
 }
 
 export async function deleteProductById(id: string) {

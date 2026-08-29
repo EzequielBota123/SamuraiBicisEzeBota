@@ -1,5 +1,7 @@
 {
   "projects": {
     "default": "bikeshop-ab2f0"
-  }
+  },
+  "targets": {},
+  "etags": {}
 }

@@ -1,6 +1,15 @@
 // src/firebase.ts
 import { initializeApp, getApp, getApps } from "firebase/app";
-import { getFirestore } from "firebase/firestore";
+import {
+  getFirestore,
+  collection,
+  query,
+  where,
+  getDocs,
+  addDoc,
+  doc,
+  Timestamp,
+} from "firebase/firestore";
 import {
   getAuth,
   setPersistence,
@@ -8,7 +17,7 @@ import {
   onAuthStateChanged,
   onIdTokenChanged,
 } from "firebase/auth";
-import { getStorage } from "firebase/storage";
+import { getStorage, ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { getFunctions } from "firebase/functions";
 import {
   initializeAppCheck,
@@ -53,12 +62,22 @@ getAppCheckToken(appCheck, true)
 // 🔒 Auth con persistencia (misma app en todos lados)
 export const auth = getAuth(app);
 setPersistence(auth, browserLocalPersistence);
+// @ts-ignore — acceso rápido desde la consola del navegador para diagnósticos puntuales
+window.__auth = auth;
 
 // 🗄️ Firestore / Storage / Functions
 export const db = getFirestore(app);
 // Usa el bucket del config para evitar mismatches
 export const storage = getStorage(app);
 export const functions = getFunctions(app, "us-central1");
+// @ts-ignore — acceso rápido desde la consola del navegador para diagnósticos puntuales
+window.__db = db;
+// @ts-ignore
+window.__storage = storage;
+// @ts-ignore
+window.__fs = { collection, query, where, getDocs, addDoc, doc, Timestamp };
+// @ts-ignore
+window.__st = { ref, uploadBytes, getDownloadURL };
 
 // Debug de config (útil para confirmar bucket y projectId)
 console.log("projectId:", getApp().options.projectId);

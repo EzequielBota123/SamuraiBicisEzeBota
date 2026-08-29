@@ -85,6 +85,7 @@ export default function MiCuentaPage() {
   const { user } = useAuth();
   const history = useHistory();
   const [comprobantes, setComprobantes] = useState([]);
+  const [saldoTotal, setSaldoTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [downloading, setDownloading] = useState(null);
@@ -97,14 +98,17 @@ let cancelled = false;
     setError(null);
 
     getClientComprobantes()
-      .then(({ items }) => { if (!cancelled) setComprobantes(items); })
+      .then(({ items, saldoTotal }) => {
+        if (cancelled) return;
+        setComprobantes(items);
+        setSaldoTotal(saldoTotal ?? 0);
+      })
       .catch((err) => { if (!cancelled) setError(err.message); })
       .finally(() => { if (!cancelled) setLoading(false); });
 
     return () => { cancelled = true; };
   }, [user, history]);
 
-  const saldoTotal = comprobantes.reduce((acc, c) => acc + (c.Saldo ?? 0), 0);
   const vencidos = comprobantes.filter((c) => isOverdue(c.FechaVencimiento) && c.Saldo > 0);
   const porVencer = comprobantes.filter((c) => isDueSoon(c.FechaVencimiento) && c.Saldo > 0);
 
@@ -126,7 +130,7 @@ const detalle = await getComprobanteDetail(c.Id);
     <div className="mx-auto max-w-7xl px-4 py-10 sm:px-6 lg:px-8">
       <div className="mb-8">
         <h1 className="text-2xl font-semibold text-slate-900">Mi cuenta corriente</h1>
-        <p className="mt-1 text-sm text-slate-500">Saldo y movimientos de los últimos 2 años.</p>
+        <p className="mt-1 text-sm text-slate-500">Saldo y movimientos de tu cuenta.</p>
       </div>
 
       {loading && <Spinner label="Cargando movimientos..." />}
@@ -144,9 +148,10 @@ const detalle = await getComprobanteDetail(c.Id);
           {/* Tarjetas de resumen */}
           <div className="mb-8 grid gap-4 sm:grid-cols-3">
             <SummaryCard
-              label="Saldo deudor total"
+              label={saldoTotal > 0 ? 'Debés' : saldoTotal < 0 ? 'Tenés saldo a favor' : 'Al día'}
               value={money(saldoTotal)}
               accent={saldoTotal > 0 ? 'red' : 'green'}
+              sub={saldoTotal < 0 ? 'Pagaste de más / tenés crédito a favor' : null}
             />
             <SummaryCard
               label="Comprobantes vencidos"

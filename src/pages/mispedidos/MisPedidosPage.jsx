@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useHistory } from 'react-router-dom';
 import { useAuth } from '../../auth/AuthContext';
 import { getClientComprobantes } from '../../services/comprobantes';
+import PagoCCModal from '../../components/stock/PagoCCModal';
 
 
 const TIPO_LABEL = { FCA: 'Factura A', NCA: 'Nota de Crédito A', NDA: 'Nota de Débito A' };
@@ -42,9 +43,11 @@ export default function MisPedidosPage() {
   const { user } = useAuth();
   const history = useHistory();
   const [comprobantes, setComprobantes] = useState([]);
+  const [saldoTotal, setSaldoTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [tipoFiltro, setTipoFiltro] = useState('all');
+  const [pagoModalOpen, setPagoModalOpen] = useState(false);
 
   useEffect(() => {
     if (!user) { history.push('/login'); return; }
@@ -54,7 +57,11 @@ let cancelled = false;
     setError(null);
 
     getClientComprobantes()
-      .then(({ items }) => { if (!cancelled) setComprobantes(items); })
+      .then(({ items, saldoTotal }) => {
+        if (cancelled) return;
+        setComprobantes(items);
+        setSaldoTotal(saldoTotal ?? 0);
+      })
       .catch((err) => { if (!cancelled) setError(err.message); })
       .finally(() => { if (!cancelled) setLoading(false); });
 
@@ -75,6 +82,36 @@ let cancelled = false;
           Facturas y notas de crédito/débito de los últimos 2 años.
         </p>
       </div>
+
+      {!loading && !error && (
+        <div
+          className={`mb-6 rounded-2xl border p-6 ${
+            saldoTotal > 0 ? 'border-red-200 bg-red-50' : 'border-emerald-200 bg-emerald-50'
+          }`}
+        >
+          <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+            {saldoTotal > 0 ? 'Debés' : saldoTotal < 0 ? 'Tenés saldo a favor' : 'Saldo total'}
+          </p>
+          <p className={`mt-2 text-3xl font-bold ${saldoTotal > 0 ? 'text-red-700' : 'text-emerald-700'}`}>
+            {money(saldoTotal)}
+          </p>
+          <p className="mt-1 text-sm text-slate-500">
+            {saldoTotal > 0
+              ? 'Tenés saldo pendiente de pago.'
+              : saldoTotal < 0
+              ? 'Pagaste de más / tenés crédito a favor.'
+              : 'Estás al día, sin saldo pendiente.'}
+          </p>
+          <button
+            onClick={() => setPagoModalOpen(true)}
+            className="mt-4 inline-flex items-center gap-1.5 rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
+          >
+            💳 Subir comprobante de pago
+          </button>
+        </div>
+      )}
+
+      <PagoCCModal open={pagoModalOpen} onClose={() => setPagoModalOpen(false)} />
 
       <div className="mb-6 flex flex-wrap gap-2">
         {['all', 'FCA', 'NCA', 'NDA'].map((tipo) => (

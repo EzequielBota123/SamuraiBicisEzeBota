@@ -2,7 +2,7 @@
 import { Route, Redirect } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 
-const STAFF_ROLES = ["admin", "manager", "viewer"];
+const STAFF_ROLES = ["admin"];
 
 export default function ProtectedRoute({
   component: Component,

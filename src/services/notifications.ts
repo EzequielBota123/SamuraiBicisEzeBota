@@ -1,6 +1,7 @@
 // src/services/notifications.ts
 import {
   collection,
+  deleteDoc,
   doc,
   limit,
   onSnapshot,
@@ -27,7 +28,7 @@ export type NotificationItem = {
   customerNotes: string | null;
   total: number;
   itemsCount: number;
-  items: Array<{ id: string | null; name: string; qty: number; price: number }>;
+  items: Array<{ id: string | null; name: string; sku: string | number | null; qty: number; price: number }>;
   contabilium: {
     contabiliumId: number | null;
     idListaPrecio: number | null;
@@ -37,6 +38,11 @@ export type NotificationItem = {
   read: boolean;
   attended: boolean;
   createdAt: Date | null;
+  // Campos específicos de notificaciones type:"sale_reported" (venta
+  // reportada por un distribuidor desde "Mi stock").
+  distributorUid: string | null;
+  distributorName: string | null;
+  depositoNombre: string | null;
 };
 
 const NOTIFICATIONS = collection(db, "notifications");
@@ -59,11 +65,20 @@ function toNotification(id: string, data: any): NotificationItem {
     customerNotes: data?.customerNotes ?? null,
     total: Number(data?.total ?? 0),
     itemsCount: Number(data?.itemsCount ?? 0),
-    items: Array.isArray(data?.items) ? data.items : [],
+    // Compat: notificaciones de venta viejas (antes de agrupar) guardaban un
+    // solo sku/name/quantity/unitPrice suelto en vez de un array "items".
+    items: Array.isArray(data?.items)
+      ? data.items
+      : data?.type === "sale_reported" && data?.sku
+      ? [{ sku: data.sku, name: data.name, quantity: data.quantity, unitPrice: data.unitPrice }]
+      : [],
     contabilium: data?.contabilium ?? null,
     read: Boolean(data?.read),
     attended: Boolean(data?.attended),
     createdAt: toDate(data?.createdAt),
+    distributorUid: data?.distributorUid ?? null,
+    distributorName: data?.distributorName ?? null,
+    depositoNombre: data?.depositoNombre ?? null,
   };
 }
 
@@ -102,5 +117,24 @@ export async function markAllNotificationsRead(): Promise<void> {
   if (snap.empty) return;
   const batch = writeBatch(db);
   snap.docs.forEach((d) => batch.update(d.ref, { read: true, readAt: serverTimestamp() }));
+  await batch.commit();
+}
+
+export async function deleteNotification(id: string): Promise<void> {
+  await deleteDoc(doc(db, "notifications", id));
+}
+
+// Reemplaza la lista de items de una notificación agrupada (p.ej. al marcar
+// facturada una de las ventas reportadas dentro del grupo).
+export async function updateNotificationItems(id: string, items: unknown[]): Promise<void> {
+  await updateDoc(doc(db, "notifications", id), { items });
+}
+
+// Borra todas las notificaciones actualmente cargadas (las últimas `max` del
+// subscribeNotifications, que es lo que se ve en el panel de la campana).
+export async function deleteAllNotifications(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  const batch = writeBatch(db);
+  ids.forEach((id) => batch.delete(doc(db, "notifications", id)));
   await batch.commit();
 }

@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { Link, NavLink, useHistory } from "react-router-dom";
 import { useAuth } from "../../auth/AuthContext";
+import ThemeToggle from "../ui/ThemeToggle";
 
-const ADMIN_ROLES = ["admin", "manager", "viewer"];
+const ADMIN_ROLES = ["admin"];
 
 export default function Navbar({
   logoSrc = "/img/samurai-negro-total.png",
@@ -32,30 +33,31 @@ export default function Navbar({
 
   const isAdminUser = !authLoading && ADMIN_ROLES.includes(profile?.role);
   const isClient = !authLoading && !!user && !isAdminUser;
+  const hasStock = !authLoading && !!user && !!profile?.contabiliumDepositoId;
   const isTransparentNow = transparentOnTop && !scrolled && !open;
 
   const headerBg = isTransparentNow
     ? "bg-transparent"
-    : "supports-[backdrop-filter]:bg-white/80 bg-white/95 backdrop-blur border-b border-slate-200";
+    : "supports-[backdrop-filter]:bg-white/80 bg-white/95 backdrop-blur border-b border-slate-200 dark:supports-[backdrop-filter]:bg-neutral-950/80 dark:bg-black/95 dark:border-neutral-800";
 
-  const textBase = isTransparentNow ? "text-white" : "text-slate-900";
+  const textBase = isTransparentNow ? "text-white" : "text-slate-900 dark:text-white";
   const ringColor = isTransparentNow
     ? "focus-visible:ring-white/70"
     : "focus-visible:ring-slate-900/30";
 
   const linkInactive = isTransparentNow
     ? "text-white/90 hover:text-white hover:bg-white/10"
-    : "text-slate-600 hover:text-slate-900 hover:bg-slate-100";
+    : "text-slate-600 hover:text-slate-900 hover:bg-slate-100 dark:text-neutral-300 dark:hover:text-white dark:hover:bg-neutral-800";
 
   const linkActive = isTransparentNow
     ? "text-white bg-white/20"
-    : "text-slate-900 bg-white shadow-sm shadow-slate-200";
+    : "text-slate-900 bg-white shadow-sm shadow-slate-200 dark:text-white dark:bg-neutral-800 dark:shadow-none";
 
   const outlineBtn =
     "inline-flex items-center justify-center rounded-xl border px-4 py-2 text-sm font-medium transition " +
     (isTransparentNow
       ? "border-white/40 text-white hover:bg-white/10"
-      : "border-slate-200 text-slate-900 hover:bg-slate-100") +
+      : "border-slate-200 text-slate-900 hover:bg-slate-100 dark:border-neutral-700 dark:text-white dark:hover:bg-neutral-800") +
     ` focus:outline-none focus-visible:ring-2 ${ringColor}`;
 
   const solidBtn =
@@ -76,7 +78,7 @@ export default function Navbar({
     "space-y-2 rounded-b-xl pb-4 pt-2 " +
     (isTransparentNow
       ? "bg-black/85 text-white backdrop-blur border-t border-white/15"
-      : "border-t border-slate-200 bg-white/95 text-slate-800 backdrop-blur");
+      : "border-t border-slate-200 bg-white/95 text-slate-800 backdrop-blur dark:border-neutral-800 dark:bg-black/95 dark:text-neutral-200");
 
   return (
     <header
@@ -89,11 +91,34 @@ export default function Navbar({
         className={`mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 ${textBase}`}
         aria-label="Principal"
       >
-        <div className="flex h-20 items-center justify-between">
+        <div className="flex h-20 items-center justify-between sm:h-28">
           {/* Logo */}
           <div className="flex items-center flex-shrink-0">
-            <Link to="/" className="flex items-center gap-2" aria-label="Ir al inicio">
-              <img src={logoSrc} alt="Logo" className="h-12 w-auto" />
+            <Link to="/" className="group relative inline-flex items-center gap-2" aria-label="Ir al inicio">
+              <span className="inline-flex animate-float-y items-center">
+                <span className="relative inline-block">
+                  <img
+                    src={logoSrc}
+                    alt="Samurai"
+                    className="block h-14 w-auto transition-transform duration-300 group-hover:scale-105 sm:h-24 dark:hidden"
+                  />
+                  <img
+                    src="/img/samurai-blanco-navbar.png"
+                    alt="Samurai"
+                    className="hidden h-14 w-auto transition-transform duration-300 group-hover:scale-105 sm:h-24 dark:block"
+                  />
+                  <span
+                    className="pointer-events-none absolute rounded-full bg-red-600/70 blur-[3px] animate-logo-dot-pulse dark:hidden"
+                    style={{ left: "49.6%", top: "20.8%", width: "10%", aspectRatio: "1 / 1", transform: "translate(-50%, -50%)" }}
+                    aria-hidden="true"
+                  />
+                  <span
+                    className="pointer-events-none absolute hidden rounded-full bg-red-600/70 blur-[3px] animate-logo-dot-pulse dark:block"
+                    style={{ left: "49.9%", top: "12.2%", width: "6%", aspectRatio: "1 / 1", transform: "translate(-50%, -50%)" }}
+                    aria-hidden="true"
+                  />
+                </span>
+              </span>
             </Link>
           </div>
 
@@ -106,6 +131,7 @@ export default function Navbar({
               ringClass={ringColor}
               isAdminUser={isAdminUser}
               isClient={isClient}
+              hasStock={hasStock}
               authLoading={authLoading}
               profile={profile}
             />
@@ -113,6 +139,7 @@ export default function Navbar({
 
           {/* Right actions (desktop) */}
           <div className="hidden md:flex md:items-center md:gap-3">
+            <ThemeToggle isTransparentNow={isTransparentNow} />
             {!authLoading && (user ? (
               <UserMenu
                 user={user}
@@ -120,6 +147,8 @@ export default function Navbar({
                 onLogout={handleLogout}
                 outlineBtn={outlineBtn}
                 isTransparentNow={isTransparentNow}
+                isAdminUser={isAdminUser}
+                hasStock={hasStock}
               />
             ) : (
               <>
@@ -130,7 +159,8 @@ export default function Navbar({
           </div>
 
           {/* Mobile toggle */}
-          <div className="md:hidden">
+          <div className="flex items-center gap-2 md:hidden">
+            <ThemeToggle isTransparentNow={isTransparentNow} />
             <button
               type="button"
               className={burgerBtn}
@@ -165,16 +195,16 @@ export default function Navbar({
             <MobileLink to="/catalogo" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
               Catálogo
             </MobileLink>
+            {hasStock && (
+              <MobileLink to="/mi-stock" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
+                Mi stock
+              </MobileLink>
+            )}
             {isClient && (
               <>
                 <MobileLink to="/mis-pedidos" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
                   Mis comprobantes
                 </MobileLink>
-                {profile?.contabiliumDepositoId && (
-                  <MobileLink to="/mi-stock" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
-                    Mi stock
-                  </MobileLink>
-                )}
                 <MobileLink to="/mi-cuenta" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
                   Mi cuenta
                 </MobileLink>
@@ -190,11 +220,6 @@ export default function Navbar({
                 </MobileLink>
               </>
             )}
-            {isAdminUser && (
-              <MobileLink to="/admin" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
-                Admin
-              </MobileLink>
-            )}
             <div
               className={`border-t pt-2 ${
                 isTransparentNow ? "border-white/15" : "border-slate-200/70"
@@ -205,6 +230,16 @@ export default function Navbar({
                 <div className={`px-4 py-2 text-xs ${isTransparentNow ? "text-white/70" : "text-slate-500"}`}>
                   {user.displayName || user.email}
                 </div>
+                {isAdminUser && (
+                  <>
+                    <MobileLink to="/admin" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
+                      Panel admin
+                    </MobileLink>
+                    <MobileLink to="/admin/users?new=1" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
+                      Generar usuario
+                    </MobileLink>
+                  </>
+                )}
                 <button
                   onClick={handleLogout}
                   className={outlineBtn + " w-full text-left"}
@@ -215,7 +250,11 @@ export default function Navbar({
             ) : (
               <>
                 <button
-                  onClick={() => { close(); if (onLogin) onLogin(); }}
+                  onClick={() => {
+                    close();
+                    if (onLogin) onLogin();
+                    else history.push("/login");
+                  }}
                   className={outlineBtn + " w-full text-left"}
                 >
                   Ingresar
@@ -232,9 +271,13 @@ export default function Navbar({
   );
 }
 
-function UserMenu({ user, profile, onLogout, outlineBtn, isTransparentNow }) {
+function UserMenu({ user, profile, onLogout, outlineBtn, isTransparentNow, isAdminUser, hasStock }) {
   const [dropOpen, setDropOpen] = useState(false);
   const displayName = profile?.name || user.displayName || user.email?.split("@")[0] || "Usuario";
+  const showMiStock = hasStock;
+  const itemClass = `flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm font-medium transition ${
+    isTransparentNow ? "hover:bg-white/10" : "hover:bg-slate-100"
+  }`;
 
   return (
     <div className="relative">
@@ -253,7 +296,7 @@ function UserMenu({ user, profile, onLogout, outlineBtn, isTransparentNow }) {
       {dropOpen && (
         <>
           <div className="fixed inset-0 z-10" onClick={() => setDropOpen(false)} />
-          <div className={`absolute right-0 z-20 mt-2 w-48 rounded-2xl border p-1 shadow-xl ${
+          <div className={`absolute right-0 z-20 mt-2 w-56 rounded-2xl border p-1 shadow-xl ${
             isTransparentNow
               ? "border-white/20 bg-slate-900/90 text-white backdrop-blur"
               : "border-slate-200 bg-white text-slate-900"
@@ -261,13 +304,30 @@ function UserMenu({ user, profile, onLogout, outlineBtn, isTransparentNow }) {
             <div className={`px-3 py-2 text-xs ${isTransparentNow ? "text-white/60" : "text-slate-500"}`}>
               {user.email}
             </div>
+            {(showMiStock || isAdminUser) && (
+              <hr className={isTransparentNow ? "border-white/15 my-1" : "border-slate-100 my-1"} />
+            )}
+            {showMiStock && (
+              <Link to="/mi-stock" onClick={() => setDropOpen(false)} className={itemClass}>
+                <BikeIcon />
+                Mi stock
+              </Link>
+            )}
+            {isAdminUser && (
+              <>
+                <Link to="/admin" onClick={() => setDropOpen(false)} className={itemClass}>
+                  <GearIcon />
+                  Panel admin
+                </Link>
+                <Link to="/admin/users?new=1" onClick={() => setDropOpen(false)} className={itemClass}>
+                  <UserPlusIcon />
+                  Generar usuario
+                </Link>
+              </>
+            )}
             <hr className={isTransparentNow ? "border-white/15 my-1" : "border-slate-100 my-1"} />
-            <button
-              onClick={onLogout}
-              className={`w-full rounded-xl px-3 py-2 text-left text-sm transition ${
-                isTransparentNow ? "hover:bg-white/10" : "hover:bg-slate-100"
-              }`}
-            >
+            <button onClick={onLogout} className={itemClass}>
+              <LogoutIcon />
               Cerrar sesión
             </button>
           </div>
@@ -277,7 +337,43 @@ function UserMenu({ user, profile, onLogout, outlineBtn, isTransparentNow }) {
   );
 }
 
-function PrimaryLinks({ onNavigate, linkInactive, linkActive, ringClass, isAdminUser, isClient, authLoading, profile }) {
+function BikeIcon() {
+  return (
+    <svg className="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <circle cx="5.5" cy="17.5" r="3.5" />
+      <circle cx="18.5" cy="17.5" r="3.5" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M5.5 17.5 10 8h5l3.5 9.5M10 8l2.5 5.5H18M10 8 8 5h-2" />
+    </svg>
+  );
+}
+
+function GearIcon() {
+  return (
+    <svg className="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <circle cx="12" cy="12" r="3" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+    </svg>
+  );
+}
+
+function UserPlusIcon() {
+  return (
+    <svg className="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <circle cx="9" cy="8" r="4" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M2 21c0-4 3-6.5 7-6.5s7 2.5 7 6.5M19 8v6M22 11h-6" />
+    </svg>
+  );
+}
+
+function LogoutIcon() {
+  return (
+    <svg className="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path strokeLinecap="round" strokeLinejoin="round" d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3" />
+    </svg>
+  );
+}
+
+function PrimaryLinks({ onNavigate, linkInactive, linkActive, ringClass, isAdminUser, isClient, hasStock, authLoading, profile }) {
   const base =
     `text-sm font-medium transition rounded-lg px-3 py-2 focus:outline-none focus-visible:ring-2 ${ringClass}`;
   return (
@@ -288,16 +384,16 @@ function PrimaryLinks({ onNavigate, linkInactive, linkActive, ringClass, isAdmin
       <NavLink to="/catalogo" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
         Catálogo
       </NavLink>
+      {hasStock && (
+        <NavLink to="/mi-stock" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
+          Mi stock
+        </NavLink>
+      )}
       {isClient && (
         <>
           <NavLink to="/mis-pedidos" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
             Mis comprobantes
           </NavLink>
-          {profile?.contabiliumDepositoId && (
-            <NavLink to="/mi-stock" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
-              Mi stock
-            </NavLink>
-          )}
           <NavLink to="/mi-cuenta" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
             Mi cuenta
           </NavLink>
@@ -312,11 +408,6 @@ function PrimaryLinks({ onNavigate, linkInactive, linkActive, ringClass, isAdmin
             Quiero ser cliente
           </NavLink>
         </>
-      )}
-      {isAdminUser && (
-        <NavLink to="/admin" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
-          Admin
-        </NavLink>
       )}
     </div>
   );

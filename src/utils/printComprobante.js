@@ -17,10 +17,10 @@ export function printComprobante(comprobante) {
 
   const rowsHtml = items.map((item) => `
     <tr>
-      <td>${item.Descripcion || '—'}</td>
+      <td>${item.Concepto || item.Descripcion || '—'}</td>
       <td class="right">${item.Cantidad ?? 0}</td>
       <td class="right">${money(item.PrecioUnitario)}</td>
-      <td class="right">${money(item.Total)}</td>
+      <td class="right">${money(item.Total ?? (Number(item.PrecioUnitario) || 0) * (Number(item.Cantidad) || 0))}</td>
     </tr>
   `).join('');
 

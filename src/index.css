@@ -1,1 +1,53 @@
 @import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+html, body {
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
+*, *::before, *::after {
+  transition-property: background-color, border-color, color, fill, stroke, box-shadow;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  transition-duration: 700ms;
+}
+
+@keyframes drift-slow {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(2rem, -1.5rem) scale(1.06); }
+}
+@keyframes drift-slow-reverse {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(-1.75rem, 1.5rem) scale(1.05); }
+}
+@keyframes float-y {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-3px); }
+}
+@keyframes ken-burns {
+  0% { transform: scale(1) translate(0, 0); }
+  100% { transform: scale(1.12) translate(-1%, -1%); }
+}
+@keyframes title-word-in {
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes logo-dot-pulse {
+  0%, 100% { opacity: 0.55; transform: translate(-50%, -50%) scale(1); }
+  50% { opacity: 1; transform: translate(-50%, -50%) scale(1.35); }
+}
+
+.animate-drift-slow {
+  animation: drift-slow 10s ease-in-out infinite;
+}
+.animate-drift-slow-reverse {
+  animation: drift-slow-reverse 12s ease-in-out infinite;
+}
+.animate-float-y {
+  animation: float-y 3.6s ease-in-out infinite;
+}
+.animate-logo-dot-pulse {
+  animation: logo-dot-pulse 2s ease-in-out infinite;
+}
+.animate-ken-burns {
+  animation: ken-burns 14s ease-in-out infinite alternate;
+}

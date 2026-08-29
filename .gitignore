@@ -25,3 +25,10 @@ dist-ssr
 
 # Datos internos con información real de clientes/distribuidores (no subir al repo público)
 scripts/contabilium-depositos.json
+
+# Credencial de cuenta de servicio de Firebase (acceso admin total a Firestore/Auth/Storage)
+serviceAccountKey.json
+
+# Variables de entorno con claves/API keys
+.env
+.env.*

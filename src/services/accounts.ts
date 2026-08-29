@@ -19,6 +19,7 @@ export type Account = {
   city?: string;
   vertical?: string;
   customerTypeId?: string | null;
+  vendedor?: string | null;
   // Integración Contabilium
   contabiliumId?:   number | null;
   idListaPrecio?:   number | null;

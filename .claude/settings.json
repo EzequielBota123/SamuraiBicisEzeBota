@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(lsof -i :5173 -sTCP:LISTEN -t)",
+      "Bash(kill -9 7247)",
+      "Bash(nohup npm run dev -- --port 5173)",
+      "Read(//tmp/**)",
+      "Bash(npm uninstall *)",
+      "Bash(npx playwright *)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5173/admin/crm/asignar)",
+      "Bash(ls ~/Library/Caches/ms-playwright/ 2>/dev/null)",
+      "Read(//Users/ezequielbota/Library/Caches/ms-playwright/**)",
+      "Bash(python3 -)",
+      "Bash(CRM_TEST_EMAIL='ezequielbota@samurai.ar' CRM_TEST_PASS='Capoeze1834' node /private/tmp/claude-501/-Users-ezequielbota-SamuraiBicis/3579da40-46ab-4df6-984c-c1441acda6db/scratchpad/crm-test.mjs)",
+      "Bash(CRM_TEST_EMAIL='ezequielbota@samurai.ar' CRM_TEST_PASS='Capoeze1834' node crm-test.mjs)",
+      "Bash(sed -i '' 's/waitUntil: \"networkidle\"/waitUntil: \"load\"/g' /Users/ezequielbota/SamuraiBicis/crm-test.mjs)",
+      "Bash(CRM_TEST_EMAIL='ezequielbota@samurai.ar' CRM_TEST_PASS='Capoeze1834' node /Users/ezequielbota/SamuraiBicis/crm-test.mjs)",
+      "Bash(firebase deploy *)",
+      "Bash(curl -s https://samurai.ar/manifest.webmanifest)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" https://samurai.ar/favicon.svg)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" https://samurai.ar/icons/apple-touch-icon.png)",
+      "Bash(curl -s https://samurai.ar/sw.js)",
+      "Bash(firebase functions:secrets:access CONTABILIUM_EMAIL)",
+      "Bash(gcloud auth *)",
+      "Bash(firebase functions:secrets:access CONTABILIUM_API_KEY)",
+      "Bash(node /private/tmp/claude-501/-Users-ezequielbota-SamuraiBicis/1a45bd5d-7f50-4660-9b73-cd197b1247c5/scratchpad/check_blanco.js)",
+      "Bash(node -e ' *)",
+      "Bash(node -e \"console.log\\(new Date\\(1787952100*1000\\).toISOString\\(\\)\\)\")"
+    ]
+  }
+}

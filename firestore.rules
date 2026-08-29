@@ -55,8 +55,73 @@ service cloud.firestore {
     // de distribuidores): solo lectura para usuarios staff, nunca escritura desde el cliente.
     match /internalData/{id} {
       allow read: if request.auth != null &&
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ["admin", "manager", "viewer"];
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
       allow write: if false;
+    }
+
+    // CRM interno (ex-Supabase): clientes/vendedores/asignaciones de
+    // telemarketing. Solo staff admin (mismo gate que /admin/crm en la app).
+    match /crmVendedores/{id} {
+      allow read, write: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+    match /crmClientes/{id} {
+      allow read, write: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+    match /crmAsignaciones/{id} {
+      allow read, write: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+
+    // Cobranzas sincronizadas desde Contabilium (conciliación bancaria) y
+    // el historial de imputaciones de pagos. Solo staff admin.
+    match /cobranzas/{id} {
+      allow read: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+      // El grueso se escribe desde Cloud Functions (Admin SDK). Se permite
+      // que un admin adjunte el comprobante de pago de una cobranza puntual
+      // desde el navegador, sin tocar el resto de los campos.
+      allow update: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin" &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(["comprobantePagoUrl"]);
+      allow create, delete: if false;
+    }
+    match /imputaciones/{id} {
+      allow read, write: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+
+    // Auditorías de stock consignado (video que graba el distribuidor desde
+    // "Mi Stock", visible para el admin en Stock Consignado).
+    match /stockAudits/{id} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null && (
+        request.resource.data.distributorUid == request.auth.uid ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin"
+      );
+      allow update, delete: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+
+    // Pagos reportados por el staff desde Conciliación Bancaria (vincular un
+    // movimiento del banco a un cliente) y cheques registrados junto a un
+    // recibo (foto + N° de cheque). Solo staff admin.
+    match /pagosReportados/{id} {
+      allow read, write: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+    match /chequesRegistrados/{id} {
+      allow read, write: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+
+    // Historial de extractos bancarios subidos en Cobranzas (conciliación
+    // bancaria) — fecha/hora y movimientos de cada archivo, compartido para
+    // todo el equipo. Solo staff admin.
+    match /extractosBancarios/{id} {
+      allow read, write: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
     }
 
     // Todo lo demás cerrado

@@ -1,6 +1,7 @@
 // src/services/orders.ts
 import {
   collection,
+  deleteDoc,
   doc,
   getDoc,
   getDocs,
@@ -21,7 +22,7 @@ import { auth } from "../firebase";
 import { db } from "../firebase";
 import { authReady } from "../authReady";
 
-export type OrderItem = { id: string; name: string; price: number; qty: number; };
+export type OrderItem = { id: string; name: string; price: number; qty: number; sku?: string; };
 export type Customer = { name: string; email?: string; phone?: string; notes?: string; };
 
 const ORDERS = collection(db, "orders");
@@ -66,6 +67,7 @@ function normalizeItems(rawItems: unknown): OrderItem[] {
       name: String(item?.name || ""),
       price: Number(item?.price ?? 0),
       qty: Number(item?.qty ?? 0),
+      sku: item?.sku ? String(item.sku) : undefined,
     }))
     .filter((it) => it.id && it.name);
 }
@@ -98,7 +100,8 @@ export async function createOrder({
     id: String(it.id),
     name: String(it.name || "").trim(),
     price: Number(it.price || 0),
-    qty: Math.max(1, Math.min(999, Number(it.qty || 1)))
+    qty: Math.max(1, Math.min(999, Number(it.qty || 1))),
+    ...(it.sku ? { sku: String(it.sku) } : {}),
   })).filter(it => it.id && it.name && it.qty > 0);
 
   if (!cleanItems.length) throw new Error("Carrito vacío.");
@@ -208,6 +211,16 @@ export async function updateOrderStatus(
   await updateDoc(doc(db, "orders", orderId), patch);
 }
 
+// Actualiza los items de un pedido propio (para sacar productos si el
+// cliente se arrepiente antes de que Samurai lo procese). Si queda sin
+// items, cancela el pedido directamente.
+export async function updateMyOrderItems(orderId: string, items: OrderItem[]) {
+  const total = items.reduce((acc, it) => acc + Number(it.price || 0) * Number(it.qty || 0), 0);
+  const patch: any = { items, total, updatedAt: serverTimestamp() };
+  if (items.length === 0) patch.status = "cancelada";
+  await updateDoc(doc(db, "orders", orderId), patch);
+}
+
 // Vincula manualmente una orden con el número de comprobante de Contabilium.
 // La sincronización (M6) resuelve el saldo y actualiza el estado en la próxima corrida.
 export async function linkOrderComprobante(orderId: string, numero: string) {
@@ -237,6 +250,10 @@ export async function getOrderStatus(orderId: string, opts: { email?: string } =
   }
 
   return toOrderRecord(snap.id, snap);
+}
+
+export async function deleteOrder(orderId: string): Promise<void> {
+  await deleteDoc(doc(db, "orders", orderId));
 }
 
 export async function listCustomerOrders(uid: string): Promise<OrderRecord[]> {
