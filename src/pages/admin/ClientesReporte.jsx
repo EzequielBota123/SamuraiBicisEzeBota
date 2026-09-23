@@ -18,8 +18,12 @@ const ORDENES = {
   deuda: (a, b) => b.saldoDeudor - a.saldoDeudor,
   favor: (a, b) => b.saldoAFavor - a.saldoAFavor,
   facturado: (a, b) => b.facturadoTotal - a.facturadoTotal,
+  facturadoAsc: (a, b) => a.facturadoTotal - b.facturadoTotal,
   cobrado: (a, b) => b.cobradoTotal - a.cobradoTotal,
   stock: (a, b) => b.stockConsignado - a.stockConsignado,
+  stockAsc: (a, b) => a.stockConsignado - b.stockConsignado,
+  valorConsignado: (a, b) => b.valorConsignado - a.valorConsignado,
+  valorConsignadoAsc: (a, b) => a.valorConsignado - b.valorConsignado,
   nombre: (a, b) => (a.nombre || "").localeCompare(b.nombre || ""),
 };
 
@@ -27,6 +31,7 @@ export default function ClientesReporte() {
   const [data, setData] = useState(null);
   const [orden, setOrden] = useState("deuda");
   const [search, setSearch] = useState("");
+  const [soloConsignados, setSoloConsignados] = useState(false);
   const [refrescando, setRefrescando] = useState(false);
   const [error, setError] = useState("");
 
@@ -47,6 +52,9 @@ export default function ClientesReporte() {
   const rows = useMemo(() => {
     if (!data) return [];
     let list = data.rows;
+    if (soloConsignados) {
+      list = list.filter((r) => r.stockConsignado > 0);
+    }
     if (search.trim()) {
       const q = search.trim().toLowerCase();
       list = list.filter(
@@ -54,7 +62,7 @@ export default function ClientesReporte() {
       );
     }
     return [...list].sort(ORDENES[orden] || ORDENES.deuda);
-  }, [data, orden, search]);
+  }, [data, orden, search, soloConsignados]);
 
   const totales = useMemo(() => {
     if (!data) return null;
@@ -169,10 +177,22 @@ export default function ClientesReporte() {
           <option value="deuda">Ordenar: mayor deuda</option>
           <option value="favor">Ordenar: mayor a favor</option>
           <option value="facturado">Ordenar: mayor facturado</option>
+          <option value="facturadoAsc">Ordenar: menor facturado</option>
           <option value="cobrado">Ordenar: mayor cobrado</option>
           <option value="stock">Ordenar: mayor stock consignado</option>
+          <option value="stockAsc">Ordenar: menor stock consignado</option>
+          <option value="valorConsignado">Ordenar: mayor valor consignado</option>
+          <option value="valorConsignadoAsc">Ordenar: menor valor consignado</option>
           <option value="nombre">Ordenar: nombre (A-Z)</option>
         </select>
+        <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-200">
+          <input
+            type="checkbox"
+            checked={soloConsignados}
+            onChange={(e) => setSoloConsignados(e.target.checked)}
+          />
+          Solo con stock consignado
+        </label>
       </div>
 
       {loading ? (
@@ -185,8 +205,20 @@ export default function ClientesReporte() {
                 <th className="px-3 py-2">Cliente</th>
                 <th className="px-3 py-2">Localidad</th>
                 <th className="px-3 py-2 text-right">Stock</th>
-                <th className="px-3 py-2 text-right">Valor consignado</th>
-                <th className="px-3 py-2 text-right">Facturado</th>
+                <th
+                  className="cursor-pointer px-3 py-2 text-right select-none hover:text-slate-700 dark:hover:text-neutral-200"
+                  onClick={() => setOrden(orden === "valorConsignadoAsc" ? "valorConsignado" : "valorConsignadoAsc")}
+                  title="Ordenar por valor consignado"
+                >
+                  Valor consignado{orden === "valorConsignadoAsc" ? " ▲" : orden === "valorConsignado" ? " ▼" : ""}
+                </th>
+                <th
+                  className="cursor-pointer px-3 py-2 text-right select-none hover:text-slate-700 dark:hover:text-neutral-200"
+                  onClick={() => setOrden(orden === "facturadoAsc" ? "facturado" : "facturadoAsc")}
+                  title="Ordenar por facturado"
+                >
+                  Facturado{orden === "facturadoAsc" ? " ▲" : orden === "facturado" ? " ▼" : ""}
+                </th>
                 <th className="px-3 py-2">1ª factura</th>
                 <th className="px-3 py-2">Última factura</th>
                 <th className="px-3 py-2 text-right">Cobrado</th>

@@ -8,7 +8,7 @@ import {
 } from "../../services/accounts";
 import { BusyButtonContent, LoadingOverlay } from "../../components/ui/LoadingIndicators";
 import { subscribeCustomerTypes } from "../../services/customerTypes";
-import { getContabiliumDepositos } from "../../services/contabiliumDepositos";
+import { getContabiliumDepositos, labelDeposito, matchDeposito } from "../../services/contabiliumDepositos";
 import { getDepositoStockAdmin, createUserWithPassword, adminSetUserPassword, auditLegacyUsers, adminRenameUsername, adminDeleteUser, adminLinkDepositoClientes } from "../../services/comprobantes";
 
 const statusStyles = {
@@ -127,7 +127,7 @@ export default function Users() {
           await adminRenameUsername(editing.id, newUsername);
         }
       } else {
-        await createUserWithPassword(data.name, data.password);
+        await createUserWithPassword(data.name, data.password, { cuit: data.cuit, telefono: data.telefono });
       }
       setModalOpen(false);
       setEditing(null);
@@ -250,6 +250,7 @@ export default function Users() {
           >
             <option value="all">Todos los roles</option>
             <option value="admin">Admin</option>
+            <option value="chofer">Chofer</option>
             <option value="viewer">Viewer</option>
           </select>
           <select
@@ -422,9 +423,12 @@ function UserModal({ open, onClose, onSubmit, initial, customerTypes }) {
   const isNew = !initial?.id;
   const [name, setName]               = useState(initial?.name || "");
   const [password, setPassword]       = useState("");
+  const [cuitNuevo, setCuitNuevo]     = useState("");
+  const [telefonoNuevo, setTelefonoNuevo] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [username, setUsername] = useState(initial?.username || "");
   const [role, setRole]               = useState(initial?.role || "viewer");
+  const [esChofer, setEsChofer]       = useState(initial?.esChofer === true);
   const [status, setStatus]           = useState(initial?.status || "activo");
   const [customerTypeId, setCustomerTypeId] = useState(initial?.customerTypeId || "");
   const [creditLimit, setCreditLimit] = useState(initial?.creditLimit?.toString() || "");
@@ -459,10 +463,11 @@ function UserModal({ open, onClose, onSubmit, initial, customerTypes }) {
   const filteredDepositos = useMemo(() => {
     const q = depositoSearch.trim().toLowerCase();
     if (!q) return depositos;
-    return depositos.filter((d) => (d.nombre || "").toLowerCase().includes(q));
+    return depositos.filter((d) => matchDeposito(d, q));
   }, [depositos, depositoSearch]);
 
-  const selectedDepositoNombre = depositos.find((d) => String(d.id) === depositoId)?.nombre || "";
+  const selectedDeposito = depositos.find((d) => String(d.id) === depositoId);
+  const selectedDepositoNombre = selectedDeposito?.nombre || "";
 
   useEffect(() => {
     if (!open) return;
@@ -474,9 +479,12 @@ function UserModal({ open, onClose, onSubmit, initial, customerTypes }) {
   useEffect(() => {
     setName(initial?.name || "");
     setPassword("");
+    setCuitNuevo("");
+    setTelefonoNuevo("");
     setNewPassword("");
     setUsername(initial?.username || "");
     setRole(initial?.role || "viewer");
+    setEsChofer(initial?.esChofer === true);
     setStatus(initial?.status || "activo");
     setCustomerTypeId(initial?.customerTypeId || "");
     setCreditLimit(initial?.creditLimit?.toString() || "");
@@ -543,11 +551,12 @@ function UserModal({ open, onClose, onSubmit, initial, customerTypes }) {
             e.preventDefault();
             setSaving(true);
             if (isNew) {
-              await onSubmit({ name, password });
+              await onSubmit({ name, password, cuit: cuitNuevo.trim() || null, telefono: telefonoNuevo.trim() || null });
             } else {
               await onSubmit({
                 name,
                 role,
+                esChofer: role === "chofer" ? false : esChofer,
                 status,
                 customerTypeId:  customerTypeId || null,
                 contabiliumId:   contabiliumId ? Number(contabiliumId) : null,
@@ -585,6 +594,31 @@ function UserModal({ open, onClose, onSubmit, initial, customerTypes }) {
               />
               <p className="text-[11px] text-slate-500">
                 Mínimo 6 caracteres. Después de crear el usuario podés asignarle rol, tipo de cliente y depósito consignado editándolo.
+              </p>
+            </div>
+          )}
+
+          {isNew && (
+            <div className="space-y-2 rounded-2xl border border-sky-200 bg-sky-50 p-3">
+              <label className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                CUIT (opcional) — crea el cliente en Contabilium automáticamente
+              </label>
+              <input
+                placeholder="Ej: 20304050607"
+                inputMode="numeric"
+                className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40"
+                value={cuitNuevo}
+                onChange={(e) => setCuitNuevo(e.target.value)}
+              />
+              <input
+                placeholder="Teléfono (opcional)"
+                className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40"
+                value={telefonoNuevo}
+                onChange={(e) => setTelefonoNuevo(e.target.value)}
+              />
+              <p className="text-[11px] text-slate-500">
+                Si completás el CUIT, se busca al padrón de AFIP y se crea la ficha de Cliente en Contabilium sola, ya vinculada
+                a esta cuenta. El depósito de consignación todavía hay que crearlo a mano en Contabilium.
               </p>
             </div>
           )}
@@ -627,7 +661,16 @@ function UserModal({ open, onClose, onSubmit, initial, customerTypes }) {
               >
                 <option value="viewer">Viewer (cliente, sin acceso a admin)</option>
                 <option value="admin">Admin (acceso total al panel)</option>
+                <option value="chofer">Chofer (mapa, stock consignado y notas de entrega)</option>
               </select>
+              {role !== "chofer" && (
+                <label className="mt-2 flex items-start gap-2 text-xs text-slate-600">
+                  <input type="checkbox" className="mt-0.5" checked={esChofer} onChange={(e) => setEsChofer(e.target.checked)} />
+                  <span>
+                    También es chofer — entra al sector chofer (chequeo de vehículo y viajes) sin perder lo que ya ve con su rol.
+                  </span>
+                </label>
+              )}
             </div>
             <div className="space-y-2">
               <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Estado</label>
@@ -713,7 +756,7 @@ function UserModal({ open, onClose, onSubmit, initial, customerTypes }) {
                   className="flex w-full items-center justify-between rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-left text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40"
                 >
                   <span className={selectedDepositoNombre ? "text-slate-900" : "text-slate-400"}>
-                    {selectedDepositoNombre || "Sin depósito asignado"}
+                    {selectedDeposito ? labelDeposito(selectedDeposito) : "Sin depósito asignado"}
                   </span>
                   <svg viewBox="0 0 20 20" fill="currentColor" className="h-4 w-4 shrink-0 text-slate-400">
                     <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clipRule="evenodd" />
@@ -727,7 +770,7 @@ function UserModal({ open, onClose, onSubmit, initial, customerTypes }) {
                         autoFocus
                         value={depositoSearch}
                         onChange={(e) => setDepositoSearch(e.target.value)}
-                        placeholder="Buscar depósito por nombre…"
+                        placeholder="Buscar depósito por nombre, número propio o ID de Contabilium…"
                         className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 outline-none focus:border-sky-400"
                       />
                     </div>
@@ -758,7 +801,7 @@ function UserModal({ open, onClose, onSubmit, initial, customerTypes }) {
                               String(d.id) === depositoId ? "font-semibold text-sky-600" : "text-slate-700"
                             }`}
                           >
-                            {d.nombre}
+                            {labelDeposito(d)}
                           </button>
                         </li>
                       ))}

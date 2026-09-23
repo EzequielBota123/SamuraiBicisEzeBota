@@ -2,7 +2,173 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../../auth/AuthContext";
 import { listCustomerOrders } from "../../services/orders";
+import { getClientComprobantes } from "../../services/comprobantes";
+import PagoCCModal from "../../components/stock/PagoCCModal";
 import { LoadingSpinner } from "../../components/ui/LoadingIndicators";
+
+const TIPO_LABEL_COMPROBANTE = { FCA: "Factura A", NCA: "Nota de Crédito A", NDA: "Nota de Débito A" };
+const TIPO_BADGE_COMPROBANTE = {
+  FCA: "bg-blue-100 text-blue-800",
+  NCA: "bg-emerald-100 text-emerald-800",
+  NDA: "bg-amber-100 text-amber-800",
+};
+
+function isComprobanteVencido(fechaVencimiento) {
+  if (!fechaVencimiento) return false;
+  return new Date(fechaVencimiento + "T23:59:59") < new Date();
+}
+
+function fmtFechaComprobante(s) {
+  if (!s) return "—";
+  const d = new Date(s.includes("T") ? s : s + "T00:00:00");
+  return d.toLocaleDateString("es-AR", { day: "2-digit", month: "2-digit", year: "numeric" });
+}
+
+// Sección "Mis comprobantes" — facturas/notas de Contabilium y saldo de
+// cuenta corriente. Antes vivía en una pantalla aparte ("/mis-pedidos"),
+// separada de "Estado de pedido" ("/estado-de-pedido"); un cliente que
+// entraba a "Mis pedidos" buscando el pedido que acababa de hacer se
+// encontraba con facturas (o nada) en vez de su pedido, porque son dos
+// cosas distintas con nombres parecidos. Ahora las dos viven juntas acá,
+// como pestañas, así no importa cuál de los dos links use para entrar.
+function ComprobantesTab() {
+  const [comprobantes, setComprobantes] = useState([]);
+  const [saldoTotal, setSaldoTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [tipoFiltro, setTipoFiltro] = useState("all");
+  const [pagoModalOpen, setPagoModalOpen] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    getClientComprobantes()
+      .then(({ items, saldoTotal: saldo }) => {
+        if (cancelled) return;
+        setComprobantes(items);
+        setSaldoTotal(saldo ?? 0);
+      })
+      .catch((err) => { if (!cancelled) setError(err.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const filtered = tipoFiltro === "all" ? comprobantes : comprobantes.filter((c) => c.Tipo === tipoFiltro);
+
+  return (
+    <div>
+      {!loading && !error && (
+        <div className={`mb-6 rounded-2xl border p-6 ${saldoTotal > 0 ? "border-red-200 bg-red-50" : "border-emerald-200 bg-emerald-50"}`}>
+          <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+            {saldoTotal > 0 ? "Debés" : saldoTotal < 0 ? "Tenés saldo a favor" : "Saldo total"}
+          </p>
+          <p className={`mt-2 text-3xl font-bold ${saldoTotal > 0 ? "text-red-700" : "text-emerald-700"}`}>
+            {formatMoney(saldoTotal)}
+          </p>
+          <p className="mt-1 text-sm text-slate-500">
+            {saldoTotal > 0
+              ? "Tenés saldo pendiente de pago."
+              : saldoTotal < 0
+              ? "Pagaste de más / tenés crédito a favor."
+              : "Estás al día, sin saldo pendiente."}
+          </p>
+          <button
+            onClick={() => setPagoModalOpen(true)}
+            className="mt-4 inline-flex items-center gap-1.5 rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
+          >
+            💳 Subir comprobante de pago
+          </button>
+        </div>
+      )}
+
+      <PagoCCModal open={pagoModalOpen} onClose={() => setPagoModalOpen(false)} />
+
+      <div className="mb-6 flex flex-wrap gap-2">
+        {["all", "FCA", "NCA", "NDA"].map((tipo) => (
+          <button
+            key={tipo}
+            onClick={() => setTipoFiltro(tipo)}
+            className={`rounded-xl px-4 py-2 text-sm font-medium transition ${
+              tipoFiltro === tipo ? "bg-slate-900 text-white" : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+            }`}
+          >
+            {tipo === "all" ? "Todos" : TIPO_LABEL_COMPROBANTE[tipo]}
+          </button>
+        ))}
+      </div>
+
+      {loading && (
+        <div className="flex min-h-[160px] items-center justify-center">
+          <LoadingSpinner label="Cargando comprobantes…" />
+        </div>
+      )}
+
+      {error && (
+        <div className="rounded-2xl border border-red-200 bg-red-50 p-6 text-sm text-red-700">
+          {error.includes("sin vinculación")
+            ? "Tu cuenta aún no está sincronizada con nuestro sistema. Contactá al equipo comercial."
+            : `No se pudieron cargar los comprobantes: ${error}`}
+        </div>
+      )}
+
+      {!loading && !error && filtered.length === 0 && (
+        <div className="rounded-2xl border border-slate-200 bg-white py-16 text-center">
+          <p className="text-slate-400">No hay comprobantes para mostrar.</p>
+        </div>
+      )}
+
+      {!loading && !error && filtered.length > 0 && (
+        <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-slate-100">
+              <thead>
+                <tr className="bg-slate-50 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  <th className="px-6 py-3 text-left">Tipo</th>
+                  <th className="px-6 py-3 text-left">Número</th>
+                  <th className="px-6 py-3 text-left">Fecha</th>
+                  <th className="px-6 py-3 text-left">Vencimiento</th>
+                  <th className="px-6 py-3 text-right">Total</th>
+                  <th className="px-6 py-3 text-right">Saldo</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {filtered.map((c) => {
+                  const overdue = isComprobanteVencido(c.FechaVencimiento) && c.Saldo > 0;
+                  return (
+                    <tr key={c.Id} className="transition-colors hover:bg-slate-50">
+                      <td className="px-6 py-4">
+                        <span className={`inline-flex rounded-full px-2.5 py-0.5 text-xs font-semibold ${TIPO_BADGE_COMPROBANTE[c.Tipo] || "bg-slate-100 text-slate-700"}`}>
+                          {TIPO_LABEL_COMPROBANTE[c.Tipo] || c.Tipo}
+                        </span>
+                      </td>
+                      <td className="px-6 py-4 font-mono text-sm text-slate-700">{c.Numero || c.Id}</td>
+                      <td className="px-6 py-4 text-sm text-slate-600">{fmtFechaComprobante(c.Fecha)}</td>
+                      <td className="px-6 py-4 text-sm">
+                        {c.FechaVencimiento ? (
+                          <span className={overdue ? "font-semibold text-red-600" : "text-slate-600"}>
+                            {fmtFechaComprobante(c.FechaVencimiento)}
+                            {overdue && <span className="ml-1 text-xs">(vencido)</span>}
+                          </span>
+                        ) : "—"}
+                      </td>
+                      <td className="px-6 py-4 text-right text-sm font-semibold text-slate-900">{formatMoney(c.Total)}</td>
+                      <td className="px-6 py-4 text-right text-sm">
+                        <span className={c.Saldo > 0 ? (overdue ? "font-semibold text-red-600" : "font-semibold text-amber-600") : "text-emerald-600"}>
+                          {formatMoney(c.Saldo)}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 const statusLabels = {
   solicitud: "Solicitud recibida",
@@ -448,6 +614,7 @@ function SupportCard() {
 
 export default function OrderStatusPage() {
   const { user, loading: authLoading } = useAuth();
+  const [tab, setTab] = useState("pedidos");
   const [orders, setOrders] = useState([]);
   const [selectedOrderId, setSelectedOrderId] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -542,30 +709,61 @@ export default function OrderStatusPage() {
           </div>
         </section>
 
-        <section className="relative mt-8 rounded-3xl border border-slate-200 bg-white p-8 shadow-[0_45px_90px_-65px_rgba(15,23,42,0.45)] dark:border-neutral-800 dark:bg-neutral-900 dark:shadow-none">
+        {uid && !authLoading && (
+          <div className="mt-8 flex gap-2">
+            <button
+              type="button"
+              onClick={() => setTab("pedidos")}
+              className={`rounded-xl px-4 py-2 text-sm font-semibold transition ${
+                tab === "pedidos"
+                  ? "bg-slate-900 text-white dark:bg-white dark:text-slate-900"
+                  : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300"
+              }`}
+            >
+              📦 Pedidos
+            </button>
+            <button
+              type="button"
+              onClick={() => setTab("comprobantes")}
+              className={`rounded-xl px-4 py-2 text-sm font-semibold transition ${
+                tab === "comprobantes"
+                  ? "bg-slate-900 text-white dark:bg-white dark:text-slate-900"
+                  : "border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300"
+              }`}
+            >
+              🧾 Comprobantes y saldo
+            </button>
+          </div>
+        )}
+
+        <section className="relative mt-4 rounded-3xl border border-slate-200 bg-white p-8 shadow-[0_45px_90px_-65px_rgba(15,23,42,0.45)] dark:border-neutral-800 dark:bg-neutral-900 dark:shadow-none">
           {authLoading ? (
             <div className="flex min-h-[240px] items-center justify-center">
               <LoadingSpinner label="Preparando tu espacio de pedidos…" />
             </div>
           ) : uid ? (
-            <div className="space-y-8">
-              {error ? (
-                <ErrorCallout message={error} onRetry={handleRetry} loading={loading} />
-              ) : null}
-              <div className="grid gap-8 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,1.9fr)]">
-                <OrdersList
-                  orders={orders}
-                  selectedOrderId={selectedOrder?.id || selectedOrderId}
-                  onSelect={setSelectedOrderId}
-                  onReload={handleRetry}
-                  loading={loading}
-                />
-                <div>
-                  {selectedOrder ? <OrderSummary order={selectedOrder} /> : <EmptySelectionState />}
+            tab === "comprobantes" ? (
+              <ComprobantesTab />
+            ) : (
+              <div className="space-y-8">
+                {error ? (
+                  <ErrorCallout message={error} onRetry={handleRetry} loading={loading} />
+                ) : null}
+                <div className="grid gap-8 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,1.9fr)]">
+                  <OrdersList
+                    orders={orders}
+                    selectedOrderId={selectedOrder?.id || selectedOrderId}
+                    onSelect={setSelectedOrderId}
+                    onReload={handleRetry}
+                    loading={loading}
+                  />
+                  <div>
+                    {selectedOrder ? <OrderSummary order={selectedOrder} /> : <EmptySelectionState />}
+                  </div>
                 </div>
+                {!hasOrders ? <SupportCard /> : null}
               </div>
-              {!hasOrders ? <SupportCard /> : null}
-            </div>
+            )
           ) : (
             <LoginPrompt />
           )}

@@ -137,6 +137,12 @@ export default function AuditVideoPlayer({ audit, className = "", videoClassName
         className={videoClassName}
       />
 
+      {audit.nota && (
+        <p className="mt-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 text-[11px] text-slate-600 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-300">
+          📝 {audit.nota}
+        </p>
+      )}
+
       <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
         <button
           type="button"

@@ -20,85 +20,158 @@ async function imageUrlToDataUrl(url) {
     ctx.fillStyle = "#fff";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(bitmap, 0, 0);
-    return canvas.toDataURL("image/jpeg", 0.85);
+    return { dataUrl: canvas.toDataURL("image/jpeg", 0.85), width: bitmap.width, height: bitmap.height };
   } catch {
     return null;
   }
 }
 
-// Precio de lista, sin aplicar ningún descuento particular — el mismo para
-// cualquier prospecto al que se le mande este PDF.
-function listPriceArs(product, exchangeRate) {
-  const contabiliumArs = product.priceArs != null ? Number(product.priceArs) : null;
-  if (Number.isFinite(contabiliumArs) && contabiliumArs > 0) return contabiliumArs;
-  const rate = Number(exchangeRate);
-  const usd = Number(product.price || 0);
-  if (Number.isFinite(rate) && rate > 0 && Number.isFinite(usd)) return usd * rate;
-  return null;
-}
-
-// Genera y descarga un PDF con foto + nombre + precio de lista de todos los
-// productos pasados, para que un distribuidor logueado se lo mande a un
-// prospecto por WhatsApp sin exponer el catálogo online con precios.
-export async function generateCatalogPdf(products, { exchangeRate, fileName = "catalogo-samurai.pdf" } = {}) {
+// Genera y descarga un PDF con foto + nombre + precio de lista de cada
+// MODELO (un color/talle por fila, no una fila por cada variante — para eso
+// está el link a samurai.ar/catalogo, que se comparte aparte del PDF), para
+// que un distribuidor logueado se lo mande a un prospecto por WhatsApp sin
+// exponer el catálogo online con precios. Sin links sueltos adentro del PDF:
+// tarjetas limpias, prolijas, agrupadas por categoría — como en la web.
+//
+// `items`: [{ id, name, category, imageUrl, priceArs, priceUsd, desde }]
+export async function generateCatalogPdf(items, { fileName = "catalogo-samurai.pdf" } = {}) {
   const doc = new jsPDF({ unit: "pt", format: "a4" });
   const pageWidth = doc.internal.pageSize.getWidth();
   const pageHeight = doc.internal.pageSize.getHeight();
-  const margin = 24;
+  const margin = 28;
+  const gap = 12;
   const cols = 2;
-  const cellW = (pageWidth - margin * 2) / cols;
-  const cellH = 190;
-  const imgSize = 120;
+  const cellW = (pageWidth - margin * 2 - gap * (cols - 1)) / cols;
+  const cardPad = 12;
+  const imgSize = cellW - cardPad * 2;
+  const cardH = imgSize + 78;
 
-  doc.setFontSize(16);
-  doc.text("Catálogo Samurai", margin, margin + 14);
-  doc.setFontSize(9);
-  doc.setTextColor(120);
-  doc.text(`Precios de lista · ${new Date().toLocaleDateString("es-AR")}`, margin, margin + 30);
-  doc.setTextColor(0);
+  const ACCENT = [217, 47, 62]; // rose-600, mismo tono que los botones del sitio
+  const INK = [15, 23, 42]; // slate-900
+  const MUTED = [100, 116, 139]; // slate-500
+  const BORDER = [226, 232, 240]; // slate-200
+  const IMG_BG = [248, 250, 252]; // slate-50
 
+  function drawHeader() {
+    doc.setFillColor(...INK);
+    doc.rect(0, 0, pageWidth, 64, "F");
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(18);
+    doc.setTextColor(255, 255, 255);
+    doc.text("Catálogo Samurai", margin, 32);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.setTextColor(203, 213, 225);
+    doc.text(`Precios de lista · ${new Date().toLocaleDateString("es-AR")}`, margin, 48);
+    doc.setTextColor(0, 0, 0);
+  }
+
+  function drawSectionLabel(label, count, y) {
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(12);
+    doc.setTextColor(...INK);
+    doc.text(label, margin, y);
+    const labelW = doc.getTextWidth(label);
+    doc.setDrawColor(...BORDER);
+    doc.setLineWidth(1);
+    doc.line(margin + labelW + 8, y - 4, pageWidth - margin - 60, y - 4);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8.5);
+    doc.setTextColor(...MUTED);
+    doc.text(`${count} producto${count === 1 ? "" : "s"}`, pageWidth - margin, y, { align: "right" });
+    doc.setTextColor(0, 0, 0);
+  }
+
+  drawHeader();
   let x = margin;
-  let y = margin + 48;
+  let y = 64 + 30;
   let col = 0;
+  let currentCategory = null;
 
-  for (const p of products) {
-    if (y + cellH > pageHeight - margin) {
-      doc.addPage();
-      y = margin;
+  for (const it of items) {
+    const isNewCategory = it.category !== currentCategory;
+    const sectionHeaderH = isNewCategory ? 26 : 0;
+
+    // Si cambia de categoría a mitad de fila, cierra la fila actual primero.
+    if (isNewCategory && col !== 0) {
+      col = 0;
+      y += cardH + gap;
     }
-    x = margin + col * cellW;
 
-    const dataUrl = await imageUrlToDataUrl(p.imageUrl);
-    if (dataUrl) {
+    if (y + sectionHeaderH + cardH > pageHeight - margin) {
+      doc.addPage();
+      drawHeader();
+      y = 64 + 30;
+      col = 0;
+    }
+
+    if (isNewCategory) {
+      const countInCategory = items.filter((p) => p.category === it.category).length;
+      drawSectionLabel(it.category || "Otros", countInCategory, y);
+      currentCategory = it.category;
+      y += 18;
+    }
+
+    x = margin + col * (cellW + gap);
+
+    // Tarjeta: borde redondeado prolijo, igual espíritu que las cards del sitio.
+    doc.setDrawColor(...BORDER);
+    doc.setFillColor(255, 255, 255);
+    doc.roundedRect(x, y, cellW, cardH, 8, 8, "FD");
+
+    doc.setFillColor(...IMG_BG);
+    doc.roundedRect(x + cardPad, y + cardPad, imgSize, imgSize, 6, 6, "F");
+
+    const img = await imageUrlToDataUrl(it.imageUrl);
+    if (img) {
       try {
-        doc.addImage(dataUrl, "JPEG", x, y, imgSize, imgSize, undefined, "FAST");
+        // Encaja la imagen dentro del cuadro SIN deformarla (equivalente a
+        // object-fit: contain), centrada — antes se forzaba a imgSize x
+        // imgSize y las fotos no cuadradas quedaban estiradas.
+        const pad = 6;
+        const boxSize = imgSize - pad * 2;
+        const scale = Math.min(boxSize / img.width, boxSize / img.height);
+        const drawW = img.width * scale;
+        const drawH = img.height * scale;
+        const drawX = x + cardPad + pad + (boxSize - drawW) / 2;
+        const drawY = y + cardPad + pad + (boxSize - drawH) / 2;
+        doc.addImage(img.dataUrl, "JPEG", drawX, drawY, drawW, drawH, undefined, "FAST");
       } catch {
         // imagen inválida/corrupta: seguimos sin ella
       }
     } else {
-      doc.setDrawColor(220);
-      doc.rect(x, y, imgSize, imgSize);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(8);
+      doc.setTextColor(...MUTED);
+      doc.text("Sin imagen", x + cellW / 2, y + cardPad + imgSize / 2, { align: "center" });
+      doc.setTextColor(0, 0, 0);
     }
 
-    doc.setFontSize(10);
-    doc.setTextColor(20);
-    const nameLines = doc.splitTextToSize(p.name || "", cellW - imgSize - 16);
-    doc.text(nameLines.slice(0, 4), x + imgSize + 10, y + 16);
+    const textY = y + cardPad + imgSize + 16;
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(9.5);
+    doc.setTextColor(...INK);
+    const nameLines = doc.splitTextToSize(it.name || "", cellW - cardPad * 2);
+    doc.text(nameLines.slice(0, 2), x + cardPad, textY);
 
-    const priceArs = listPriceArs(p, exchangeRate);
-    doc.setFontSize(12);
-    doc.setTextColor(0, 100, 60);
-    doc.text(
-      priceArs != null ? money(priceArs) : `USD ${Number(p.price || 0).toFixed(2)}`,
-      x + imgSize + 10,
-      y + imgSize - 10
-    );
-    doc.setTextColor(0);
+    const priceY = textY + 15 * Math.min(nameLines.length, 2) + 4;
+    if (it.desde) {
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(7.5);
+      doc.setTextColor(...MUTED);
+      doc.text("DESDE", x + cardPad, priceY);
+    }
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(13);
+    doc.setTextColor(...ACCENT);
+    const priceLabel = it.priceArs != null ? money(it.priceArs) : it.priceUsd != null ? `USD ${Number(it.priceUsd).toFixed(2)}` : "Consultar";
+    doc.text(priceLabel, x + cardPad, priceY + (it.desde ? 14 : 0));
+    doc.setTextColor(0, 0, 0);
 
     col++;
     if (col >= cols) {
       col = 0;
-      y += cellH;
+      y += cardH + gap;
     }
   }
 

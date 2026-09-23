@@ -20,6 +20,7 @@ export type Account = {
   vertical?: string;
   customerTypeId?: string | null;
   vendedor?: string | null;
+  esChofer?: boolean; // usuario con otro rol que también reparte (accede al sector chofer)
   // Integración Contabilium
   contabiliumId?:   number | null;
   idListaPrecio?:   number | null;

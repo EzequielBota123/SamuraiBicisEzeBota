@@ -43,13 +43,20 @@ function esCobranzaImputada(c) {
   return formas.length > 0 && formas.every((f) => f.FormaDePago === "Saldo a favor");
 }
 
-export default function Cobranzas() {
+export default function Cobranzas({ initialSearch = "" }) {
   const [items, setItems] = useState(null);
   const [error, setError] = useState("");
   const [syncStatus, setSyncStatus] = useState(null);
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState("");
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(initialSearch);
+
+  // Si nos embeben desde otra pantalla (ej. "Ventas reportadas" → "Ver
+  // cobranzas de este cliente") con un nombre nuevo, actualiza el filtro
+  // aunque el componente ya estuviera montado.
+  useEffect(() => {
+    if (initialSearch) setSearch(initialSearch);
+  }, [initialSearch]);
   const [soloSinImputar, setSoloSinImputar] = useState(false);
   const [mostrarExtracto, setMostrarExtracto] = useState(false);
   const [mostrarCheques, setMostrarCheques] = useState(false);

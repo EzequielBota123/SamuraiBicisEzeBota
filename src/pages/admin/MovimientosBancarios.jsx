@@ -5,6 +5,7 @@ import { db } from "../../firebase";
 import { subscribeCobranzas } from "../../services/cobranzas";
 import ConciliacionBancaria from "./cobranzas/ConciliacionBancaria";
 import MercadoPagoMovimientos from "./movimientos/MercadoPagoMovimientos";
+import GaliciaMovimientos from "./movimientos/GaliciaMovimientos";
 
 function onlyDigits(s) {
   return String(s || "").replace(/\D/g, "");
@@ -12,7 +13,7 @@ function onlyDigits(s) {
 
 const TABS = [
   { id: "mercadopago", label: "💳 Mercado Pago", sub: "Conectado por API" },
-  { id: "galicia", label: "🏦 Banco Galicia", sub: "API (Open Galicia) — pendiente de conectar" },
+  { id: "galicia", label: "🏦 Banco Galicia", sub: "API (Open Galicia) — QA" },
   { id: "supervielle", label: "🏦 Supervielle", sub: "Extracto manual" },
   { id: "santander", label: "🏦 Santander Río", sub: "Extracto manual" },
 ];
@@ -81,18 +82,7 @@ export default function MovimientosBancarios() {
         <MercadoPagoMovimientos clientesPorCuit={clientesPorCuit} clientesPorEmail={clientesPorEmail} />
       )}
 
-      {tab === "galicia" && (
-        <div className="space-y-4">
-          <div className="rounded-2xl border border-sky-200 bg-sky-50 p-4 text-sm text-sky-800 dark:border-sky-900 dark:bg-sky-950/20 dark:text-sky-400">
-            <p className="font-semibold">🔌 Pendiente de conectar por API (Open Galicia)</p>
-            <p className="mt-1 text-xs">
-              Hay que escribir a <b>opengalicia@bancogalicia.com.ar</b> pidiendo acceso al servicio para la cuenta de Samurai. Mientras
-              tanto, subí el extracto acá abajo como con los demás bancos.
-            </p>
-          </div>
-          <ConciliacionBancaria cobranzas={cobranzas} bancoFiltro="galicia" />
-        </div>
-      )}
+      {tab === "galicia" && <GaliciaMovimientos />}
 
       {tab === "supervielle" && <ConciliacionBancaria cobranzas={cobranzas} bancoFiltro="supervielle" />}
 

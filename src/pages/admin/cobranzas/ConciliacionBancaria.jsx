@@ -14,9 +14,10 @@ const EXTRACTOS_COLLECTION = "extractosBancarios";
 // Guarda el extracto subido en Firestore (compartido para todo el equipo,
 // con fecha/hora real) además del localStorage — antes esto se perdía al
 // cambiar de compu o borrar el caché del navegador.
-async function guardarExtractoEnFirestore(fileName, movimientos) {
+async function guardarExtractoEnFirestore(fileName, movimientos, banco) {
   const ref = await addDoc(collection(db, EXTRACTOS_COLLECTION), {
     fileName,
+    banco,
     cantidad: movimientos.length,
     movimientos: movimientos.map((m) => ({ ...m, fecha: m.fecha.toISOString() })),
     subidoPor: auth.currentUser?.email || null,
@@ -351,6 +352,80 @@ function parseSupervielleTexto(lines) {
   return out;
 }
 
+// Parsea el texto reconstruido del "Resumen de cuenta" de Banco Santander
+// (formato "Fecha [Comprobante] Movimiento Débito Crédito Saldo en cuenta").
+// Mismas ideas que parseSupervielleTexto (delta de saldo para saber si un
+// importe es débito o crédito), pero el formato de los montos es distinto:
+// llevan "$ " adelante y el saldo negativo se imprime con el signo ANTES
+// del "$" ("-$ 468.658,96"), no después como en Supervielle.
+function parseSantanderTexto(lines) {
+  const MONEY = "-?\\$\\s?[\\d.]+,\\d{2}";
+  const movRegex = new RegExp(`^(\\d{2}/\\d{2}/\\d{2})\\s+(.+?)\\s+(${MONEY})\\s+(${MONEY})$`);
+  const saldoInicialRegex = new RegExp(`^(\\d{2}/\\d{2}/\\d{2})\\s+Saldo Inicial\\s+(${MONEY})$`, "i");
+  // Marca fin de una sección de movimientos (pesos o dólares) — "Saldo
+  // total" también aparece antes de que arranquen los movimientos, en la
+  // tarjeta resumen de la página 1, por eso no alcanza con un solo chequeo:
+  // simplemente resetea el saldo corriente, sin causar problemas.
+  const finSeccionRegex = /^Saldo total|^Detalle impositivo|^No ten[eé]s movimientos/i;
+  const ruidoRegex = /^(Resumen de cuenta|Per[ií]odo|Emisi[oó]n mensual|Desde:|Hasta:|Cuentas$|Cuenta Corriente|Saldo total en cuentas|Total en pesos|Total en d[oó]lares|Banco Santander|correlativo|tampoco lo hacen|\* Salvo error|Movimientos en pesos|Movimientos en d[oó]lares|Fecha\s+Comprobante|CBU:|^\d+\s*-\s*\d+$|^Legales$|Impuestos al|^Cheques$|^ECHEQs$|^Otros$|Fondos Comunes|Unidad de Informaci[oó]n|Condici[oó]n MiPyme|Ten[eé]s alguna|Llamanos al|Oper[aá] con|Record[aá] que|Tipo de impuesto|Totales de retenci[oó]n|Importe susceptible|Por retenci[oó]n|Total Retenci[oó]n)/i;
+
+  const toNumber = (s) => {
+    const str = String(s).trim();
+    const negativo = str.startsWith("-");
+    const cleaned = str.replace(/^-/, "").replace(/\$/g, "").replace(/\s/g, "");
+    const n = Number(cleaned.replace(/\./g, "").replace(",", "."));
+    return negativo ? -n : n;
+  };
+
+  const out = [];
+  let runningSaldo = null;
+  let currentMov = null;
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+
+    const saldoIniMatch = saldoInicialRegex.exec(line);
+    if (saldoIniMatch) {
+      runningSaldo = toNumber(saldoIniMatch[2]);
+      currentMov = null;
+      continue;
+    }
+
+    if (finSeccionRegex.test(line)) {
+      runningSaldo = null;
+      currentMov = null;
+      continue;
+    }
+
+    const movMatch = movRegex.exec(line);
+    if (movMatch && runningSaldo !== null) {
+      const [, fechaStr, concepto, importeStr, saldoStr] = movMatch;
+      const importe = toNumber(importeStr);
+      const saldo = toNumber(saldoStr);
+      const delta = saldo - runningSaldo;
+      runningSaldo = saldo;
+
+      if (delta > 0.01) {
+        const [, dd, mm, yy] = /^(\d{2})\/(\d{2})\/(\d{2})$/.exec(fechaStr);
+        const fecha = new Date(2000 + Number(yy), Number(mm) - 1, Number(dd));
+        const mov = { cuenta: null, descripcion: concepto, detalle: "", fecha, banco: "Santander", importe, nota: null };
+        out.push(mov);
+        currentMov = mov;
+      } else {
+        currentMov = null;
+      }
+      continue;
+    }
+
+    if (currentMov && runningSaldo !== null && !ruidoRegex.test(line) && line.length < 200) {
+      currentMov.detalle = currentMov.detalle ? `${currentMov.detalle} · ${line}` : line;
+    }
+  }
+
+  return out;
+}
+
 // Identifica un movimiento bancario por CUIT, sea cual sea su tipo
 // (transferencia, efectivo, cheque, otro) — el importe NO es una condición
 // para dar el pago por identificado, es solo información de referencia que
@@ -434,6 +509,14 @@ function movKey(mov) {
   return `${mov.fecha?.toISOString?.() || ""}|${mov.importe}|${mov.descripcion}`;
 }
 
+// Clave de deduplicación al ACUMULAR extractos (fecha+importe+descripción+
+// detalle) — más estricta que movKey porque acá el riesgo es pegar dos
+// transferencias distintas del mismo día y monto si solo mirara descripción.
+function dedupKey(mov) {
+  const fecha = mov.fecha instanceof Date ? mov.fecha.toISOString().slice(0, 10) : String(mov.fecha || "").slice(0, 10);
+  return `${fecha}|${Math.round(mov.importe)}|${(mov.descripcion || "").trim()}|${(mov.detalle || "").trim()}`;
+}
+
 export default function ConciliacionBancaria({ cobranzas, bancoFiltro }) {
   const [movimientos, setMovimientos] = useState(null);
   const [fileName, setFileName] = useState("");
@@ -458,7 +541,17 @@ export default function ConciliacionBancaria({ cobranzas, bancoFiltro }) {
   // Historial de extractos subidos por todo el equipo, compartido vía
   // Firestore (antes esto vivía solo en el localStorage de cada compu).
   useEffect(() => {
-    const q = query(collection(db, EXTRACTOS_COLLECTION), orderBy("createdAt", "desc"));
+    setHistorialExtractos(null);
+    setExtractoActivoId(null);
+    // Filtrado por banco: cada pestaña (Supervielle, Santander) solo tiene
+    // que ver SU propio historial — antes esta consulta traía todo junto y
+    // la pestaña terminaba mostrando (y cargando automáticamente) el
+    // extracto más reciente de CUALQUIER banco, no el suyo.
+    const q = query(
+      collection(db, EXTRACTOS_COLLECTION),
+      where("banco", "==", bancoFiltro),
+      orderBy("createdAt", "desc")
+    );
     const unsub = onSnapshot(q, (snap) => {
       setHistorialExtractos(
         snap.docs.map((d) => {
@@ -474,7 +567,7 @@ export default function ConciliacionBancaria({ cobranzas, bancoFiltro }) {
       );
     });
     return unsub;
-  }, []);
+  }, [bancoFiltro]);
 
   async function abrirExtractoHistorial(id) {
     if (id === extractoActivoId) return;
@@ -579,7 +672,8 @@ export default function ConciliacionBancaria({ cobranzas, bancoFiltro }) {
     }
   }
 
-  // Al montar, recupera el último extracto subido (persiste entre recargas).
+  // Al montar, recupera el último extracto subido (persiste entre recargas
+  // en la misma compu/navegador).
   useEffect(() => {
     const saved = loadMovimientos();
     if (saved) {
@@ -588,50 +682,93 @@ export default function ConciliacionBancaria({ cobranzas, bancoFiltro }) {
     }
   }, []);
 
+  // Si no había nada en el localStorage de esta compu (compu nueva, caché
+  // borrado, otro miembro del equipo), arranca desde el acumulado compartido
+  // más reciente de Firestore — así la próxima subida sigue sumando sobre lo
+  // que ya cargó cualquiera del equipo, no solo lo local.
+  useEffect(() => {
+    if (movimientos !== null) return;
+    if (!historialExtractos || historialExtractos.length === 0) return;
+    abrirExtractoHistorial(historialExtractos[0].id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [historialExtractos]);
+
   async function handleFile(e) {
     const files = Array.from(e.target.files || []);
     if (files.length === 0) return;
     setError("");
     try {
-      let todos = [];
+      let nuevos = [];
       let huboFilasSinColumnas = false;
       let huboArchivoVacio = false;
 
       for (const file of files) {
         if (/\.pdf$/i.test(file.name)) {
           const lines = await extractPdfLines(file);
-          const parsed = parseSupervielleTexto(lines);
+          // El PDF de Santander viene con un formato de tabla distinto al
+          // de Supervielle (montos con "$ " y saldo negativo con el signo
+          // adelante) — se elige el parser según la pestaña del banco.
+          const parsed = bancoFiltro === "santander" ? parseSantanderTexto(lines) : parseSupervielleTexto(lines);
           if (parsed.length === 0) huboArchivoVacio = true;
-          todos = todos.concat(parsed);
+          nuevos = nuevos.concat(parsed);
         } else {
           const buf = await file.arrayBuffer();
           const wb = XLSX.read(buf, { type: "array", cellDates: true });
           const { movimientos: parsed, filasDeDatos, columnasReconocidas } = parseIngresosSheet(wb);
           if (filasDeDatos > 0 && !columnasReconocidas) huboFilasSinColumnas = true;
           else if (filasDeDatos > 0 && parsed.length === 0) huboArchivoVacio = true;
-          todos = todos.concat(parsed);
+          nuevos = nuevos.concat(parsed);
         }
       }
+
+      // El banco de cada movimiento lo define la PESTAÑA donde se subió el
+      // archivo, no lo que diga (o no diga) una columna "Banco" del Excel —
+      // si el usuario está en la pestaña Supervielle es porque el extracto
+      // es de Supervielle, punto. Esto evita que un extracto de otro banco
+      // subido por error, o un Excel sin esa columna, quede mezclado o sin
+      // clasificar y termine contaminando el historial de otra pestaña.
+      const bancoCanonico = bancoFiltro === "santander" ? "Santander" : "Supervielle";
+      nuevos = nuevos.map((m) => ({ ...m, banco: bancoCanonico }));
+
+      // Acumula contra lo que ya está cargado (como Mercado Pago: cada
+      // extracto nuevo SUMA, no reemplaza el anterior) — se descarta
+      // cualquier movimiento que ya estuviera (mismo día+importe+concepto+
+      // detalle) para poder resubir un mes ya cargado sin duplicarlo.
+      const existentes = movimientos || [];
+      const vistos = new Set(existentes.map(dedupKey));
+      const agregados = [];
+      for (const m of nuevos) {
+        const k = dedupKey(m);
+        if (vistos.has(k)) continue;
+        vistos.add(k);
+        agregados.push(m);
+      }
+      const acumulado = [...existentes, ...agregados].sort((a, b) => a.fecha - b.fecha);
+      const duplicados = nuevos.length - agregados.length;
 
       if (huboFilasSinColumnas) {
         setError(
           `⚠️ No reconocí las columnas de alguno de estos archivos (no encontré "Fecha" y "Importe"/"Crédito" en el encabezado). El formato de este banco todavía no está soportado — mandale el archivo a soporte para agregarlo antes de dar por hecho que no hay pagos.`
         );
-      } else if (huboArchivoVacio) {
+      } else if (huboArchivoVacio && agregados.length === 0 && duplicados === 0) {
         setError(
           `⚠️ Se reconoció el formato pero no se encontró ningún ingreso en alguno de estos archivos. Revisá que el extracto tenga el rango de fechas correcto antes de asumir que no hubo pagos.`
         );
+      } else if (duplicados > 0) {
+        setError(
+          `ℹ️ Se sumaron ${agregados.length} movimiento(s) nuevo(s). ${duplicados} ya estaban cargados (mismo día, importe y concepto) y no se duplicaron.`
+        );
       }
 
-      const nombre = files.length === 1 ? files[0].name : `${files.length} archivos (${files[0].name}, …)`;
+      const nombreSubida = files.length === 1 ? files[0].name : `${files.length} archivos (${files[0].name}, …)`;
+      const nombre = `Acumulado (${acumulado.length} movimientos) — últ. subida: ${nombreSubida}`;
       setFileName(nombre);
-      setMovimientos(todos);
-      saveMovimientos(nombre, todos);
-      const id = await guardarExtractoEnFirestore(nombre, todos);
+      setMovimientos(acumulado);
+      saveMovimientos(nombre, acumulado);
+      const id = await guardarExtractoEnFirestore(nombre, acumulado, bancoFiltro);
       setExtractoActivoId(id);
     } catch (err) {
       setError(err.message || "No se pudo leer el archivo");
-      setMovimientos(null);
     }
   }
 
@@ -670,6 +807,30 @@ export default function ConciliacionBancaria({ cobranzas, bancoFiltro }) {
   // suben comprobante): avisa a facturar y hacer el recibo.
   const pagosSinFacturar = useMemo(() => (rows || []).filter((r) => r.status === "green" && !r.cobranza), [rows]);
 
+  // Mismas 4 métricas que el tablero de Mercado Pago (total, identificado por
+  // cliente, cobrado hoy, ticket promedio) — para que Supervielle/Galicia/
+  // Santander se vean consistentes con esa pestaña en vez de ir directo a la
+  // lista de movimientos sin contexto.
+  const dashboard = useMemo(() => {
+    if (!rows) return null;
+    const total = rows.reduce((acc, r) => acc + Number(r.importe || 0), 0);
+    const identificados = rows.filter((r) => r.status === "green");
+    const totalIdentificado = identificados.reduce((acc, r) => acc + Number(r.importe || 0), 0);
+    const hoy = new Date().toDateString();
+    const totalHoy = rows
+      .filter((r) => r.fecha?.toDateString?.() === hoy)
+      .reduce((acc, r) => acc + Number(r.importe || 0), 0);
+    const promedio = rows.length ? total / rows.length : 0;
+    return {
+      total,
+      cantidad: rows.length,
+      totalIdentificado,
+      cantidadIdentificada: identificados.length,
+      totalHoy,
+      promedio,
+    };
+  }, [rows]);
+
   // Cobranzas que YA están sincronizadas (no es un movimiento bancario suelto
   // sin cargar) pero nunca quedaron aplicadas contra ninguna factura — plata
   // "a cuenta" que quedó suelta. Se excluyen las que son 100% "Saldo a favor"
@@ -686,8 +847,49 @@ export default function ConciliacionBancaria({ cobranzas, bancoFiltro }) {
       .sort((a, b) => new Date(b.fecha || 0) - new Date(a.fecha || 0));
   }, [cobranzas]);
 
+  const BANCO_INFO = {
+    galicia: { icon: "🏛️", nombre: "Banco Galicia" },
+    supervielle: { icon: "🏦", nombre: "Banco Supervielle" },
+    santander: { icon: "🏦", nombre: "Banco Santander Río" },
+  };
+  const bancoInfo = BANCO_INFO[bancoFiltro] || { icon: "🏦", nombre: "Todos los bancos" };
+
   return (
     <div className="space-y-4">
+      <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900">
+        <p className="text-sm font-semibold text-slate-900 dark:text-white">
+          {bancoInfo.icon} {bancoInfo.nombre}
+        </p>
+        <p className="text-xs text-slate-500 dark:text-neutral-400">
+          Extracto manual — acumulado de todo lo subido hasta ahora, no reemplaza al subir uno nuevo.
+        </p>
+      </div>
+
+      {dashboard && (
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900">
+            <p className="text-xs text-slate-500 dark:text-neutral-400">Total acumulado</p>
+            <p className="mt-1 text-lg font-bold text-slate-900 dark:text-white">{money(dashboard.total)}</p>
+            <p className="text-[11px] text-slate-400 dark:text-neutral-500">{dashboard.cantidad} movimiento(s)</p>
+          </div>
+          <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 dark:border-emerald-900 dark:bg-emerald-950/30">
+            <p className="text-xs text-emerald-700 dark:text-emerald-400">Identificado por cliente</p>
+            <p className="mt-1 text-lg font-bold text-emerald-900 dark:text-emerald-300">{money(dashboard.totalIdentificado)}</p>
+            <p className="text-[11px] text-emerald-600 dark:text-emerald-500">
+              {dashboard.cantidadIdentificada} de {dashboard.cantidad}
+            </p>
+          </div>
+          <div className="rounded-2xl border border-sky-200 bg-sky-50 p-4 dark:border-sky-900 dark:bg-sky-950/30">
+            <p className="text-xs text-sky-700 dark:text-sky-400">Cobrado hoy</p>
+            <p className="mt-1 text-lg font-bold text-sky-900 dark:text-sky-300">{money(dashboard.totalHoy)}</p>
+          </div>
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900">
+            <p className="text-xs text-slate-500 dark:text-neutral-400">Ticket promedio</p>
+            <p className="mt-1 text-lg font-bold text-slate-900 dark:text-white">{money(dashboard.promedio)}</p>
+          </div>
+        </div>
+      )}
+
       {pagosSinFacturar.length > 0 && (
         <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 dark:border-rose-900 dark:bg-rose-950/20">
           <p className="text-sm font-semibold text-rose-900 dark:text-rose-400">
@@ -752,7 +954,7 @@ export default function ConciliacionBancaria({ cobranzas, bancoFiltro }) {
       <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900">
         <p className="text-sm font-semibold text-slate-900 dark:text-white">Subir extracto bancario</p>
         <p className="mt-1 text-xs text-slate-500 dark:text-neutral-400">
-          Excel con la hoja "Ingresos" (Cuenta, Descripción, Detalle, Fecha, Banco, Importe), o PDF del resumen de cuenta de Supervielle — podés seleccionar varios a la vez.
+          Excel con la hoja "Ingresos" (Cuenta, Descripción, Detalle, Fecha, Banco, Importe), o PDF del resumen de cuenta de {bancoFiltro === "santander" ? "Santander" : "Supervielle"} — podés seleccionar varios a la vez. Cada archivo que subís se SUMA a lo que ya está cargado (no lo reemplaza); si volvés a subir un mes ya cargado, esos movimientos no se duplican.
         </p>
         <div className="mt-3 flex flex-wrap items-center gap-3">
           <input

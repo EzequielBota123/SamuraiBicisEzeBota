@@ -35,34 +35,54 @@ async function getIdToken(): Promise<string> {
   return user.getIdToken();
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function callFunction<T>(name: string, body: unknown, timeoutMs = 280000): Promise<T> {
   const token = await getIdToken();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let res: Response;
-  try {
-    res = await fetch(`${BASE_URL}/${name}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-  } catch (e) {
-    if ((e as Error).name === "AbortError") {
-      throw new Error("La operación tardó demasiado y se canceló. Probá de nuevo.");
+
+  // Un corte de red de un instante (wifi que titila, el celular cambiando
+  // de antena, etc.) hace que fetch() tire "Failed to fetch" aunque el
+  // servidor esté perfecto — un solo reintento corto alcanza para que eso
+  // no se le muestre al usuario como si fuera un error real del sistema.
+  let lastNetworkError: Error | null = null;
+  for (let intento = 0; intento < 2; intento++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let res: Response;
+    try {
+      res = await fetch(`${BASE_URL}/${name}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      if ((e as Error).name === "AbortError") {
+        throw new Error("La operación tardó demasiado y se canceló. Probá de nuevo.");
+      }
+      lastNetworkError = e as Error;
+      if (intento === 0) {
+        await sleep(800);
+        continue;
+      }
+      throw new Error("No se pudo conectar con el servidor. Revisá tu conexión y probá de nuevo.");
     }
-    throw e;
-  } finally {
     clearTimeout(timer);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: `Error ${res.status}` }));
+      throw new Error(err.error || `Error ${res.status}`);
+    }
+    return res.json();
   }
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: `Error ${res.status}` }));
-    throw new Error(err.error || `Error ${res.status}`);
-  }
-  return res.json();
+  // Inalcanzable en la práctica (el loop siempre retorna o tira antes),
+  // pero TypeScript necesita un retorno/throw explícito acá.
+  throw lastNetworkError || new Error("No se pudo conectar con el servidor.");
 }
 
 export type GetComprobantesParams = {
@@ -103,6 +123,128 @@ export async function getMyDepositoStock(): Promise<{
   return callFunction("getMyDepositoStock", {});
 }
 
+export type FacturaResumen = {
+  numero: string;
+  tipo: string;
+  fecha: string;
+  total: number;
+  saldo: number;
+};
+
+export type BiciResumen = {
+  name: string;
+  sku: string;
+  stockActual: number;
+  priceArs: number | null;
+};
+
+export type VendedorBasico = {
+  uid: string;
+  name: string | null;
+  depositoNombre: string | null;
+  depositoId: number | null;
+  contabiliumId: number | null;
+};
+
+export type VendedorResumen = {
+  uid: string;
+  name: string | null;
+  depositoNombre: string | null;
+  stockBicis: number | null;
+  bicis: BiciResumen[];
+  saldoTotal: number | null;
+  facturasRecientes: FacturaResumen[];
+  error?: string;
+};
+
+// Para clientes que coordinan un grupo de distribuidores propios (campo
+// `vendedoresAsignados` en su doc de usuario) — lista liviana (solo
+// nombres), sin tocar Contabilium. El detalle pesado de cada uno se pide
+// aparte con getVendedorResumen, uno por uno.
+export async function getMisVendedores(): Promise<{
+  vendedores: VendedorBasico[];
+}> {
+  return callFunction("getMisVendedores", {});
+}
+
+// Detalle pesado (stock, deuda, últimas facturas) de un solo vendedor —
+// pedido chico e independiente por cada tarjeta, para que una conexión
+// inestable solo afecte a esa tarjeta y no a toda la pantalla.
+export async function getVendedorResumen(vendedorUid: string): Promise<VendedorResumen> {
+  return callFunction("getVendedorResumen", { vendedorUid }, 60000);
+}
+
+export type DetalleVentaComision = {
+  cliente: string;
+  modelo: string;
+  cantidad: number | null;
+  monto: number;
+  comision: number;
+  tipo: "FCA" | "NCA";
+  numero: string;
+  fecha: string;
+};
+
+export type ResumenComisionVendedor = {
+  mes: string;
+  viajes: number;
+  tarifaFletePorViaje: number;
+  fleteTotal: number;
+  comisionPorcentaje: number;
+  ventasTotal: number;
+  comisionTotal: number;
+  totalACobrar: number;
+  cantidadClientesAsignados: number;
+  detalle: DetalleVentaComision[];
+};
+
+// Cuenta corriente mensual (flete por viaje + comisión sobre lo que
+// facturan sus clientes asignados) de un supervisor con `vendedoresAsignados`
+// — sin `vendedorUid` trae la propia; un admin/chofer puede pasarlo para ver
+// la de otro.
+export async function getResumenComisionVendedor(mes: string, vendedorUid?: string): Promise<ResumenComisionVendedor> {
+  return callFunction("getResumenComisionVendedor", { mes, vendedorUid }, 170000);
+}
+
+// Carga a mano cuántos viajes (Lavalle → su depósito) hizo en ese mes —
+// Contabilium no lo registra, es la única forma de contarlo para el flete.
+export async function setViajesVendedorMes(mes: string, viajes: number, vendedorUid?: string): Promise<{ ok: true }> {
+  return callFunction("setViajesVendedorMes", { mes, viajes, vendedorUid });
+}
+
+export type DistribuidorConEquipo = {
+  uid: string;
+  name: string;
+  cantidadClientesAsignados: number;
+  comisionPorcentaje: number;
+  tarifaFletePorViaje: number;
+};
+
+// Admin: lista de quiénes tienen `vendedoresAsignados` cargado, para elegir
+// a quién ver/configurar en el resumen de comisión.
+export async function adminListDistribuidoresConEquipo(): Promise<{ distribuidores: DistribuidorConEquipo[] }> {
+  return callFunction("adminListDistribuidoresConEquipo", {});
+}
+
+// Admin: configura la tarifa de flete por viaje y/o el % de comisión de un
+// distribuidor puntual.
+export async function adminSetTarifasVendedor(
+  vendedorUid: string,
+  params: { comisionPorcentaje?: number; tarifaFletePorViaje?: number }
+): Promise<{ ok: true }> {
+  return callFunction("adminSetTarifasVendedor", { vendedorUid, ...params });
+}
+
+// Detalle completo (modelos, colores, cantidades) del depósito propio de
+// Samurai en Lavalle — mismo permiso que getMisVendedores.
+export async function getMiDepositoPropio(): Promise<{
+  depositoId: number;
+  depositoNombre: string | null;
+  items: DepositoStockItem[];
+}> {
+  return callFunction("getMiDepositoPropio", {});
+}
+
 export async function getDepositoStockAdmin(depositoId: number): Promise<{
   depositoId: number;
   items: DepositoStockItem[];
@@ -114,8 +256,78 @@ export async function adminGetClientComprobantes(contabiliumId: number): Promise
   return callFunction("adminGetClientComprobantes", { contabiliumId });
 }
 
-export async function adminGetClientPhone(contabiliumId: number): Promise<{ telefono: string | null }> {
+export async function adminGetClientPhone(contabiliumId: number): Promise<{
+  telefono: string | null;
+  celular: string | null;
+  ciudad: string | null;
+  provincia: string | null;
+  razonSocial: string | null;
+  direccion: string | null;
+  cp: string | null;
+  instagramDetectado: string | null;
+}> {
   return callFunction("adminGetClientPhone", { contabiliumId });
+}
+
+export async function adminActualizarTelefonosCliente(
+  contabiliumId: number,
+  params: { telefono?: string; celular?: string }
+): Promise<{ ok: true; telefono: string | null; celular: string | null }> {
+  return callFunction("adminActualizarTelefonosCliente", { contabiliumId, ...params });
+}
+
+export interface ClienteConUbicacion {
+  id: string;
+  contabiliumId: number;
+  nombre: string;
+  cuit: string;
+  ciudad: string;
+  provincia: string;
+  direccion: string;
+  cp: string;
+  lat: number | null;
+  lon: number | null;
+  // true = geocodificado por la dirección puntual (calle+altura real);
+  // false = sin esa geocodificación, cayó al centro de la localidad.
+  ubicacionPrecisa: boolean;
+}
+
+// Excel con dos solapas ("Consignados" con su situación/color marcado a
+// mano, y "Sin depósito") — usado en el botón "Exportar" del mapa.
+export async function exportarMapaClientes(provincia?: string): Promise<{
+  base64: string;
+  filename: string;
+  totalConsignados: number;
+  totalSinDeposito: number;
+}> {
+  return callFunction("exportarMapaClientes", provincia ? { provincia } : {}, 120000);
+}
+
+export async function getClientesConUbicacion(): Promise<{ items: ClienteConUbicacion[] }> {
+  // La primera corrida puede tener que geocodificar muchas direcciones
+  // nuevas contra GeoRef/Nominatim (con throttling) — le damos más margen
+  // que el timeout general para que no aborte antes de que el backend
+  // (300s) termine y quede todo cacheado para la próxima vez.
+  return callFunction("getClientesConUbicacion", {}, 300000);
+}
+
+export interface UbicacionVendedor {
+  uid: string;
+  nombre: string;
+  contabiliumId: number;
+  ciudad: string;
+  provincia: string;
+  direccion: string;
+  cp: string;
+  lat: number;
+  lon: number;
+  ubicacionPrecisa: boolean;
+}
+
+// Ubicaciones de los vendedores asignados al caller (mapa de Alfredo) —
+// mismo permiso que getMisVendedores/getMiDepositoPropio.
+export async function getUbicacionesMisVendedores(): Promise<{ items: UbicacionVendedor[] }> {
+  return callFunction("getUbicacionesMisVendedores", {});
 }
 
 // Consulta el padrón real de AFIP para un CUIT/documento (vía Contabilium),
@@ -131,6 +343,47 @@ export async function verificarCondicionAfip(documento: string): Promise<{
 
 export async function adminGetComprobanteDetail(id: number): Promise<ComprobanteDetalle> {
   return callFunction("adminGetComprobanteDetail", { id });
+}
+
+// Le pide a Claude que lea una foto de comprobante de pago (ya subida a
+// Storage) y devuelva monto/fecha/banco/referencia — para precargar el
+// formulario de recibo en Clientes 360 sin tipear a mano. El staff siempre
+// revisa/edita el resultado antes de aplicar el recibo real.
+export async function leerComprobantePagoAdmin(url: string): Promise<{
+  ok: true;
+  lectura: {
+    monto: number | null;
+    fecha: string | null;
+    banco: string | null;
+    referencia: string | null;
+    confianza: "alta" | "media" | "baja";
+    idBanco: number | null;
+  } | null;
+}> {
+  return callFunction("leerComprobantePagoAdmin", { url });
+}
+
+export type Cotizacion = {
+  id: number;
+  numero: string;
+  fecha: string;
+  clienteId: number;
+  clienteNombre: string | null;
+  cuit: string | null;
+  total: number;
+  saldo: number;
+};
+
+export async function listCotizaciones(): Promise<{ total: number; items: Cotizacion[] }> {
+  const token = await getIdToken();
+  const res = await fetch(`${BASE_URL}/listCotizaciones`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: `Error ${res.status}` }));
+    throw new Error(err.error || `Error ${res.status}`);
+  }
+  return res.json();
 }
 
 export type ClienteVinculado = { nombre: string; cuit: string; contabiliumId: number };
@@ -224,9 +477,10 @@ export async function auditLegacyUsers(): Promise<LegacyUsersAudit> {
 
 export async function createUserWithPassword(
   name: string,
-  password: string
-): Promise<{ uid: string; username: string }> {
-  return callFunction("createUserWithPassword", { name, password });
+  password: string,
+  opts?: { cuit?: string; telefono?: string }
+): Promise<{ uid: string; username: string; contabiliumId: number | null }> {
+  return callFunction("createUserWithPassword", { name, password, ...opts });
 }
 
 export async function adminSetUserPassword(uid: string, password: string): Promise<{ ok: true }> {
@@ -312,18 +566,52 @@ export type FacturaManualItem = { descripcion: string; cantidad: number; precioU
 export async function emitirFacturaManual(
   contabiliumId: number,
   items: FacturaManualItem[],
-  tipoFc: "FCA" | "FCB" | "FCC" = "FCA"
+  tipoFc: "FCA" | "FCB" | "FCC" = "FCA",
+  fechaEmision?: string // "YYYY-MM-DD" opcional — para cargar con fecha pasada
 ): Promise<{ ok: true; comprobante: unknown }> {
-  return callFunction("emitirFacturaManual", { contabiliumId, items, tipoFc }, 60000);
+  return callFunction("emitirFacturaManual", { contabiliumId, items, tipoFc, fechaEmision }, 60000);
 }
 
-export type FormaDePagoRecibo = "Débito" | "Depósito" | "Efectivo" | "Transferencia" | "Nota de crédito";
+export interface ContabiliumClienteResultado {
+  contabiliumId: number;
+  razonSocial: string;
+  cuit: string | null;
+  condicionIva: string | null;
+  email: string | null;
+  telefono: string | null;
+}
+
+// Busca clientes de Contabilium por nombre — usado para elegir el
+// destinatario de un remito cuando no es el mismo cliente de la factura
+// (ej: remito a una empresa de flete intermedia, y otro remito de esa
+// empresa al cliente final — igual que se hace en Contabilium).
+export async function searchContabiliumClientes(q: string): Promise<{ total: number; resultados: ContabiliumClienteResultado[] }> {
+  return callFunction(`adminSearchContabiliumClientes?q=${encodeURIComponent(q)}`, {});
+}
+
+export type ClientePorTelefono = {
+  contabiliumId: number;
+  razonSocial: string;
+  cuit: string | null;
+  telefono: string | null;
+  celular: string | null;
+  email: string | null;
+};
+
+// Busca a qué cliente corresponde un número de teléfono (matchea por los
+// últimos 8 dígitos, sin importar el formato con el que esté cargado).
+export async function adminBuscarClientePorTelefono(telefono: string): Promise<{ total: number; resultados: ClientePorTelefono[] }> {
+  return callFunction(`adminBuscarClientePorTelefono?telefono=${encodeURIComponent(telefono)}`, {}, 60000);
+}
+
+export type FormaDePagoRecibo = "Débito" | "Depósito" | "Efectivo" | "Transferencia" | "Cheque" | "Nota de crédito";
 
 export type LineaPagoRecibo = {
   formaDePago: FormaDePagoRecibo;
   monto: number;
   idBanco?: number | null;
   nroReferencia?: string;
+  idNotaCredito?: number | null;
 };
 
 // Registra un recibo de cobranza contra una factura puntual (descuenta el
@@ -335,6 +623,7 @@ export type LineaPagoRecibo = {
 export async function cobrarComprobante(params: {
   idComprobante: number;
   importeTotalNeto: number;
+  fecha?: string;
   pagos: LineaPagoRecibo[];
 }): Promise<{ ok: true; saldoRestante: number; resultado: unknown }> {
   return callFunction("cobrarComprobante", params, 60000);
@@ -446,8 +735,52 @@ export async function importarRemitos(remitos: unknown[]): Promise<{ nuevos: num
   return callFunction("importarRemitos", { remitos }, 280000);
 }
 
+export async function sincronizarRemitosDesdeWeb(desde?: string, hasta?: string): Promise<{
+  nuevos: number;
+  actualizados: number;
+  total: number;
+  traidos: number;
+  aviso?: string;
+}> {
+  return callFunction("sincronizarRemitosDesdeWeb", { desde, hasta }, 540000);
+}
+
 export async function adminAsignarVendedor(uid: string, vendedor: string | null): Promise<{ ok: true; contabiliumSync: boolean }> {
   return callFunction("adminAsignarVendedor", { uid, vendedor });
+}
+
+// Agrega (o saca, con quitar:true) un cliente de la lista de clientes a
+// cargo de un distribuidor con equipo propio (ej. Alfredo Bavcevich) —
+// opcionalmente fija de una el depósito de Contabilium del cliente.
+export async function adminAsignarClienteADistribuidor(
+  distribuidorUid: string,
+  clienteUid: string,
+  params: { quitar?: boolean; contabiliumDepositoId?: number } = {}
+): Promise<{ ok: true }> {
+  return callFunction("adminAsignarClienteADistribuidor", { distribuidorUid, clienteUid, ...params });
+}
+
+export type FilaImportarSituacion = {
+  nombreExcel?: string;
+  cuit?: string;
+  situacionEtiqueta?: string;
+  color?: "verde" | "amarillo" | "naranja" | "rojo" | "vencido" | "";
+  llamado?: boolean;
+  nota?: string;
+  marcadoPor?: string;
+  notaExtra?: string;
+};
+
+export type ResultadoImportarSituaciones = {
+  total: number;
+  actualizados: number;
+  soloNota: number;
+  sinCambios: number;
+  noEncontrados: { nombre: string; cuit: string }[];
+};
+
+export async function adminImportarSituacionesClientes(filas: FilaImportarSituacion[]): Promise<ResultadoImportarSituaciones> {
+  return callFunction("adminImportarSituacionesClientes", { filas }, 120000);
 }
 
 export type VentaPorMes = {
@@ -481,6 +814,24 @@ export type BusinessDashboard = {
 
 export async function triggerBusinessDashboardSync(): Promise<BusinessDashboard> {
   return callFunction("triggerBusinessDashboardSync", {}, 560000);
+}
+
+export type RemitoContabiliumDetalle = {
+  id: number;
+  numero?: string;
+  idPersona?: number;
+  razonSocialLista?: string;
+  observaciones?: string | null;
+  items?: { codigoConcepto?: string; descripcion?: string; cantidad?: number }[];
+  [key: string]: unknown;
+};
+
+export async function adminObtenerRemitoDetalle(idRemito: number): Promise<RemitoContabiliumDetalle> {
+  return callFunction("adminObtenerRemitoDetalle", { idRemito }, 60000);
+}
+
+export async function adminEditarObservacionRemito(idRemito: number, observaciones: string): Promise<RemitoContabiliumDetalle> {
+  return callFunction("adminEditarObservacionRemito", { idRemito, observaciones }, 60000);
 }
 
 export function subscribeBusinessDashboardDetail(
@@ -577,4 +928,113 @@ export async function getMercadoPagoMovimientos(desde?: string, hasta?: string):
     throw new Error(err.error || `Error ${res.status}`);
   }
   return res.json();
+}
+
+export type GaliciaCuenta = {
+  number: string;
+  iban: string;
+  type: string;
+  balance: number;
+  currency: string;
+};
+
+// Saldos de las cuentas de Galicia (Open Galicia, API en vivo).
+export async function getGaliciaSaldos(): Promise<{
+  data: Array<{ accounts_cc: GaliciaCuenta[]; accounts_ca: GaliciaCuenta[]; totals: Array<{ amount: number; currency: string }> }>;
+}> {
+  return callFunction("getGaliciaSaldos", {}, 60000);
+}
+
+export type GaliciaExtractoSolicitado = {
+  id: string;
+  name: string;
+  status: string;
+  created_date: string;
+  account_number: string;
+};
+
+// Paso 1/2 del flujo de movimientos: pide a Galicia que genere el extracto
+// de una cuenta para un rango de fechas. El banco lo procesa por lote (cada
+// ~30 min), así que hay que consultar descargarGaliciaMovimientos después.
+export async function solicitarGaliciaMovimientos(
+  accountNumber: string,
+  startDate: string,
+  endDate: string
+): Promise<GaliciaExtractoSolicitado> {
+  return callFunction("solicitarGaliciaMovimientos", { accountNumber, startDate, endDate }, 60000);
+}
+
+export type GaliciaMovimiento = {
+  DebitosNum: number | null;
+  CreditosNum: number | null;
+  SaldoNum: number | null;
+  [key: string]: unknown;
+};
+
+// Paso 2/2: si el extracto solicitado ya está PROCESSED, devuelve los
+// movimientos parseados; si sigue PENDING, devuelve status: "PENDING" y
+// movimientos: null (hay que reintentar más tarde).
+export async function descargarGaliciaMovimientos(extractoId: string): Promise<{
+  status: string;
+  header: string | null;
+  movimientos: GaliciaMovimiento[] | null;
+}> {
+  return callFunction("descargarGaliciaMovimientos", { extractoId }, 120000);
+}
+
+// Ajuste manual de stock en Contabilium (no tiene API oficial para esto —
+// se hace con una automatización de la consola web, puede tardar unos
+// segundos más de lo normal por eso).
+// Temporal: prueba nombres de método candidatos en Contabilium a ver si
+// alguno devuelve el idCC de un depósito automáticamente. Se puede borrar
+// una vez que se resuelva de un lado u otro.
+export async function debugProbeIdCC(idInventario: number): Promise<{ resultados: unknown[] }> {
+  return callFunction("debugProbeIdCC", { idInventario }, 120000);
+}
+
+// Transferencia real entre depósitos (no pide idCC — es automática de punta
+// a punta). Solo staff admin.
+export async function transferirStockManual(params: {
+  depositoOrigenId: number;
+  depositoDestinoId: number;
+  items: { sku: string; cantidad: number; name?: string }[];
+  observaciones?: string;
+  depositoOrigenNombre?: string;
+  depositoDestinoNombre?: string;
+  sinRemito?: boolean;
+}): Promise<{
+  ok: true;
+  idTransferencia: number | null;
+  remitoArchivo: string | null;
+  remitoPdfBase64: string | null;
+}> {
+  return callFunction("transferirStockManual", params, 120000);
+}
+
+// Paso aparte, después del movimiento: un remito "real" (comprobante REM a
+// nombre de un cliente/proveedor elegido a mano) para que la mercadería
+// pueda circular en la calle con papeles válidos.
+export async function generarRemitoRealManual(params: {
+  remitoArchivo: string;
+  proveedorContabiliumId: number;
+  observaciones?: string;
+}): Promise<{
+  ok: true;
+  numero: string | null;
+  remitoArchivo: string | null;
+  remitoPdfBase64: string | null;
+}> {
+  return callFunction("generarRemitoRealManual", params, 120000);
+}
+
+export async function ajustarStockManual(params: {
+  depositoId: number;
+  sku: string;
+  cantidad: number;
+  tipoModificacion: "R" | "M";
+  idCC?: number | null;
+  nroRef?: string;
+  observaciones?: string;
+}): Promise<{ ok: true }> {
+  return callFunction("ajustarStockManual", params, 120000);
 }

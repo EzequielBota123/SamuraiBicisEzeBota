@@ -87,6 +87,11 @@ export default function HistorialSeguimiento({ historial, puedeEditar, onEditar,
                   Cuenta con diferencias
                 </span>
               )}
+              {h.vendedorAsignado && (
+                <span className="inline-flex items-center rounded-full bg-violet-50 px-2 py-0.5 text-[11px] font-medium text-violet-700 dark:bg-violet-950/30 dark:text-violet-400">
+                  🧑‍💼 Vendedor: {h.vendedorAsignado}
+                </span>
+              )}
             </div>
             {h.editadoPor && (
               <p className="mt-2 text-[11px] italic text-slate-400 dark:text-neutral-500">

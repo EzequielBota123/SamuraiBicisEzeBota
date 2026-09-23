@@ -1,5 +1,19 @@
 import { useState } from "react";
 import { ensureSheetJs } from "../../../utils/sheetjs";
+import { exportarMapaClientes } from "../../../services/comprobantes";
+
+function descargarBase64Xlsx(base64, filename) {
+  const bytes = atob(base64);
+  const arr = new Uint8Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+  const blob = new Blob([arr], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename || "clientes.xlsx";
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 function fmtNotas(notas) {
   return (notas || [])
@@ -61,6 +75,26 @@ export default function Exportar({ crm }) {
   return (
     <div className="max-w-2xl space-y-4">
       {msg && <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300">{msg}</div>}
+
+      <div className="rounded-3xl border border-slate-200 bg-white p-5 dark:border-neutral-800 dark:bg-neutral-900">
+        <h3 className="text-sm font-bold text-slate-800 dark:text-white">🗺️ Exportar mapa de clientes</h3>
+        <p className="mt-1 text-xs text-slate-500 dark:text-neutral-400">
+          Todos los clientes del mapa, en dos solapas: <b>Consignados</b> (con su situación 🟢🟡🟠🔴🟣 y nota) y <b>Sin depósito</b>{" "}
+          (los puntos azules, con sus datos de contacto).
+        </p>
+        <button
+          disabled={busy}
+          onClick={() =>
+            run(async () => {
+              const { base64, filename } = await exportarMapaClientes();
+              descargarBase64Xlsx(base64, filename);
+            })
+          }
+          className="mt-3 rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50 dark:bg-neutral-800 dark:hover:bg-neutral-700"
+        >
+          Descargar
+        </button>
+      </div>
 
       <div className="rounded-3xl border border-slate-200 bg-white p-5 dark:border-neutral-800 dark:bg-neutral-900">
         <h3 className="text-sm font-bold text-slate-800 dark:text-white">📥 Exportar cartera de un vendedor</h3>

@@ -119,7 +119,7 @@ export function BikeCard({ item, onSelect, money }) {
   );
 }
 
-export function ItemModal({ item, onClose, money, onReportSale, onRequestMore, distributorName, depositoNombre, whatsappNumber }) {
+export function ItemModal({ item, onClose, money, onReportSale, onRequestMore, distributorName, depositoNombre, whatsappNumber, onAjustarStock }) {
   const [qty, setQty] = useState(1);
   const [tipoDocumento, setTipoDocumento] = useState("FCA");
   const [reporting, setReporting] = useState(false);
@@ -132,6 +132,12 @@ export function ItemModal({ item, onClose, money, onReportSale, onRequestMore, d
   const [requesting, setRequesting] = useState(false);
   const [requestError, setRequestError] = useState("");
   const [requested, setRequested] = useState(false);
+
+  const [ajusteCantidad, setAjusteCantidad] = useState(1);
+  const [ajusteTipo, setAjusteTipo] = useState("M");
+  const [ajustando, setAjustando] = useState(false);
+  const [ajusteError, setAjusteError] = useState("");
+  const [ajusteOk, setAjusteOk] = useState(false);
 
   useEffect(() => {
     setQty(1);
@@ -189,6 +195,19 @@ export function ItemModal({ item, onClose, money, onReportSale, onRequestMore, d
       setReportError(e.message || "No se pudo registrar la venta");
     } finally {
       setReporting(false);
+    }
+  }
+
+  async function handleAjustarStock() {
+    setAjustando(true);
+    setAjusteError("");
+    try {
+      await onAjustarStock({ sku: item.sku, cantidad: ajusteCantidad, tipoModificacion: ajusteTipo });
+      setAjusteOk(true);
+    } catch (e) {
+      setAjusteError(e.message || "No se pudo ajustar el stock");
+    } finally {
+      setAjustando(false);
     }
   }
 
@@ -370,6 +389,63 @@ export function ItemModal({ item, onClose, money, onReportSale, onRequestMore, d
                     <p className="mt-2 text-[11px] text-slate-500">
                       Genera un pedido a Samurai y te abre WhatsApp para confirmarlo con el vendedor.
                     </p>
+                  </>
+                )}
+              </div>
+            )}
+
+            {onAjustarStock && (
+              <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4">
+                <p className="mb-1 text-sm font-semibold text-slate-900">⚙️ Ajustar stock (Contabilium)</p>
+                <p className="mb-3 text-xs text-slate-500">
+                  Corrige la cantidad real en este depósito directo en Contabilium. Tarda unos segundos más de lo normal.
+                </p>
+                {ajusteOk ? (
+                  <p className="text-sm font-semibold text-emerald-600">✓ Ajuste aplicado.</p>
+                ) : (
+                  <>
+                    <div className="mb-3 flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setAjusteTipo("M")}
+                        className={`flex-1 rounded-xl border px-3 py-2 text-left text-xs transition ${
+                          ajusteTipo === "M" ? "border-slate-900 bg-slate-900 text-white" : "border-slate-200 bg-white text-slate-600"
+                        }`}
+                      >
+                        <span className="block font-semibold">Modificar</span>
+                        <span className="block opacity-80">Suma o resta (negativo)</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setAjusteTipo("R")}
+                        className={`flex-1 rounded-xl border px-3 py-2 text-left text-xs transition ${
+                          ajusteTipo === "R" ? "border-slate-900 bg-slate-900 text-white" : "border-slate-200 bg-white text-slate-600"
+                        }`}
+                      >
+                        <span className="block font-semibold">Reemplazar</span>
+                        <span className="block opacity-80">Fija el stock en este valor</span>
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <label className="text-xs font-medium text-slate-500">
+                        {ajusteTipo === "R" ? "Nuevo stock" : "Cantidad (± )"}
+                      </label>
+                      <input
+                        type="number"
+                        value={ajusteCantidad}
+                        onChange={(e) => setAjusteCantidad(Number(e.target.value) || 0)}
+                        className="w-24 rounded-xl border border-amber-200 bg-white px-3 py-1.5 text-sm text-slate-700 outline-none focus:border-amber-500 focus:ring-2 focus:ring-amber-500/40"
+                      />
+                      <button
+                        type="button"
+                        disabled={ajustando}
+                        onClick={handleAjustarStock}
+                        className="ml-auto rounded-xl bg-amber-600 px-4 py-2 text-sm font-semibold text-white transition hover:-translate-y-0.5 disabled:opacity-60"
+                      >
+                        {ajustando ? "Ajustando…" : "Confirmar ajuste"}
+                      </button>
+                    </div>
+                    {ajusteError && <p className="mt-2 text-xs text-rose-500">{ajusteError}</p>}
                   </>
                 )}
               </div>

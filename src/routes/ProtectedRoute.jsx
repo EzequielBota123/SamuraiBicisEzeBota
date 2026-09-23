@@ -10,7 +10,7 @@ export default function ProtectedRoute({
   allowedRoles = STAFF_ROLES,
   ...rest
 }) {
-  const { user, role, loading } = useAuth();
+  const { user, role, profile, loading } = useAuth();
 
   return (
     <Route
@@ -24,7 +24,10 @@ export default function ProtectedRoute({
           );
         }
 
-        const hasAccess = user && role && allowedRoles.includes(role);
+        // La marca esChofer (usuarios con otro rol que también reparten)
+        // cuenta como acceso al sector que permite el rol "chofer".
+        const hasAccess =
+          user && role && (allowedRoles.includes(role) || (allowedRoles.includes("chofer") && profile?.esChofer === true));
         if (!hasAccess) {
           return (
             <Redirect

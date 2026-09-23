@@ -1,8 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { collection, getDocs, query, where } from "firebase/firestore";
+// "query" se importa como fsQuery porque el componente ya usa una variable
+// de estado local llamada `query` (el texto de búsqueda de bicis) — con el
+// mismo nombre, esa variable tapa la función de Firestore adentro de ese
+// componente y rompe en tiempo de ejecución ("query is not a function").
+import { collection, getDocs, query as fsQuery, where } from "firebase/firestore";
 import { db } from "../../firebase";
-import { getContabiliumDepositos } from "../../services/contabiliumDepositos";
-import { getDepositoStockAdmin } from "../../services/comprobantes";
+import { getContabiliumDepositos, labelDeposito, matchDeposito } from "../../services/contabiliumDepositos";
+import { getDepositoStockAdmin, ajustarStockManual, transferirStockManual, generarRemitoRealManual, debugProbeIdCC, searchContabiliumClientes } from "../../services/comprobantes";
 import { LoadingOverlay } from "../../components/ui/LoadingIndicators";
 import { filterBySearch } from "../../utils/colorSearch";
 import { StatsBanner, BikeCard, ItemModal } from "../../components/stock/ConsignedStockUI";
@@ -10,6 +14,9 @@ import { listAuditsByDeposito, deleteAudit, uploadAudit, nextAuditDate, isAuditO
 import AuditVideoPlayer from "../../components/stock/AuditVideoPlayer";
 import AuditRecorderModal from "../../components/stock/AuditRecorderModal";
 import { useAuth } from "../../auth/AuthContext";
+import CargarViajeCampos, { viajeCfgInicial } from "../../components/logistica/CargarViajeCampos";
+import { crearViajeDesdeTransferencia, numeroDeRemito } from "../../utils/viajeDesdeTransferencia";
+import { actualizarRemitoViaje } from "../../services/logisticaViajes";
 
 const money = (n) =>
   Number(n || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 });
@@ -69,7 +76,7 @@ export default function StockConsignado() {
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return depositos;
-    return depositos.filter((d) => d.nombre.toLowerCase().includes(q));
+    return depositos.filter((d) => matchDeposito(d, q));
   }, [depositos, search]);
 
   const totalBicicletas = useMemo(() => {
@@ -89,8 +96,11 @@ export default function StockConsignado() {
     return filterBySearch(items, itemSearch);
   }, [items, itemSearch]);
 
-  const bicis = useMemo(() => (filteredItems || []).filter(isBici), [filteredItems]);
-  const accesorios = useMemo(() => (filteredItems || []).filter((it) => !isBici(it)), [filteredItems]);
+  // La grilla principal solo muestra lo que hay disponible ahora — los
+  // productos en 0 se buscan aparte, en el panel de ajuste de stock.
+  const conStock = useMemo(() => (filteredItems || []).filter((it) => Number(it.stockDisponible || 0) > 0), [filteredItems]);
+  const bicis = useMemo(() => conStock.filter(isBici), [conStock]);
+  const accesorios = useMemo(() => conStock.filter((it) => !isBici(it)), [conStock]);
 
   async function handleDeleteAudit(a) {
     if (!confirm("¿Eliminar este video de auditoría? No se puede deshacer.")) return;
@@ -134,7 +144,7 @@ export default function StockConsignado() {
       setLoadingAudits(false);
     }
     try {
-      const usersSnap = await getDocs(query(collection(db, "users"), where("contabiliumDepositoId", "==", d.id)));
+      const usersSnap = await getDocs(fsQuery(collection(db, "users"), where("contabiliumDepositoId", "==", d.id)));
       const userDoc = usersSnap.docs[0];
       const u = userDoc?.data();
       setAuditIntervalDays(u?.auditIntervalDays);
@@ -145,7 +155,17 @@ export default function StockConsignado() {
     }
   }
 
-  async function handleSubmitAudit(blob, recordedAt) {
+  async function reloadItems() {
+    if (!selected) return;
+    try {
+      const result = await getDepositoStockAdmin(selected.id);
+      setItems(result.items);
+    } catch (e) {
+      console.error("Error recargando stock:", e);
+    }
+  }
+
+  async function handleSubmitAudit(blob, recordedAt, nota) {
     if (!selected) return;
     await uploadAudit({
       depositoId: selected.id,
@@ -154,6 +174,7 @@ export default function StockConsignado() {
       distributorName: distributorName || profile?.name || "Samurai (staff)",
       blob,
       recordedAt,
+      nota,
     });
     const list = await listAuditsByDeposito(selected.id);
     setAudits(list);
@@ -202,7 +223,7 @@ export default function StockConsignado() {
         <div className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm dark:border-neutral-800 dark:bg-neutral-900 dark:shadow-none">
           <input
             type="search"
-            placeholder="Buscar distribuidor..."
+            placeholder="Buscar distribuidor por nombre, número o ID de Contabilium..."
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40 sm:py-2.5"
@@ -224,7 +245,7 @@ export default function StockConsignado() {
                     : "text-slate-700 hover:bg-slate-100 dark:text-neutral-300 dark:hover:bg-neutral-800"
                 }`}
               >
-                {d.nombre}
+                {labelDeposito(d)}
               </button>
             ))}
           </div>
@@ -298,6 +319,19 @@ export default function StockConsignado() {
                 )}
               </div>
 
+              {!loadingItems && !error && items && (
+                <>
+                  <AjusteStockPanel depositoId={selected.id} items={items} onAjustado={reloadItems} />
+                  <TransferirStockPanel
+                    depositoOrigenId={selected.id}
+                    depositoOrigenNombre={selected.nombre}
+                    items={items}
+                    depositos={depositos}
+                    onTransferido={reloadItems}
+                  />
+                </>
+              )}
+
               {loadingItems && (
                 <LoadingOverlay
                   label="Consultando Contabilium…"
@@ -322,13 +356,13 @@ export default function StockConsignado() {
                 />
               )}
 
-              {!loadingItems && !error && items && items.length === 0 && (
+              {!loadingItems && !error && items && conStock.length === 0 && !itemSearch && (
                 <div className="mt-6 rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-8 text-center text-sm text-slate-500 dark:border-neutral-700 dark:bg-neutral-800/60 dark:text-neutral-400 sm:p-10">
                   Este distribuidor no tiene stock disponible ahora mismo.
                 </div>
               )}
 
-              {!loadingItems && !error && items && items.length > 0 && filteredItems.length === 0 && (
+              {!loadingItems && !error && items && items.length > 0 && itemSearch && filteredItems.length === 0 && (
                 <div className="mt-6 rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-8 text-center text-sm text-slate-500 dark:border-neutral-700 dark:bg-neutral-800/60 dark:text-neutral-400 sm:p-10">
                   No encontramos resultados para "{itemSearch}".
                 </div>
@@ -387,8 +421,907 @@ export default function StockConsignado() {
         </div>
       </div>
 
-      <ItemModal item={selectedItem} onClose={() => setSelectedItem(null)} money={money} />
+      <ItemModal
+        item={selectedItem}
+        onClose={() => setSelectedItem(null)}
+        money={money}
+        onAjustarStock={
+          selected
+            ? ({ sku, cantidad, tipoModificacion }) =>
+                ajustarStockManual({ depositoId: selected.id, sku, cantidad, tipoModificacion })
+            : undefined
+        }
+      />
       <AuditRecorderModal open={recorderOpen} onClose={() => setRecorderOpen(false)} onSubmit={handleSubmitAudit} />
+    </div>
+  );
+}
+
+// Panel siempre visible (no hay que entrar a cada bici) para ajustar stock
+// en Contabilium — incluye productos en 0 unidades, que no aparecen en la
+// grilla principal (esa solo muestra lo disponible).
+function AjusteStockPanel({ depositoId, items, onAjustado }) {
+  const [query, setQuery] = useState("");
+  const [producto, setProducto] = useState(null);
+  const [cantidad, setCantidad] = useState(1);
+  const [tipo, setTipo] = useState("M");
+  const [enviando, setEnviando] = useState(false);
+  const [error, setError] = useState("");
+  const [ok, setOk] = useState(false);
+  const [idCC, setIdCC] = useState("");
+  const [pideIdCC, setPideIdCC] = useState(false);
+  const [observacion, setObservacion] = useState("");
+  const [probando, setProbando] = useState(false);
+  const [resultadosProbe, setResultadosProbe] = useState(null);
+
+  async function probarIdCC() {
+    setProbando(true);
+    setResultadosProbe(null);
+    try {
+      const { resultados } = await debugProbeIdCC(depositoId);
+      setResultadosProbe(resultados);
+    } catch (e) {
+      setResultadosProbe([{ error: e.message }]);
+    } finally {
+      setProbando(false);
+    }
+  }
+
+  const resultados = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    return items
+      .filter((it) => (it.name || "").toLowerCase().includes(q) || (it.sku || "").toLowerCase().includes(q))
+      .slice(0, 8);
+  }, [items, query]);
+
+  function elegir(item) {
+    setProducto(item);
+    setQuery("");
+    setCantidad(1);
+    setTipo("M");
+    setObservacion("");
+    setOk(false);
+    setError("");
+    setPideIdCC(false);
+    setIdCC("");
+  }
+
+  async function confirmar() {
+    setEnviando(true);
+    setError("");
+    try {
+      await ajustarStockManual({
+        depositoId,
+        sku: producto.sku,
+        cantidad,
+        tipoModificacion: tipo,
+        idCC: idCC.trim() ? Number(idCC.trim()) : null,
+        observaciones: observacion.trim() || undefined,
+      });
+      setOk(true);
+      onAjustado?.();
+    } catch (e) {
+      const msg = e.message || "No se pudo ajustar el stock";
+      // El backend pide el idCC solo la primera vez por depósito — después
+      // queda recordado en Firestore y no vuelve a hacer falta.
+      if (/idCC/i.test(msg)) setPideIdCC(true);
+      setError(msg);
+    } finally {
+      setEnviando(false);
+    }
+  }
+
+  return (
+    <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 p-4 dark:border-amber-900 dark:bg-amber-950/20">
+      <p className="text-base font-bold text-slate-900 dark:text-white">⚙️ Corregir stock</p>
+      <p className="mt-1 text-sm text-slate-500 dark:text-neutral-400">
+        Usalo cuando el stock real no coincide con Contabilium (una unidad rota, una que apareció, un recuento).
+      </p>
+
+      {!producto ? (
+        <div className="relative mt-4">
+          <p className="mb-1.5 text-xs font-bold uppercase tracking-wide text-amber-700 dark:text-amber-400">Paso 1 · Buscá la bici</p>
+          <input
+            type="search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Escribí el nombre o el código…"
+            className="w-full rounded-xl border border-amber-200 bg-white px-4 py-3 text-base text-slate-700 outline-none focus:border-amber-500 focus:ring-2 focus:ring-amber-500/40 dark:border-amber-900/50 dark:bg-neutral-900 dark:text-white"
+          />
+          {resultados.length > 0 && (
+            <ul className="absolute z-10 mt-1 w-full overflow-hidden rounded-xl border border-amber-200 bg-white shadow-lg dark:border-amber-900/50 dark:bg-neutral-900">
+              {resultados.map((it) => (
+                <li key={it.id || it.sku}>
+                  <button
+                    type="button"
+                    onClick={() => elegir(it)}
+                    className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-xs hover:bg-amber-50 dark:hover:bg-amber-950/30"
+                  >
+                    <span className="text-slate-700 dark:text-neutral-200">
+                      {it.name} <span className="text-slate-400">· SKU {it.sku}</span>
+                    </span>
+                    <span className={Number(it.stockActual || 0) > 0 ? "font-semibold text-emerald-600" : "font-semibold text-rose-500"}>
+                      {Number(it.stockActual || 0)} u.
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      ) : (
+        <div className="mt-3 rounded-xl border border-amber-200 bg-white p-3 dark:border-amber-900/50 dark:bg-neutral-900">
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <p className="text-sm font-semibold text-slate-900 dark:text-white">{producto.name}</p>
+              <p className="text-xs text-slate-500 dark:text-neutral-400">
+                SKU {producto.sku} · Stock actual: {Number(producto.stockActual || 0)}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setProducto(null)}
+              className="shrink-0 text-xs text-slate-400 hover:text-amber-600 dark:text-neutral-500"
+            >
+              Cambiar
+            </button>
+          </div>
+
+          {ok ? (
+            <div className="mt-3 rounded-xl bg-emerald-50 p-4 text-center dark:bg-emerald-950/20">
+              <p className="text-2xl">✅</p>
+              <p className="mt-1 text-sm font-semibold text-emerald-700 dark:text-emerald-400">¡Listo! El stock ya quedó corregido.</p>
+            </div>
+          ) : (
+            <>
+              <p className="mt-4 mb-1.5 text-xs font-bold uppercase tracking-wide text-amber-700 dark:text-amber-400">Paso 2 · ¿Qué pasó?</p>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <button
+                  type="button"
+                  onClick={() => setTipo("M")}
+                  className={`flex-1 rounded-xl border-2 px-4 py-3 text-left text-sm transition ${
+                    tipo === "M" ? "border-slate-900 bg-slate-900 text-white" : "border-slate-200 bg-white text-slate-600 hover:border-slate-300"
+                  }`}
+                >
+                  <span className="block text-base font-bold">➕➖ Sumar o restar unidades</span>
+                  <span className="mt-0.5 block text-xs opacity-80">Ej: llegó 1 unidad más → poné 1. Se rompió 1 → poné -1.</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTipo("R")}
+                  className={`flex-1 rounded-xl border-2 px-4 py-3 text-left text-sm transition ${
+                    tipo === "R" ? "border-slate-900 bg-slate-900 text-white" : "border-slate-200 bg-white text-slate-600 hover:border-slate-300"
+                  }`}
+                >
+                  <span className="block text-base font-bold">🎯 Poner el número exacto</span>
+                  <span className="mt-0.5 block text-xs opacity-80">Ej: contaste 5 bicis reales → poné 5, sin importar cuánto decía antes.</span>
+                </button>
+              </div>
+
+              <p className="mt-4 mb-1.5 text-xs font-bold uppercase tracking-wide text-amber-700 dark:text-amber-400">
+                Paso 3 · {tipo === "R" ? "¿En cuánto lo dejamos?" : "¿Cuántas unidades?"}
+              </p>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setCantidad((c) => c - 1)}
+                  className="flex h-11 w-11 items-center justify-center rounded-xl bg-slate-100 text-xl font-bold text-slate-700 hover:bg-slate-200 dark:bg-neutral-800 dark:text-white"
+                >
+                  −
+                </button>
+                <input
+                  type="number"
+                  value={cantidad}
+                  onChange={(e) => setCantidad(Number(e.target.value) || 0)}
+                  className="w-20 rounded-xl border border-amber-200 bg-white px-2 py-2 text-center text-xl font-bold text-slate-900 outline-none focus:border-amber-500 focus:ring-2 focus:ring-amber-500/40 dark:border-amber-900/50 dark:bg-neutral-900 dark:text-white"
+                />
+                <button
+                  type="button"
+                  onClick={() => setCantidad((c) => c + 1)}
+                  className="flex h-11 w-11 items-center justify-center rounded-xl bg-slate-100 text-xl font-bold text-slate-700 hover:bg-slate-200 dark:bg-neutral-800 dark:text-white"
+                >
+                  +
+                </button>
+                {tipo === "M" && (
+                  <span className="text-xs text-slate-400 dark:text-neutral-500">(número negativo = resta)</span>
+                )}
+              </div>
+
+              {pideIdCC && (
+                <div className="mt-4 rounded-xl border border-amber-300 bg-amber-100/60 p-3 dark:border-amber-800 dark:bg-amber-950/30">
+                  <p className="text-xs font-semibold text-amber-800 dark:text-amber-300">
+                    Primera vez que ajustás este depósito — hace falta un código único (se guarda solo, no lo vas a tener que poner de nuevo).
+                  </p>
+                  <input
+                    type="text"
+                    value={idCC}
+                    onChange={(e) => setIdCC(e.target.value)}
+                    placeholder="ej: 1135354"
+                    className="mt-2 w-full rounded-xl border border-amber-300 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-amber-500 focus:ring-2 focus:ring-amber-500/40 dark:border-amber-800 dark:bg-neutral-900 dark:text-white"
+                  />
+                  <button
+                    type="button"
+                    disabled={probando}
+                    onClick={probarIdCC}
+                    className="mt-2 rounded-lg border border-amber-300 bg-white px-2 py-1 text-[11px] font-semibold text-amber-700 hover:bg-amber-50 disabled:opacity-50"
+                  >
+                    {probando ? "Buscando…" : "🔍 Buscar automático (avanzado)"}
+                  </button>
+                  {resultadosProbe && (
+                    <pre className="mt-2 max-h-52 overflow-auto rounded-lg bg-slate-900 p-2 text-[10px] text-slate-100">
+                      {JSON.stringify(resultadosProbe, null, 2)}
+                    </pre>
+                  )}
+                </div>
+              )}
+
+              <div className="mt-4">
+                <label className="text-xs font-medium text-slate-500">Nota (opcional — queda anotada en Contabilium)</label>
+                <input
+                  type="text"
+                  value={observacion}
+                  onChange={(e) => setObservacion(e.target.value)}
+                  placeholder="ej: unidad rota, recuento físico, etc."
+                  className="mt-1 w-full rounded-xl border border-amber-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-amber-500 focus:ring-2 focus:ring-amber-500/40 dark:border-amber-900/50 dark:bg-neutral-900 dark:text-white"
+                />
+              </div>
+
+              <button
+                type="button"
+                disabled={enviando}
+                onClick={confirmar}
+                className="mt-4 w-full rounded-xl bg-amber-600 py-3 text-base font-bold text-white transition hover:-translate-y-0.5 hover:bg-amber-700 disabled:opacity-60"
+              >
+                {enviando ? "Ajustando…" : "✓ Confirmar"}
+              </button>
+              {error && <p className="mt-2 text-sm text-rose-500">{error}</p>}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Transferencia real de stock entre depósitos — no pide idCC, es automática
+// desde la primera vez.
+function TransferirStockPanel({ depositoOrigenId, depositoOrigenNombre, items, depositos, onTransferido }) {
+  const { user: authUser, profile: authProfile } = useAuth();
+  const [destinoId, setDestinoId] = useState("");
+  // Viaje que se carga solo en la grilla de logística de Julián al mover
+  // la mercadería (se puede destildar si el movimiento no lleva chofer).
+  const [viajeCfg, setViajeCfg] = useState(viajeCfgInicial);
+  const [viajeId, setViajeId] = useState(null);
+  const [viajeError, setViajeError] = useState("");
+  const [query, setQuery] = useState("");
+  const [productoElegido, setProductoElegido] = useState(null); // producto seleccionado, antes de agregar al carrito
+  const [cantidadElegida, setCantidadElegida] = useState(1);
+  const [carrito, setCarrito] = useState([]); // [{sku, name, cantidad, stockActual}]
+  const [observacion, setObservacion] = useState("");
+  const [enviando, setEnviando] = useState(false);
+  const [error, setError] = useState("");
+  const [ok, setOk] = useState(false);
+  const [remitoArchivo, setRemitoArchivo] = useState(null);
+  const [remitoPdfBase64, setRemitoPdfBase64] = useState(null);
+
+  // Remito "real" (a nombre de un proveedor elegido, para circular en la
+  // calle) — paso aparte y explícito, después de que el movimiento ya se
+  // confirmó, porque necesita un cliente real (no funciona con FEPA TOP).
+  const [remitoRealAbierto, setRemitoRealAbierto] = useState(false);
+  const [generandoRemitoReal, setGenerandoRemitoReal] = useState(false);
+  const [remitoRealError, setRemitoRealError] = useState("");
+  const [remitoRealNumero, setRemitoRealNumero] = useState(null);
+  const [remitoRealArchivo, setRemitoRealArchivo] = useState(null);
+  const [remitoRealPdfBase64, setRemitoRealPdfBase64] = useState(null);
+
+  // Proveedor del remito: por defecto se detecta solo (el cliente
+  // vinculado al depósito destino), pero se puede buscar y elegir otro a
+  // mano — para los casos donde el depósito no tiene cliente vinculado, o
+  // vino vinculado mal.
+  const [proveedorAutoDetectado, setProveedorAutoDetectado] = useState(undefined); // undefined = sin buscar, null = buscó y no encontró
+  const [proveedorElegido, setProveedorElegido] = useState(null); // override manual — null = usar el auto-detectado
+  const [proveedorQuery, setProveedorQuery] = useState("");
+  const [proveedorResultados, setProveedorResultados] = useState([]);
+  const [proveedorBuscando, setProveedorBuscando] = useState(false);
+  const [mostrarBuscadorProveedor, setMostrarBuscadorProveedor] = useState(false);
+
+  useEffect(() => {
+    setProveedorElegido(null);
+    setMostrarBuscadorProveedor(false);
+    if (!destinoId) {
+      setProveedorAutoDetectado(undefined);
+      return;
+    }
+    let cancelled = false;
+    setProveedorAutoDetectado(undefined);
+
+    // FEPA TOP es la propia empresa (el emisor), no está cargada como
+    // "cliente" en Contabilium — no se puede buscar/elegir como tal. Si el
+    // depósito destino no tiene un cliente vinculado, no dejamos el campo
+    // en blanco: mostramos FEPA TOP como default (sin contabiliumId, así
+    // el backend no fuerza ningún cliente y cae solo al remito estándar,
+    // que en Contabilium ya queda a nombre de la empresa) y se puede
+    // cambiar a mano con "Cambiar" igual que un proveedor detectado.
+    const FEPA_TOP_DEFAULT = { contabiliumId: null, razonSocial: "FEPA TOP (remito estándar, sin cliente)" };
+
+    getDocs(fsQuery(collection(db, "users"), where("contabiliumDepositoId", "==", Number(destinoId))))
+      .then((snap) => {
+        if (cancelled) return;
+        if (snap.empty) {
+          setProveedorAutoDetectado(FEPA_TOP_DEFAULT);
+          return;
+        }
+        const u = snap.docs[0].data();
+        if (!u.contabiliumId) {
+          setProveedorAutoDetectado(FEPA_TOP_DEFAULT);
+          return;
+        }
+        setProveedorAutoDetectado({ contabiliumId: u.contabiliumId, razonSocial: u.contabiliumDepositoNombre || u.name || "" });
+      })
+      .catch(() => {
+        if (!cancelled) setProveedorAutoDetectado(FEPA_TOP_DEFAULT);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [destinoId]);
+
+  useEffect(() => {
+    const q = proveedorQuery.trim();
+    if (q.length < 3) {
+      setProveedorResultados([]);
+      return;
+    }
+    let cancelled = false;
+    setProveedorBuscando(true);
+    const timer = setTimeout(() => {
+      searchContabiliumClientes(q)
+        .then((r) => {
+          if (!cancelled) setProveedorResultados(r.resultados || []);
+        })
+        .catch(() => {
+          if (!cancelled) setProveedorResultados([]);
+        })
+        .finally(() => {
+          if (!cancelled) setProveedorBuscando(false);
+        });
+    }, 350);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [proveedorQuery]);
+
+  const resultados = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    return items
+      .filter((it) => Number(it.stockActual || 0) > 0)
+      .filter((it) => !carrito.some((c) => c.sku === it.sku))
+      .filter((it) => (it.name || "").toLowerCase().includes(q) || (it.sku || "").toLowerCase().includes(q))
+      .slice(0, 8);
+  }, [items, query, carrito]);
+
+  const destinosDisponibles = useMemo(
+    () => depositos.filter((d) => d.id !== depositoOrigenId),
+    [depositos, depositoOrigenId]
+  );
+
+  function elegirProducto(item) {
+    setProductoElegido(item);
+    setCantidadElegida(1);
+    setQuery("");
+  }
+
+  // Suma 1 unidad directo a la lista sin pasar por la pantalla de elegir
+  // cantidad — para el caso común de agregar de a una bici por vez rápido.
+  // Si ya está en la lista, le suma 1 a la cantidad existente en vez de
+  // duplicar la fila.
+  function agregarUnaUnidad(item) {
+    setCarrito((prev) => {
+      const existente = prev.find((c) => c.sku === item.sku);
+      if (existente) {
+        return prev.map((c) =>
+          c.sku === item.sku ? { ...c, cantidad: Math.min(c.cantidad + 1, Number(item.stockActual || c.cantidad + 1)) } : c
+        );
+      }
+      return [...prev, { sku: item.sku, name: item.name, cantidad: 1, stockActual: item.stockActual }];
+    });
+  }
+
+  function agregarAlCarrito() {
+    if (!productoElegido) return;
+    setCarrito((prev) => [
+      ...prev,
+      { sku: productoElegido.sku, name: productoElegido.name, cantidad: cantidadElegida, stockActual: productoElegido.stockActual },
+    ]);
+    setProductoElegido(null);
+    setCantidadElegida(1);
+  }
+
+  function quitarDelCarrito(sku) {
+    setCarrito((prev) => prev.filter((c) => c.sku !== sku));
+  }
+
+  function cambiarCantidadCarrito(sku, delta) {
+    setCarrito((prev) =>
+      prev.map((c) => {
+        if (c.sku !== sku) return c;
+        const nueva = Math.max(1, Math.min(c.cantidad + delta, Number(c.stockActual || c.cantidad + delta)));
+        return { ...c, cantidad: nueva };
+      })
+    );
+  }
+
+  function reiniciar() {
+    setDestinoId("");
+    setCarrito([]);
+    setProductoElegido(null);
+    setObservacion("");
+    setOk(false);
+    setRemitoArchivo(null);
+    setRemitoPdfBase64(null);
+    setRemitoRealAbierto(false);
+    setRemitoRealError("");
+    setRemitoRealNumero(null);
+    setRemitoRealArchivo(null);
+    setRemitoRealPdfBase64(null);
+    setProveedorElegido(null);
+    setProveedorQuery("");
+    setProveedorResultados([]);
+    setViajeCfg(viajeCfgInicial());
+    setViajeId(null);
+    setViajeError("");
+    setError("");
+  }
+
+  function descargarPdf() {
+    if (!remitoPdfBase64) return;
+    const bytes = atob(remitoPdfBase64);
+    const arr = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+    const blob = new Blob([arr], { type: "application/pdf" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = remitoArchivo || "remito.pdf";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function confirmar() {
+    setEnviando(true);
+    setError("");
+    try {
+      const result = await transferirStockManual({
+        depositoOrigenId,
+        depositoDestinoId: Number(destinoId),
+        items: carrito.map((c) => ({ sku: c.sku, cantidad: c.cantidad, name: c.name })),
+        observaciones: observacion.trim() || undefined,
+        depositoOrigenNombre,
+        depositoDestinoNombre: destinosDisponibles.find((d) => d.id === Number(destinoId))?.nombre,
+      });
+      setRemitoArchivo(result.remitoArchivo || null);
+      setRemitoPdfBase64(result.remitoPdfBase64 || null);
+      setOk(true);
+      onTransferido?.();
+      if (viajeCfg.cargar) {
+        // El stock ya se movió — si el viaje falla no se deshace nada, solo
+        // se avisa para cargarlo a mano desde la grilla.
+        try {
+          const id = await crearViajeDesdeTransferencia({
+            origen: { id: depositoOrigenId, nombre: depositoOrigenNombre },
+            destino: {
+              id: Number(destinoId),
+              nombre: destinosDisponibles.find((d) => d.id === Number(destinoId))?.nombre,
+            },
+            fecha: viajeCfg.fecha,
+            turno: viajeCfg.turno,
+            horaSalida: viajeCfg.hora,
+            remitoArchivo: result.remitoArchivo,
+            pdfBase64: result.remitoPdfBase64,
+            notas: observacion.trim(),
+            chofer: viajeCfg.choferUid ? { uid: viajeCfg.choferUid, nombre: viajeCfg.choferNombre } : null,
+            actor: { uid: authUser?.uid || "", nombre: authProfile?.name || authUser?.email || null },
+          });
+          setViajeId(id);
+        } catch (errViaje) {
+          setViajeError(errViaje.message || "No se pudo cargar el viaje en la grilla");
+        }
+      }
+    } catch (e) {
+      setError(e.message || "No se pudo transferir el stock");
+    } finally {
+      setEnviando(false);
+    }
+  }
+
+  async function generarRemitoReal(archivoOverride) {
+    // El remito real se arma reasignando el cliente al remito interno que ya
+    // generó el movimiento — no crea un comprobante nuevo (eso rompía la
+    // numeración). Se pasa `archivoOverride` desde confirmarSoloRemito
+    // porque justo ahí el estado `remitoArchivo` todavía no se actualizó
+    // (setState es async) cuando se llama en la misma función.
+    const archivo = archivoOverride || remitoArchivo;
+    const proveedor = proveedorElegido || proveedorAutoDetectado;
+    if (!proveedor?.contabiliumId) {
+      setRemitoRealError("Elegí un cliente real (no FEPA TOP) para poder generar este remito.");
+      return false;
+    }
+    if (!archivo) {
+      setRemitoRealError("Todavía no hay un remito interno generado para reasignar.");
+      return false;
+    }
+    setGenerandoRemitoReal(true);
+    setRemitoRealError("");
+    try {
+      const result = await generarRemitoRealManual({
+        remitoArchivo: archivo,
+        proveedorContabiliumId: proveedor.contabiliumId,
+        observaciones: observacion.trim() || undefined,
+      });
+      setRemitoRealNumero(result.numero);
+      setRemitoRealArchivo(result.remitoArchivo);
+      setRemitoRealPdfBase64(result.remitoPdfBase64);
+      if (viajeId) {
+        // El viaje pasa a mostrar el remito real (a nombre del cliente).
+        actualizarRemitoViaje(viajeId, {
+          numero: result.numero || numeroDeRemito(result.remitoArchivo),
+          archivo: result.remitoArchivo || null,
+          pdfBase64: result.remitoPdfBase64 || null,
+        }).catch(() => {});
+      }
+      return true;
+    } catch (e) {
+      setRemitoRealError(e.message || "No se pudo generar el remito real");
+      return false;
+    } finally {
+      setGenerandoRemitoReal(false);
+    }
+  }
+
+  function descargarPdfReal() {
+    if (!remitoRealPdfBase64) return;
+    const bytes = atob(remitoRealPdfBase64);
+    const arr = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+    const blob = new Blob([arr], { type: "application/pdf" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = remitoRealArchivo || "remito-real.pdf";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  if (ok) {
+    return (
+      <div className="mt-4 rounded-2xl border border-sky-200 bg-sky-50 p-4 dark:border-sky-900 dark:bg-sky-950/20">
+        <div className="rounded-xl bg-emerald-50 p-4 text-center dark:bg-emerald-950/20">
+          <p className="text-2xl">✅</p>
+          <p className="mt-1 text-sm font-semibold text-emerald-700 dark:text-emerald-400">¡Listo! Ya se movió el stock.</p>
+          {remitoArchivo && (
+            <p className="mt-1 text-xs text-slate-500 dark:text-neutral-400">
+              📄 Remito interno: <span className="font-medium">{remitoArchivo}</span>
+            </p>
+          )}
+          {remitoPdfBase64 ? (
+            <button
+              type="button"
+              onClick={descargarPdf}
+              className="mt-3 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-700"
+            >
+              ⬇️ Descargar remito interno (PDF)
+            </button>
+          ) : remitoArchivo ? (
+            <p className="mt-1 text-[11px] text-slate-400 dark:text-neutral-500">
+              (No se pudo traer el PDF automático — buscalo en Contabilium, en "Remitos y Cobranza")
+            </p>
+          ) : null}
+
+          {viajeId && (
+            <p className="mt-2 text-xs font-medium text-sky-700 dark:text-sky-400">🚚 Viaje cargado en la grilla de Julián</p>
+          )}
+          {viajeError && <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">⚠️ {viajeError} — cargalo a mano desde la grilla de logística.</p>}
+
+          <div>
+            <button type="button" onClick={reiniciar} className="mt-4 text-xs font-medium text-sky-700 hover:underline dark:text-sky-400">
+              Hacer otra transferencia
+            </button>
+          </div>
+        </div>
+
+        {remitoRealNumero ? (
+          <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-left text-sm dark:border-emerald-900 dark:bg-emerald-950/20">
+            <p className="font-semibold text-emerald-700 dark:text-emerald-400">
+              📄 Remito real: <span className="font-medium">{remitoRealNumero}</span>
+            </p>
+            {remitoRealPdfBase64 ? (
+              <button
+                type="button"
+                onClick={descargarPdfReal}
+                className="mt-2 rounded-xl bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-700"
+              >
+                ⬇️ Descargar remito real (PDF)
+              </button>
+            ) : (
+              <p className="mt-1 text-[11px] text-slate-400 dark:text-neutral-500">
+                (No se pudo traer el PDF automático — buscalo en Contabilium, en "Remitos y Cobranza")
+              </p>
+            )}
+          </div>
+        ) : (
+          <div className="mt-3">
+            {!remitoRealAbierto ? (
+              <button
+                type="button"
+                onClick={() => setRemitoRealAbierto(true)}
+                className="w-full rounded-xl border border-sky-300 bg-white px-4 py-2.5 text-sm font-semibold text-sky-700 hover:bg-sky-50 dark:border-sky-800 dark:bg-neutral-900 dark:text-sky-400"
+              >
+                📄 Hacer remito real (para circular en la calle)
+              </button>
+            ) : (
+              <div className="rounded-xl border border-sky-200 bg-white p-3 text-left text-xs dark:border-sky-900/50 dark:bg-neutral-900">
+                <p className="font-semibold text-slate-700 dark:text-neutral-300">
+                  Con las mismas {carrito.reduce((acc, c) => acc + c.cantidad, 0)} bici(s) de esta transferencia, a nombre de:
+                </p>
+                {proveedorElegido ? (
+                  <div className="mt-1 flex items-center justify-between gap-2">
+                    <span className="text-slate-600 dark:text-neutral-400">{proveedorElegido.razonSocial}</span>
+                    <button
+                      type="button"
+                      onClick={() => setProveedorElegido(null)}
+                      className="whitespace-nowrap font-medium text-sky-600 hover:underline dark:text-sky-400"
+                    >
+                      Usar el detectado solo
+                    </button>
+                  </div>
+                ) : proveedorAutoDetectado?.contabiliumId ? (
+                  <div className="mt-1 flex items-center justify-between gap-2">
+                    <span className="text-slate-600 dark:text-neutral-400">
+                      ✓ {proveedorAutoDetectado.razonSocial} <span className="text-slate-400">(detectado solo)</span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setMostrarBuscadorProveedor((v) => !v)}
+                      className="whitespace-nowrap font-medium text-sky-600 hover:underline dark:text-sky-400"
+                    >
+                      Cambiar
+                    </button>
+                  </div>
+                ) : (
+                  <p className="mt-1 text-amber-600 dark:text-amber-400">
+                    ⚠️ Este depósito no tiene un cliente vinculado — buscá uno real abajo (el remito real necesita un cliente,
+                    no puede ser a nombre de FEPA TOP).
+                  </p>
+                )}
+                {(mostrarBuscadorProveedor || (!proveedorAutoDetectado?.contabiliumId && !proveedorElegido)) && (
+                  <>
+                    <input
+                      type="text"
+                      placeholder="Buscar cliente por nombre o CUIT…"
+                      value={proveedorQuery}
+                      onChange={(e) => setProveedorQuery(e.target.value)}
+                      className="mt-2 w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs outline-none focus:border-sky-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+                    />
+                    {proveedorBuscando && <p className="mt-1 text-slate-400 dark:text-neutral-500">Buscando…</p>}
+                    {proveedorResultados.length > 0 && (
+                      <div className="mt-1 max-h-32 overflow-y-auto rounded-lg border border-slate-100 dark:border-neutral-800">
+                        {proveedorResultados.map((r) => (
+                          <button
+                            key={r.contabiliumId}
+                            type="button"
+                            onClick={() => {
+                              setProveedorElegido({ contabiliumId: r.contabiliumId, razonSocial: r.razonSocial });
+                              setProveedorQuery("");
+                              setProveedorResultados([]);
+                              setMostrarBuscadorProveedor(false);
+                            }}
+                            className="block w-full px-2.5 py-1.5 text-left hover:bg-slate-50 dark:hover:bg-neutral-800"
+                          >
+                            {r.razonSocial} {r.cuit ? `— CUIT ${r.cuit}` : ""}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+
+                <label className="mt-3 block text-slate-500 dark:text-neutral-400">Observaciones (opcional)</label>
+                <input
+                  type="text"
+                  value={observacion}
+                  onChange={(e) => setObservacion(e.target.value)}
+                  className="mt-1 w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs outline-none focus:border-sky-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+                />
+
+                <button
+                  type="button"
+                  disabled={generandoRemitoReal}
+                  onClick={() => generarRemitoReal()}
+                  className="mt-3 w-full rounded-xl bg-sky-600 py-2.5 text-sm font-bold text-white hover:bg-sky-700 disabled:opacity-60"
+                >
+                  {generandoRemitoReal ? "Generando…" : "✓ Generar remito real"}
+                </button>
+                {remitoRealError && <p className="mt-2 text-rose-500">{remitoRealError}</p>}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-4 rounded-2xl border border-sky-200 bg-sky-50 p-4 dark:border-sky-900 dark:bg-sky-950/20">
+      <p className="text-base font-bold text-slate-900 dark:text-white">🔁 Mandar stock a otro depósito</p>
+      <p className="mt-1 text-sm text-slate-500 dark:text-neutral-400">
+        Mueve bicicletas de <strong>{depositoOrigenNombre}</strong> hacia otro distribuidor o depósito. Se genera el remito solo.
+      </p>
+
+      <p className="mt-4 mb-1.5 text-xs font-bold uppercase tracking-wide text-sky-700 dark:text-sky-400">Paso 1 · ¿A qué depósito va?</p>
+      <select
+        value={destinoId}
+        onChange={(e) => setDestinoId(e.target.value)}
+        className="w-full rounded-xl border border-sky-200 bg-white px-4 py-3 text-base text-slate-700 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40 dark:border-sky-900/50 dark:bg-neutral-900 dark:text-white"
+      >
+        <option value="">Elegí un depósito…</option>
+        {destinosDisponibles.map((d) => (
+          <option key={d.id} value={d.id}>
+            {labelDeposito(d)}
+          </option>
+        ))}
+      </select>
+
+      <p className="mt-3 text-[11px] text-slate-400 dark:text-neutral-500">
+        El cliente para el remito "real" (para circular en la calle) se elige después, una vez que el movimiento ya se
+        confirmó.
+      </p>
+
+      <p className="mt-4 mb-1.5 text-xs font-bold uppercase tracking-wide text-sky-700 dark:text-sky-400">Paso 2 · Agregá las bicis</p>
+
+      {carrito.length > 0 && (
+        <ul className="mb-3 space-y-1.5">
+          {carrito.map((c) => (
+            <li key={c.sku} className="flex items-center justify-between gap-2 rounded-xl border border-sky-200 bg-white px-3 py-2 text-sm dark:border-sky-900/50 dark:bg-neutral-900">
+              <span className="min-w-0 truncate text-slate-700 dark:text-neutral-200">{c.name}</span>
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => cambiarCantidadCarrito(c.sku, -1)}
+                  className="flex h-6 w-6 items-center justify-center rounded-lg bg-slate-100 text-sm font-bold text-slate-700 hover:bg-slate-200 dark:bg-neutral-800 dark:text-white"
+                >
+                  −
+                </button>
+                <span className="w-5 text-center font-bold">{c.cantidad}</span>
+                <button
+                  type="button"
+                  onClick={() => cambiarCantidadCarrito(c.sku, 1)}
+                  disabled={c.cantidad >= Number(c.stockActual || 0)}
+                  className="flex h-6 w-6 items-center justify-center rounded-lg bg-slate-100 text-sm font-bold text-slate-700 hover:bg-slate-200 disabled:opacity-40 dark:bg-neutral-800 dark:text-white"
+                >
+                  +
+                </button>
+                <button type="button" onClick={() => quitarDelCarrito(c.sku)} className="ml-1 text-xs text-slate-400 hover:text-rose-600 dark:text-neutral-500">
+                  ✕
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {!productoElegido ? (
+        <div className="relative">
+          <span className="pointer-events-none absolute left-3 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full bg-sky-600 text-base font-bold text-white">
+            +
+          </span>
+          <input
+            type="search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder={carrito.length > 0 ? "Agregar otra bici a la lista…" : "Buscá una bici para agregar…"}
+            className="w-full rounded-xl border border-sky-200 bg-white py-3 pl-12 pr-4 text-base text-slate-700 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40 dark:border-sky-900/50 dark:bg-neutral-900 dark:text-white"
+          />
+          {resultados.length > 0 && (
+            <ul className="absolute z-10 mt-1 w-full overflow-hidden rounded-xl border border-sky-200 bg-white shadow-lg dark:border-sky-900/50 dark:bg-neutral-900">
+              {resultados.map((it) => (
+                <li key={it.id || it.sku} className="flex items-center gap-1 px-1.5 py-1">
+                  <button
+                    type="button"
+                    onClick={() => elegirProducto(it)}
+                    className="flex min-w-0 flex-1 items-center justify-between gap-2 rounded-lg px-1.5 py-1.5 text-left text-xs hover:bg-sky-50 dark:hover:bg-sky-950/30"
+                  >
+                    <span className="min-w-0 truncate text-slate-700 dark:text-neutral-200">
+                      {it.name} <span className="text-slate-400">· SKU {it.sku}</span>
+                    </span>
+                    <span className="shrink-0 font-semibold text-emerald-600">{Number(it.stockActual || 0)} u.</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => agregarUnaUnidad(it)}
+                    title="Agregar 1 unidad directo a la lista"
+                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-sky-600 text-sm font-bold text-white hover:bg-sky-700"
+                  >
+                    +
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      ) : (
+        <div className="rounded-xl border border-sky-200 bg-white p-3 dark:border-sky-900/50 dark:bg-neutral-900">
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <p className="text-sm font-semibold text-slate-900 dark:text-white">{productoElegido.name}</p>
+              <p className="text-xs text-slate-500 dark:text-neutral-400">Hay {Number(productoElegido.stockActual || 0)} disponibles</p>
+            </div>
+            <button type="button" onClick={() => setProductoElegido(null)} className="shrink-0 text-xs text-slate-400 hover:text-sky-600 dark:text-neutral-500">
+              Cancelar
+            </button>
+          </div>
+          <div className="mt-3 flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => setCantidadElegida((c) => Math.max(1, c - 1))}
+              className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-100 text-lg font-bold text-slate-700 hover:bg-slate-200 dark:bg-neutral-800 dark:text-white"
+            >
+              −
+            </button>
+            <input
+              type="number"
+              min={1}
+              max={Number(productoElegido.stockActual || 0)}
+              value={cantidadElegida}
+              onChange={(e) => setCantidadElegida(Number(e.target.value) || 0)}
+              className="w-16 rounded-xl border border-sky-200 bg-white px-2 py-1.5 text-center text-lg font-bold text-slate-900 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40 dark:border-sky-900/50 dark:bg-neutral-900 dark:text-white"
+            />
+            <button
+              type="button"
+              onClick={() => setCantidadElegida((c) => Math.min(Number(productoElegido.stockActual || 1), c + 1))}
+              className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-100 text-lg font-bold text-slate-700 hover:bg-slate-200 dark:bg-neutral-800 dark:text-white"
+            >
+              +
+            </button>
+            <button
+              type="button"
+              disabled={cantidadElegida < 1 || cantidadElegida > Number(productoElegido.stockActual || 0)}
+              onClick={agregarAlCarrito}
+              className="ml-auto rounded-xl bg-sky-600 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-60"
+            >
+              + Agregar a la lista
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-4">
+        <label className="text-xs font-medium text-slate-500">Nota (opcional)</label>
+        <input
+          type="text"
+          value={observacion}
+          onChange={(e) => setObservacion(e.target.value)}
+          placeholder="ej: redistribución entre distribuidores"
+          className="mt-1 w-full rounded-xl border border-sky-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40 dark:border-sky-900/50 dark:bg-neutral-900 dark:text-white"
+        />
+        <p className="mt-1 text-[11px] text-slate-400 dark:text-neutral-500">
+          Al confirmar se genera el remito solo, con todas las bicis de la lista, y esta nota queda anotada ahí automáticamente.
+        </p>
+      </div>
+
+      <CargarViajeCampos value={viajeCfg} onChange={setViajeCfg} />
+
+      <button
+        type="button"
+        disabled={enviando || !destinoId || carrito.length === 0}
+        onClick={confirmar}
+        className="mt-4 w-full rounded-xl bg-sky-600 py-3 text-base font-bold text-white transition hover:-translate-y-0.5 hover:bg-sky-700 disabled:opacity-60"
+      >
+        {enviando ? "Transfiriendo…" : `✓ Confirmar transferencia${carrito.length ? ` (${carrito.length} producto${carrito.length === 1 ? "" : "s"})` : ""}`}
+      </button>
+      {error && <p className="mt-2 text-sm text-rose-500">{error}</p>}
     </div>
   );
 }

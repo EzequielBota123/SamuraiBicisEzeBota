@@ -112,7 +112,7 @@ export default function MiStockPage() {
     if (data?.depositoId) loadAudit(data.depositoId);
   }, [data?.depositoId, loadAudit]);
 
-  async function handleSubmitAudit(blob, recordedAt) {
+  async function handleSubmitAudit(blob, recordedAt, nota) {
     const distributorName = profile?.name || user.displayName || user.email || "Distribuidor";
     await uploadAudit({
       depositoId: data.depositoId,
@@ -121,6 +121,7 @@ export default function MiStockPage() {
       distributorName,
       blob,
       recordedAt,
+      nota,
     });
     await loadAudit(data.depositoId);
   }
@@ -252,6 +253,7 @@ export default function MiStockPage() {
           {data?.depositoNombre
             ? `Stock consignado en tu depósito: ${data.depositoNombre}`
             : "Stock consignado en Contabilium."}
+          {" "}Tocá una bici para reportar una venta o pedir más.
         </p>
       </div>
 
@@ -262,6 +264,100 @@ export default function MiStockPage() {
           {error.includes("sin depósito")
             ? "Todavía no tenés un depósito consignado asignado. Escribinos si creés que esto es un error."
             : `No pudimos cargar tu stock: ${error}`}
+        </div>
+      )}
+
+      {!loading && !error && data && lastAudit !== undefined && auditProgramStart !== undefined && (() => {
+        const lastAuditAt = lastAudit?.createdAt || null;
+        const overdue = isAuditOverdue(lastAuditAt, auditProgramStart, profile?.auditIntervalDays);
+        const dueSoon = !overdue && isAuditDueSoon(lastAuditAt, auditProgramStart, profile?.auditIntervalDays);
+        const isNuevo = !lastAudit; // todavía no grabó ninguna, pero ya tiene fecha de arranque del programa
+        const tone = overdue
+          ? "border-rose-300 bg-rose-50 dark:border-rose-500/30 dark:bg-rose-500/10"
+          : dueSoon
+          ? "border-amber-300 bg-amber-50 dark:border-amber-500/30 dark:bg-amber-500/10"
+          : isNuevo
+          ? "border-sky-200 bg-sky-50 dark:border-sky-500/30 dark:bg-sky-500/10"
+          : "border-slate-200 bg-white dark:border-neutral-800 dark:bg-neutral-900";
+        return (
+          <div className={`mb-5 flex flex-col gap-3 rounded-3xl border p-5 shadow-sm shadow-slate-200/60 dark:shadow-none sm:mb-6 sm:flex-row sm:items-center sm:justify-between sm:p-6 ${tone}`}>
+            <div>
+              <p className="text-sm font-bold text-slate-900 dark:text-white">🎥 Auditoría de stock</p>
+              {overdue && !isNuevo && (
+                <p className="mt-1 text-sm font-semibold text-rose-700">
+                  🚨 Tu auditoría de stock está vencida. Ocupate de hacerla cuanto antes, por favor.
+                </p>
+              )}
+              {dueSoon && (
+                <p className="mt-1 text-sm font-semibold text-amber-700">
+                  ⚠️ Dentro de 2 días se vence tu nueva auditoría. Por favor, tenelo en cuenta y grabá el video.
+                </p>
+              )}
+              {!overdue && !dueSoon && lastAudit && (
+                <p className="mt-1 text-xs text-slate-500 dark:text-neutral-400">
+                  Última auditoría: {lastAudit.createdAt?.toLocaleDateString("es-AR")} · Próxima:{" "}
+                  <span className="font-semibold text-slate-700 dark:text-neutral-300">{nextAuditDate(lastAuditAt, auditProgramStart, profile?.auditIntervalDays)?.toLocaleDateString("es-AR")}</span>
+                </p>
+              )}
+              {isNuevo && !overdue && !dueSoon && (
+                <p className="mt-1 text-xs text-sky-700">
+                  🎉 Implementamos la auditoría de stock. Tu primera auditoría vence el{" "}
+                  <span className="font-semibold">{nextAuditDate(lastAuditAt, auditProgramStart, profile?.auditIntervalDays)?.toLocaleDateString("es-AR")}</span>.
+                </p>
+              )}
+              {isNuevo && overdue && (
+                <p className="mt-1 text-sm font-semibold text-rose-700">
+                  🚨 Implementamos la auditoría de stock y ya se venció el primer plazo. Grabá el video cuanto antes.
+                </p>
+              )}
+            </div>
+            <button
+              onClick={() => setRecorderOpen(true)}
+              className="inline-flex shrink-0 items-center justify-center gap-2 rounded-2xl bg-rose-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:-translate-y-0.5 hover:bg-rose-700"
+            >
+              🎥 Grabar video
+            </button>
+          </div>
+        );
+      })()}
+
+      {!loading && !error && data && (
+        <div className="mb-5 overflow-hidden rounded-3xl border border-slate-200 bg-gradient-to-br from-slate-900 via-slate-900 to-slate-800 shadow-lg shadow-slate-300/40 dark:border-neutral-800 dark:shadow-none sm:mb-6">
+          <div className="grid gap-0 sm:grid-cols-[280px_1fr]">
+            <div className="flex items-center justify-center bg-black/20 p-6 sm:p-7">
+              <div className="relative w-full max-w-[220px] overflow-hidden rounded-[1.75rem] border-[3px] border-neutral-700/80 bg-black shadow-2xl ring-1 ring-white/10">
+                <video
+                  src="/videos/auditoria-tutorial.mp4"
+                  controls
+                  playsInline
+                  className="aspect-[9/16] w-full bg-black"
+                />
+              </div>
+            </div>
+            <div className="flex flex-col justify-center gap-3 p-6 sm:p-8">
+              <span className="inline-flex w-fit items-center gap-1.5 rounded-full bg-rose-500/15 px-3 py-1 text-[11px] font-bold uppercase tracking-wide text-rose-300">
+                🎬 Tutorial · 57 seg
+              </span>
+              <h3 className="text-lg font-bold text-white sm:text-xl">Cómo grabar tu auditoría de stock</h3>
+              <p className="text-sm leading-relaxed text-slate-300">
+                Mirá este video corto y hacé la tuya en menos de un minuto.
+              </p>
+              <ul className="mt-1 space-y-2 text-sm text-slate-200">
+                <li className="flex items-start gap-2">
+                  <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-sky-500/20 text-[11px] font-bold text-sky-300">1</span>
+                  Tocá "🎥 Grabar video" en el cartel de arriba
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-sky-500/20 text-[11px] font-bold text-sky-300">2</span>
+                  Filmá las bicis de tu depósito
+                </li>
+                <li className="flex items-start gap-2">
+                  <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-sky-500/20 text-[11px] font-bold text-sky-300">3</span>
+                  Confirmá y enviala
+                </li>
+              </ul>
+            </div>
+          </div>
         </div>
       )}
 
@@ -358,100 +454,6 @@ export default function MiStockPage() {
         </div>
       )}
 
-      {!loading && !error && data && (
-        <div className="mb-5 overflow-hidden rounded-3xl border border-slate-200 bg-gradient-to-br from-slate-900 via-slate-900 to-slate-800 shadow-lg shadow-slate-300/40 dark:border-neutral-800 dark:shadow-none sm:mb-6">
-          <div className="grid gap-0 sm:grid-cols-[280px_1fr]">
-            <div className="flex items-center justify-center bg-black/20 p-6 sm:p-7">
-              <div className="relative w-full max-w-[220px] overflow-hidden rounded-[1.75rem] border-[3px] border-neutral-700/80 bg-black shadow-2xl ring-1 ring-white/10">
-                <video
-                  src="/videos/auditoria-tutorial.mp4"
-                  controls
-                  playsInline
-                  className="aspect-[9/16] w-full bg-black"
-                />
-              </div>
-            </div>
-            <div className="flex flex-col justify-center gap-3 p-6 sm:p-8">
-              <span className="inline-flex w-fit items-center gap-1.5 rounded-full bg-rose-500/15 px-3 py-1 text-[11px] font-bold uppercase tracking-wide text-rose-300">
-                🎬 Tutorial · 57 seg
-              </span>
-              <h3 className="text-lg font-bold text-white sm:text-xl">Cómo grabar tu auditoría de stock</h3>
-              <p className="text-sm leading-relaxed text-slate-300">
-                Mirá este video corto y hacé la tuya en menos de un minuto.
-              </p>
-              <ul className="mt-1 space-y-2 text-sm text-slate-200">
-                <li className="flex items-start gap-2">
-                  <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-sky-500/20 text-[11px] font-bold text-sky-300">1</span>
-                  Tocá "🎥 Grabar video" en el cartel de abajo
-                </li>
-                <li className="flex items-start gap-2">
-                  <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-sky-500/20 text-[11px] font-bold text-sky-300">2</span>
-                  Filmá las bicis de tu depósito
-                </li>
-                <li className="flex items-start gap-2">
-                  <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-sky-500/20 text-[11px] font-bold text-sky-300">3</span>
-                  Confirmá y enviala
-                </li>
-              </ul>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {!loading && !error && data && lastAudit !== undefined && auditProgramStart !== undefined && (() => {
-        const lastAuditAt = lastAudit?.createdAt || null;
-        const overdue = isAuditOverdue(lastAuditAt, auditProgramStart, profile?.auditIntervalDays);
-        const dueSoon = !overdue && isAuditDueSoon(lastAuditAt, auditProgramStart, profile?.auditIntervalDays);
-        const isNuevo = !lastAudit; // todavía no grabó ninguna, pero ya tiene fecha de arranque del programa
-        const tone = overdue
-          ? "border-rose-300 bg-rose-50 dark:border-rose-500/30 dark:bg-rose-500/10"
-          : dueSoon
-          ? "border-amber-300 bg-amber-50 dark:border-amber-500/30 dark:bg-amber-500/10"
-          : isNuevo
-          ? "border-sky-200 bg-sky-50 dark:border-sky-500/30 dark:bg-sky-500/10"
-          : "border-slate-200 bg-white dark:border-neutral-800 dark:bg-neutral-900";
-        return (
-          <div className={`mb-5 flex flex-col gap-3 rounded-3xl border p-5 shadow-sm shadow-slate-200/60 dark:shadow-none sm:mb-6 sm:flex-row sm:items-center sm:justify-between sm:p-6 ${tone}`}>
-            <div>
-              <p className="text-sm font-bold text-slate-900 dark:text-white">🎥 Auditoría de stock</p>
-              {overdue && !isNuevo && (
-                <p className="mt-1 text-sm font-semibold text-rose-700">
-                  🚨 Tu auditoría de stock está vencida. Ocupate de hacerla cuanto antes, por favor.
-                </p>
-              )}
-              {dueSoon && (
-                <p className="mt-1 text-sm font-semibold text-amber-700">
-                  ⚠️ Dentro de 2 días se vence tu nueva auditoría. Por favor, tenelo en cuenta y grabá el video.
-                </p>
-              )}
-              {!overdue && !dueSoon && lastAudit && (
-                <p className="mt-1 text-xs text-slate-500 dark:text-neutral-400">
-                  Última auditoría: {lastAudit.createdAt?.toLocaleDateString("es-AR")} · Próxima:{" "}
-                  <span className="font-semibold text-slate-700 dark:text-neutral-300">{nextAuditDate(lastAuditAt, auditProgramStart, profile?.auditIntervalDays)?.toLocaleDateString("es-AR")}</span>
-                </p>
-              )}
-              {isNuevo && !overdue && !dueSoon && (
-                <p className="mt-1 text-xs text-sky-700">
-                  🎉 Implementamos la auditoría de stock. Tu primera auditoría vence el{" "}
-                  <span className="font-semibold">{nextAuditDate(lastAuditAt, auditProgramStart, profile?.auditIntervalDays)?.toLocaleDateString("es-AR")}</span>.
-                </p>
-              )}
-              {isNuevo && overdue && (
-                <p className="mt-1 text-sm font-semibold text-rose-700">
-                  🚨 Implementamos la auditoría de stock y ya se venció el primer plazo. Grabá el video cuanto antes.
-                </p>
-              )}
-            </div>
-            <button
-              onClick={() => setRecorderOpen(true)}
-              className="inline-flex shrink-0 items-center justify-center gap-2 rounded-2xl bg-rose-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:-translate-y-0.5 hover:bg-rose-700"
-            >
-              🎥 Grabar video
-            </button>
-          </div>
-        );
-      })()}
-
       {!loading && !error && (
         <div className="mb-5 rounded-3xl border border-slate-200 bg-white p-5 shadow-sm shadow-slate-200/60 dark:border-neutral-800 dark:bg-neutral-900 dark:shadow-none sm:mb-6 sm:p-6">
           <p className="mb-3 text-sm font-bold text-slate-900 dark:text-white">Límite de crédito</p>
@@ -526,7 +528,7 @@ export default function MiStockPage() {
         </div>
       )}
 
-      {!mySalesLoading && mySales.length > 0 && (
+      {!mySalesLoading && (
         <div className="mt-12 sm:mt-16">
           <h2 className="mb-1 text-sm font-bold uppercase tracking-wider text-slate-400 dark:text-neutral-500">Mis ventas reportadas</h2>
           <p className="mb-4 text-xs text-slate-500 dark:text-neutral-400">
@@ -538,6 +540,11 @@ export default function MiStockPage() {
               {receiptError}
             </p>
           )}
+          {mySales.length === 0 ? (
+            <div className="rounded-2xl border border-dashed border-slate-200 bg-white p-6 text-center text-sm text-slate-400 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-500">
+              Todavía no reportaste ninguna venta. Cuando marques una bici como vendida, va a aparecer acá.
+            </div>
+          ) : (
           <ul className="divide-y divide-slate-200 overflow-hidden rounded-2xl border border-slate-200 bg-white dark:divide-neutral-800 dark:border-neutral-800 dark:bg-neutral-900">
             {mySales.map((s) => {
               const estado = s.comprobantePagoEstado;
@@ -618,6 +625,7 @@ export default function MiStockPage() {
               );
             })}
           </ul>
+          )}
         </div>
       )}
 

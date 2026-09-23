@@ -15,6 +15,7 @@ export default function AuditRecorderModal({ open, onClose, onSubmit }) {
   const [uploadError, setUploadError] = useState("");
   const [seconds, setSeconds] = useState(0);
   const timerRef = useRef(null);
+  const [nota, setNota] = useState("");
 
   useEffect(() => {
     if (!open) return;
@@ -23,6 +24,7 @@ export default function AuditRecorderModal({ open, onClose, onSubmit }) {
     setPreviewUrl("");
     setUploadError("");
     setSeconds(0);
+    setNota("");
 
     if (!navigator.mediaDevices?.getUserMedia) {
       setPermError(
@@ -124,7 +126,7 @@ export default function AuditRecorderModal({ open, onClose, onSubmit }) {
     setUploading(true);
     setUploadError("");
     try {
-      await onSubmit(blob, recordedAtRef.current || new Date());
+      await onSubmit(blob, recordedAtRef.current || new Date(), nota.trim());
       handleClose();
     } catch (err) {
       setUploadError(err.message || "No se pudo subir el video.");
@@ -177,6 +179,19 @@ export default function AuditRecorderModal({ open, onClose, onSubmit }) {
             </span>
           )}
         </div>
+
+        {previewUrl && !uploading && (
+          <div className="mt-3">
+            <label className="mb-1 block text-xs font-medium text-slate-500">Notita para este video (opcional)</label>
+            <textarea
+              value={nota}
+              onChange={(e) => setNota(e.target.value)}
+              placeholder="Ej: faltan las 2 bicis azules, las despacho mañana…"
+              rows={2}
+              className="w-full resize-none rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-emerald-400"
+            />
+          </div>
+        )}
 
         {uploadError && <p className="mt-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">{uploadError}</p>}
 

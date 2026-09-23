@@ -37,6 +37,7 @@ export type StockAudit = {
   distributorUid: string;
   distributorName: string;
   videoUrl: string;
+  nota: string;
   createdAt: Date | null;
   vistoPor: AuditVista[];
   revisadoManual: RevisionManual | null;
@@ -53,6 +54,7 @@ export function toAudit(id: string, data: any): StockAudit {
     distributorUid: data?.distributorUid || "",
     distributorName: data?.distributorName || "",
     videoUrl: data?.videoUrl || "",
+    nota: data?.nota || "",
     createdAt: data?.createdAt instanceof Timestamp ? data.createdAt.toDate() : null,
     vistoPor: Array.isArray(data?.vistoPor)
       ? data.vistoPor.map((v: any) => ({
@@ -161,6 +163,7 @@ export async function uploadAudit({
   distributorName,
   blob,
   recordedAt,
+  nota,
 }: {
   depositoId: string | number;
   depositoNombre: string;
@@ -170,6 +173,9 @@ export async function uploadAudit({
   // Momento real en que se grabó (reloj del celular), no cuando termina de
   // subirse — importante si la conexión es lenta y la subida tarda.
   recordedAt?: Date;
+  // Notita opcional que se carga justo al terminar de grabar, para dejar
+  // contexto del video (ej. "faltan las 2 azules, las despacho mañana").
+  nota?: string;
 }): Promise<void> {
   const user = await authReady();
   if (!user) throw new Error("No hay sesión activa. Iniciá sesión y volvé a intentar.");
@@ -188,6 +194,7 @@ export async function uploadAudit({
     distributorUid,
     distributorName: distributorName || "",
     videoUrl,
+    nota: nota?.trim() || "",
     createdAt: Timestamp.fromDate(recordedAt || new Date()),
   });
 }

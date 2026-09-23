@@ -23,9 +23,39 @@ service cloud.firestore {
 
     // Pedidos desde el catálogo: cualquiera puede CREAR
     match /orders/{id} {
-      allow create: if true;
-      allow read: if true ;
-      allow write: if true ;
+      // Solo un distribuidor logueado puede crear un pedido, y solo a su
+      // propio nombre — antes cualquiera sin cuenta podía crear pedidos
+      // (caso "Saul": generó confusión porque no había ningún vínculo real
+      // con la cuenta de un distribuidor). El bloqueo de la pantalla de
+      // catálogo es solo la primera barrera; esta es la que realmente
+      // importa, porque corre en el servidor pase lo que pase del lado del
+      // cliente.
+      // Además del vínculo con la cuenta, se exige que el pedido tenga
+      // contenido real (nombre, al menos un ítem, total > 0) — sin esto,
+      // cualquiera con una sesión válida podía escribir un pedido vacío
+      // directo a Firestore (sin pasar por el formulario ni por
+      // createOrder()) y quedaba ensuciando el listado de "Pedidos" del
+      // admin con "Cliente sin nombre · 0 ítems · $0" (confirmado sept
+      // 2026, huecos en meta/orderCounter sin pedido real detrás).
+      allow create: if request.auth != null
+        && request.resource.data.customer.uid == request.auth.uid
+        && request.resource.data.customer.name is string
+        && request.resource.data.customer.name.size() > 0
+        && request.resource.data.items is list
+        && request.resource.data.items.size() > 0
+        && request.resource.data.total is number
+        && request.resource.data.total > 0;
+      allow read: if true;
+      allow update, delete: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+
+    // Sesión web de Contabilium (cookie de una automatización con Puppeteer
+    // para el ajuste manual de stock) — solo la tocan Cloud Functions con
+    // el Admin SDK, que ignora estas reglas. Nunca debe ser legible/editable
+    // desde el cliente.
+    match /meta/contabiliumWebSession {
+      allow read, write: if false;
     }
 
     // Metadatos varios (contadores, etc.)
@@ -52,25 +82,36 @@ service cloud.firestore {
     }
 
     // Datos internos (ej. mapeo de depósitos de Contabilium con nombres reales
-    // de distribuidores): solo lectura para usuarios staff, nunca escritura desde el cliente.
+    // de distribuidores): solo lectura para usuarios staff, nunca escritura
+    // desde el cliente. "chofer" también lee — Stock Consignado (usado en el
+    // sector chofer) necesita esta lista para poder elegir un distribuidor.
     match /internalData/{id} {
       allow read: if request.auth != null &&
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ["admin", "chofer"];
       allow write: if false;
     }
 
     // CRM interno (ex-Supabase): clientes/vendedores/asignaciones de
-    // telemarketing. Solo staff admin (mismo gate que /admin/crm en la app).
+    // telemarketing. Escritura solo admin; lectura también para "chofer" —
+    // el mapa del sector chofer usa el mismo useCrmData() que el CRM admin,
+    // y sin poder leer estas 3 colecciones el Promise.all de reload() se
+    // cae entero y el mapa queda vacío.
     match /crmVendedores/{id} {
-      allow read, write: if request.auth != null &&
+      allow read: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ["admin", "chofer"];
+      allow write: if request.auth != null &&
         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
     }
     match /crmClientes/{id} {
-      allow read, write: if request.auth != null &&
+      allow read: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ["admin", "chofer"];
+      allow write: if request.auth != null &&
         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
     }
     match /crmAsignaciones/{id} {
-      allow read, write: if request.auth != null &&
+      allow read: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ["admin", "chofer"];
+      allow write: if request.auth != null &&
         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
     }
 
@@ -96,12 +137,14 @@ service cloud.firestore {
     // "Mi Stock", visible para el admin en Stock Consignado).
     match /stockAudits/{id} {
       allow read: if request.auth != null;
+      // El propio distribuidor, un admin, o un chofer (graba la auditoría
+      // por él cuando visita el depósito desde Stock Consignado).
       allow create: if request.auth != null && (
         request.resource.data.distributorUid == request.auth.uid ||
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin"
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ["admin", "chofer"]
       );
       allow update, delete: if request.auth != null &&
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ["admin", "chofer"];
     }
 
     // Pagos reportados por el staff desde Conciliación Bancaria (vincular un
@@ -115,12 +158,161 @@ service cloud.firestore {
       allow read, write: if request.auth != null &&
         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
     }
+    // Historial manual de COTs cobrados en efectivo (pantalla /admin/cots).
+    match /cajaEfectivoCots/{id} {
+      allow read, write: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+
+    // Chequeo de vehículo antes de salir a ruta — el chofer lo carga y
+    // queda "pendiente" hasta que admin/chofer con permiso le da el OK
+    // (o lo rechaza con un comentario). Uno por chofer por día.
+    match /chequeosVehiculo/{id} {
+      allow read: if esChoferOAdmin();
+      allow create: if esChoferPropio() && request.resource.data.choferUid == request.auth.uid;
+      allow update: if esChoferOAdmin();
+    }
+
+    // Grilla de logística: hora de salida y de disponibilidad de la
+    // camioneta por turno (mañana/tarde/noche) — chofer y admin la leen y
+    // la editan por igual.
+    match /logisticaTurnos/{id} {
+      allow read, write: if esChoferOAdmin();
+    }
+
+    // Viajes de la grilla de logística (origen → destino con estado). El
+    // admin los carga/edita; el chofer los lee y va marcando salida, llegada
+    // y entrega.
+    match /logisticaViajes/{id} {
+      allow read, write: if esChoferOAdmin();
+    }
+
+    // PDF del remito de cada viaje (aparte del viaje, se lee solo al
+    // tocar "Ver remito").
+    match /logisticaViajesRemitos/{id} {
+      allow read, write: if esChoferOAdmin();
+    }
+
+    // Ubicación en vivo del chofer — solo él puede escribir la suya (con su
+    // permiso de GPS), solo admin/chofer pueden leer.
+    match /ubicacionesChofer/{uid} {
+      allow read: if esChoferOAdmin();
+      allow write: if esChoferPropio() && request.auth.uid == uid;
+    }
+
+    // Registro de cada movimiento (nota, recibo, factura, remito) hecho
+    // sobre un cliente, atribuido al vendedor que tenía asignado en el
+    // momento — para poder ver la actividad por vendedor.
+    match /actividadCliente/{id} {
+      allow read, write: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+
+    // Quién maneja: rol chofer, o la marca esChofer en usuarios con otro rol
+    // (ej. un distribuidor que también reparte, como Alfredo Bavcevich).
+    function datosUsuarioActual() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function esChoferOAdmin() {
+      return request.auth != null &&
+        (datosUsuarioActual().role in ["admin", "chofer"] || datosUsuarioActual().get('esChofer', false) == true);
+    }
+    function esChoferPropio() {
+      return request.auth != null &&
+        (datosUsuarioActual().role == "chofer" || datosUsuarioActual().get('esChofer', false) == true);
+    }
+
+    // Registro de a qué pantalla entró cada usuario logueado (no cada
+    // clic, solo cambios de ruta) — cualquiera logueado puede dejar su
+    // propio registro, solo admin puede leerlos todos.
+    match /accesos/{id} {
+      allow create: if request.auth != null && request.resource.data.uid == request.auth.uid;
+      allow read: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
 
     // Historial de extractos bancarios subidos en Cobranzas (conciliación
     // bancaria) — fecha/hora y movimientos de cada archivo, compartido para
     // todo el equipo. Solo staff admin.
     match /extractosBancarios/{id} {
       allow read, write: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+
+    // Notas de entrega del chofer, por cliente — separadas de
+    // seguimiento.historial (esas solo las editan Pablo/Marian). Cualquier
+    // staff (admin o chofer) puede leerlas y crearlas; solo el chofer autor
+    // o un admin puede editarlas/borrarlas.
+    function esStaff() {
+      return request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ["admin", "chofer"];
+    }
+    // Situación comercial de cada cliente (color + nota), marcada a mano
+    // desde el mapa mientras se los va llamando — verde/amarillo/naranja/
+    // rojo. Clave = contabiliumId del cliente. Solo staff.
+    match /situacionClientes/{contabiliumId} {
+      allow read, write: if esStaff();
+    }
+
+    // Stock manual por sub-vendedor de una red de distribución (ej. los 5
+    // vendedores de Federico Stortini) — no está atado a un depósito real de
+    // Contabilium, es una cuenta que el staff carga/actualiza a mano desde
+    // la ficha del distribuidor "padre" en Clientes 360.
+    match /redesVendedores/{id} {
+      allow read, write: if esStaff();
+    }
+
+    // Qué venta real (factura de Contabilium) se le atribuyó a cada
+    // sub-vendedor de una red — deja registro y es lo que dispara el
+    // descuento de su stock cargado a mano.
+    match /redesVendedoresVentas/{id} {
+      allow read, write: if esStaff();
+    }
+
+    match /notasEntrega/{id} {
+      allow read: if esStaff();
+      // El propio chofer crea sus notas; un admin también puede cargarle
+      // una nota a un chofer (ej. avisarle algo puntual de una entrega).
+      allow create: if esStaff() && (
+        request.resource.data.choferUid == request.auth.uid ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin"
+      );
+      allow update, delete: if esStaff() && (
+        resource.data.choferUid == request.auth.uid ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin"
+      );
+    }
+
+    // Registro de rutas (inicio/fin + anotaciones) — colgado del mapa, que
+    // usan admin, chofer y Alfredo Bavcevich (supervisor con
+    // `vendedoresAsignados`, no es staff). El pedido fue "todos" pueden ver
+    // el historial, así que el gate es el mismo que usa el mapa: staff, o
+    // tener vendedores asignados.
+    function tieneVendedoresAsignados() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('vendedoresAsignados', []).size() > 0;
+    }
+    function puedeUsarMapa() {
+      return request.auth != null && (esStaff() || tieneVendedoresAsignados());
+    }
+    match /rutas/{id} {
+      allow read: if puedeUsarMapa();
+      allow create: if puedeUsarMapa() && request.resource.data.iniciadoPorUid == request.auth.uid;
+      // Cerrar una ruta (agregar finAt/notaFin/estado) lo puede hacer
+      // cualquiera con acceso al mapa, no solo quien la inició — si el
+      // chofer que arrancó la ruta no puede cerrarla, cualquier otro staff
+      // debe poder hacerlo por él.
+      allow update: if puedeUsarMapa();
+      allow delete: if request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+
+    // Ventas reportadas por distribuidores — solo lectura para staff, para
+    // poder mostrar en Clientes 360 de qué venta reportada salió una
+    // factura/COT emitida automáticamente. Las escrituras van todas por
+    // Cloud Functions (reportSale, resolveSaleRequest), no directo del
+    // cliente.
+    match /saleRequests/{id} {
+      allow read: if request.auth != null &&
         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
     }
 

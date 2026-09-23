@@ -61,7 +61,7 @@ export default function Login() {
 
       updateDoc(doc(db, "users", user.uid), { lastLoginAt: serverTimestamp() }).catch(() => {});
 
-      const dest = ADMIN_ROLES.includes(role) ? "/" : "/catalogo";
+      const dest = ADMIN_ROLES.includes(role) ? "/" : role === "chofer" ? "/chofer" : "/catalogo";
       setWelcome(`¡Bienvenido, ${displayName}!`);
       // Brief delay so the user sees the welcome message
       setTimeout(() => history.push(dest), 800);

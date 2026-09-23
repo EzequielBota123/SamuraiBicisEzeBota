@@ -315,6 +315,9 @@ export default function AdminDashboard() {
               <h1 className="text-3xl font-semibold text-slate-900 dark:text-white sm:text-4xl">
                 Métricas
               </h1>
+              <p className="mt-2 max-w-xl text-sm text-slate-500 dark:text-neutral-400">
+                Pantallazo general del negocio hoy: cuántos usuarios, productos y ventas hay, y cómo viene el día comparado con lo de siempre.
+              </p>
             </div>
             <dl className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
               {[
@@ -376,6 +379,10 @@ export default function AdminDashboard() {
               {rollup?.updatedAt
                 ? `Actualizado: ${formatDateTime(rollup.updatedAt)}${rollup.depositosCount ? ` · ${rollup.depositosCount} depósitos` : ""}`
                 : "Todavía no se calculó — apretá actualizar."}
+            </p>
+            <p className="mt-1 text-xs text-slate-400 dark:text-neutral-500">
+              Conteo real, leído directo del stock de cada depósito en Contabilium — distinto del saldo contable
+              "Entregado − Facturado" de Remitos y Cobranza, que puede tener huecos si falta cargar algún remito viejo.
             </p>
           </div>
           <button
@@ -496,7 +503,10 @@ export default function AdminDashboard() {
             />
           )}
           <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold text-slate-900 dark:text-white">Órdenes recientes</h2>
+            <div>
+              <h2 className="text-lg font-semibold text-slate-900 dark:text-white">Órdenes recientes</h2>
+              <p className="text-xs text-slate-500 dark:text-neutral-400">Las últimas 5 compras que entraron, de cualquier cliente.</p>
+            </div>
             <span className="text-xs text-slate-500 dark:text-neutral-400">Refrescamos cada 60 segundos</span>
           </div>
 
@@ -547,6 +557,7 @@ export default function AdminDashboard() {
             />
           )}
           <h2 className="text-lg font-semibold text-slate-900 dark:text-white">Actividad</h2>
+          <p className="text-xs text-slate-500 dark:text-neutral-400">Quién compró último, para saber si hay que hacer seguimiento.</p>
           <ol className="mt-4 space-y-4 text-sm text-slate-600 dark:text-neutral-300">
             {activity.length === 0 ? (
               <li className="text-slate-500 dark:text-neutral-400">

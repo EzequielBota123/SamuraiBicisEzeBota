@@ -117,6 +117,7 @@ export default function useCrmData() {
       }
       map.set(u.contabiliumId, {
         uid: u.id,
+        customerTypeId: u.customerTypeId || null,
         contactado: !!seg.contactado,
         contactadoPor: seg.contactadoPor || null,
         contactadoFecha: seg.fecha?.toDate?.() || null,

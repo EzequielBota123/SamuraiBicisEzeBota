@@ -95,7 +95,13 @@ export default function ChequesSection() {
       {cheques !== null && (
         <div className="space-y-2">
           {filtrados.map((ch) => (
-            <ChequeRow key={ch.id} cheque={ch} mostrarCliente onChanged={() => {}} />
+            <ChequeRow
+              key={ch.id}
+              cheque={ch}
+              mostrarCliente
+              otrosChequesCliente={(cheques || []).filter((o) => o.contabiliumId === ch.contabiliumId)}
+              onChanged={() => {}}
+            />
           ))}
           {filtrados.length === 0 && (
             <p className="py-8 text-center text-sm text-slate-400 dark:text-neutral-500">Sin resultados.</p>

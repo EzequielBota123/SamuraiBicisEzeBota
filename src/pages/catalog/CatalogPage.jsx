@@ -2,7 +2,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useAuth } from "../../auth/AuthContext";
-import { useLocation } from "react-router-dom";
+import { useLocation, Link } from "react-router-dom";
 import { listProducts } from "../../services/products";
 import { createOrder } from "../../services/orders";
 import { getCustomerTypeById } from "../../services/customerTypes";
@@ -14,6 +14,13 @@ import Reveal from "../../components/ui/Reveal";
 import { generateCatalogPdf } from "../../utils/generateCatalogPdf";
 
 const SITE_URL = "https://samurai.ar";
+
+// Pedidos suspendidos hasta nuevo aviso mientras se regulariza el stock —
+// cambiar a false para reactivar. Solo corta el frontend; ver firestore.rules
+// si además hace falta bloquear el lado del servidor.
+const PEDIDOS_SUSPENDIDOS = true;
+const MENSAJE_PEDIDOS_SUSPENDIDOS =
+  "Los pedidos están temporalmente suspendidos mientras regularizamos el stock. Volvé a intentarlo pronto.";
 
 function getProductImages(p) {
   if (p.images?.length) return p.images;
@@ -69,6 +76,16 @@ const toArs = (usdPrice, exchangeRate) => {
   const ars = usd * rate;
   return Number.isFinite(ars) ? ars : null;
 };
+
+// Precio de lista en ARS de un producto, priorizando el priceArs sincronizado
+// de Contabilium por sobre el cálculo en USD*tipo de cambio — mismo criterio
+// que usa GroupCard para el precio "desde $X" en pantalla.
+function listPriceArs(product, exchangeRate) {
+  const contabiliumArs = product.priceArs != null ? Number(product.priceArs) : null;
+  if (Number.isFinite(contabiliumArs) && contabiliumArs > 0) return contabiliumArs;
+  const convertedArs = toArs(Number(product.price || 0), exchangeRate);
+  return Number.isFinite(convertedArs) && convertedArs > 0 ? convertedArs : null;
+}
 
 const NEW_PRODUCT_DAYS = 21;
 function isRecentlyAdded(createdAt) {
@@ -128,6 +145,7 @@ export default function CatalogPage() {
   const [rateUsedFallback, setRateUsedFallback] = useState(false);
   const [selectedEntry, setSelectedEntry] = useState(null);
   const [generatingPdf, setGeneratingPdf] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -351,20 +369,55 @@ export default function CatalogPage() {
   const handleGenerarCatalogoPdf = async () => {
     setGeneratingPdf(true);
     try {
-      // Usa la misma lista ya filtrada por categoría/búsqueda que se ve en
-      // pantalla (así "Bicicletas" o "Accesorios" seleccionado arriba
-      // también acota el PDF), ordenada bicicletas primero y accesorios
-      // después en vez del orden mezclado que trae Firestore.
-      const categoryRank = (p) => {
-        const cat = (p.category || "").toUpperCase();
-        if (cat === "BICICLETAS") return 0;
-        if (cat === "ACCESORIOS") return 1;
+      // Usa la misma lista agrupada por modelo que se ve en pantalla (un
+      // modelo con 3 colores es UNA fila "desde $X", no 3 filas repetidas)
+      // para que el PDF no quede redundante, ordenada bicicletas primero y
+      // accesorios después en vez del orden mezclado que trae Firestore.
+      const categoryRank = (entry) => {
+        const cat = (entry.isGroup ? entry.category : entry.product.category) || "";
+        if (cat.toUpperCase() === "BICICLETAS") return 0;
+        if (cat.toUpperCase() === "ACCESORIOS") return 1;
         return 2;
       };
-      const ordenados = [...filtered].sort(
-        (a, b) => categoryRank(a) - categoryRank(b) || (a.name || "").localeCompare(b.name || "")
+      const nameOf = (entry) => (entry.isGroup ? entry.base : entry.product.name) || "";
+      const ordenados = [...catalogEntries].sort(
+        (a, b) => categoryRank(a) - categoryRank(b) || nameOf(a).localeCompare(nameOf(b))
       );
-      await generateCatalogPdf(ordenados, { exchangeRate });
+
+      const categoryLabel = (entry) => {
+        const cat = ((entry.isGroup ? entry.category : entry.product.category) || "").toUpperCase();
+        if (cat === "BICICLETAS") return "Bicicletas";
+        if (cat === "ACCESORIOS") return "Accesorios";
+        return "Otros";
+      };
+
+      const items = ordenados.map((entry) => {
+        if (!entry.isGroup) {
+          const p = entry.product;
+          return {
+            id: p.id,
+            name: p.name,
+            category: categoryLabel(entry),
+            imageUrl: getProductImages(p)[0] || "",
+            priceArs: listPriceArs(p, exchangeRate),
+            priceUsd: p.price,
+          };
+        }
+        const withImages = entry.variants.find((v) => getProductImages(v.product).length);
+        const arsPrices = entry.variants.map((v) => listPriceArs(v.product, exchangeRate)).filter((n) => n != null);
+        const usdPrices = entry.variants.map((v) => Number(v.product.price || 0)).filter((n) => Number.isFinite(n) && n > 0);
+        return {
+          id: entry.variants[0].product.id,
+          name: entry.base,
+          category: categoryLabel(entry),
+          imageUrl: withImages ? getProductImages(withImages.product)[0] : "",
+          priceArs: arsPrices.length ? Math.min(...arsPrices) : null,
+          priceUsd: usdPrices.length ? Math.min(...usdPrices) : null,
+          desde: entry.variants.length > 1,
+        };
+      });
+
+      await generateCatalogPdf(items);
     } catch (err) {
       alert(err.message || "No se pudo generar el catálogo PDF.");
     } finally {
@@ -537,6 +590,22 @@ export default function CatalogPage() {
     if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [items, catalogEntries, location.search]);
 
+  // Link "privado" del catálogo PDF: nadie puede ver precios sin sesión
+  // navegando el catálogo normal, pero si entrás con el link puntual de un
+  // producto (?p=ID, el que se manda por WhatsApp), ESE producto se
+  // desbloquea igual sin necesidad de loguearse — el resto del catálogo
+  // sigue pidiendo login.
+  const unlockedEntryKey = useMemo(() => {
+    const params = new URLSearchParams(location.search);
+    const productId = params.get("p");
+    if (!productId) return null;
+    const owningEntry = catalogEntries.find((entry) =>
+      entry.isGroup ? entry.variants.some((v) => v.product.id === productId) : entry.product.id === productId
+    );
+    if (!owningEntry) return null;
+    return owningEntry.isGroup ? owningEntry.id : owningEntry.product.id;
+  }, [catalogEntries, location.search]);
+
   const showSkeleton = loading && !initialLoaded;
   const showOverlay = loading && initialLoaded;
   const closeProductModal = () => setSelectedEntry(null);
@@ -549,9 +618,14 @@ export default function CatalogPage() {
         <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-sky-400 via-indigo-400 to-slate-300" />
         <div className="relative mx-auto max-w-7xl px-4 py-10 sm:px-6 sm:py-16 lg:px-8">
           <div className="flex flex-col items-center gap-4 text-center sm:flex-row sm:items-center sm:justify-between sm:text-left">
-            <Reveal as="h1" className="text-3xl font-semibold text-slate-900 dark:text-white sm:text-4xl lg:text-5xl">
-              Descubrí todo nuestro portfolio
-            </Reveal>
+            <div>
+              <Reveal as="h1" className="text-3xl font-semibold text-slate-900 dark:text-white sm:text-4xl lg:text-5xl">
+                Descubrí todo nuestro portfolio
+              </Reveal>
+              <Reveal delay={40} className="mt-2 max-w-lg text-sm text-slate-500 dark:text-neutral-400 sm:text-base">
+                Bicicletas y accesorios Samurai listos para pedir — elegí una categoría o buscá directo lo que necesitás.
+              </Reveal>
+            </div>
             <Reveal delay={100}>
               <button
                 onClick={() => setCartOpen(true)}
@@ -611,17 +685,6 @@ export default function CatalogPage() {
               </div>
 
               <SortBar sort={sort} setSort={setSort} />
-
-              {isLoggedIn && (
-                <button
-                  type="button"
-                  onClick={handleGenerarCatalogoPdf}
-                  disabled={generatingPdf}
-                  className="rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-sky-400 disabled:opacity-60 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-200"
-                >
-                  {generatingPdf ? "Generando…" : "📄 Generar catálogo PDF"}
-                </button>
-              )}
             </div>
 
             <ActiveFilters
@@ -630,6 +693,31 @@ export default function CatalogPage() {
               onRemove={(id) => toggleCategory(id)}
               onClear={clearFilters}
             />
+
+            {isLoggedIn && (
+              <div className="flex flex-col items-end gap-1.5">
+                <button
+                  type="button"
+                  onClick={handleGenerarCatalogoPdf}
+                  disabled={generatingPdf}
+                  className="rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-sky-400 disabled:opacity-60 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-200"
+                >
+                  {generatingPdf ? "Generando…" : "📄 Generar catálogo PDF"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard.writeText(`${SITE_URL}/catalogo`).then(() => {
+                      setLinkCopied(true);
+                      setTimeout(() => setLinkCopied(false), 2000);
+                    });
+                  }}
+                  className="flex items-center gap-1.5 text-xs font-medium text-slate-500 transition hover:text-sky-600 dark:text-neutral-400 dark:hover:text-sky-400"
+                >
+                  {linkCopied ? "✓ Link copiado" : `🔗 Copiar link del catálogo (${SITE_URL.replace(/^https?:\/\//, "")}/catalogo)`}
+                </button>
+              </div>
+            )}
 
             {(() => {
               const hasGroups = catalogEntries.some((entry) => entry.isGroup);
@@ -658,6 +746,7 @@ export default function CatalogPage() {
                 <ProductGrid
                   entries={catalogEntries}
                   isLoggedIn={isLoggedIn}
+                  unlockedKey={unlockedEntryKey}
                   discount={discount}
                   onAdd={addToCart}
                   exchangeRate={exchangeRate}
@@ -700,7 +789,12 @@ export default function CatalogPage() {
       <ProductModal
         entry={selectedEntry}
         onClose={closeProductModal}
-        isLoggedIn={isLoggedIn}
+        isLoggedIn={
+          isLoggedIn ||
+          (!!selectedEntry &&
+            unlockedEntryKey != null &&
+            (selectedEntry.isGroup ? selectedEntry.id : selectedEntry.product.id) === unlockedEntryKey)
+        }
         discount={discount}
         exchangeRate={exchangeRate}
         showUsd={showUsd}
@@ -718,6 +812,7 @@ export default function CatalogPage() {
         result={orderResult}
         onSubmit={submitOrder}
         profile={profile}
+        isLoggedIn={isLoggedIn}
       />
     </main>
   );
@@ -771,7 +866,7 @@ function entryCategory(entry) {
   return "Otros";
 }
 
-function ProductGrid({ entries, isLoggedIn, discount = 0, onAdd, exchangeRate, showUsd = true, onSelect }) {
+function ProductGrid({ entries, isLoggedIn, unlockedKey = null, discount = 0, onAdd, exchangeRate, showUsd = true, onSelect }) {
   if (!entries.length) {
     return (
       <div className="rounded-3xl border border-dashed border-slate-300/60 bg-white p-12 text-center text-sm text-slate-500 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-400">
@@ -811,12 +906,13 @@ function ProductGrid({ entries, isLoggedIn, discount = 0, onAdd, exchangeRate, s
           <ul className="grid gap-4 grid-cols-2 sm:gap-5 md:grid-cols-3 lg:grid-cols-4">
             {section.entries.map((entry, idx) => {
               const key = entry.isGroup ? entry.id : entry.product.id;
+              const unlocked = isLoggedIn || (unlockedKey != null && key === unlockedKey);
               return (
                 <Reveal as="li" key={key} id={`product-${key}`} delay={Math.min(idx * 45, 360)}>
                   {entry.isGroup ? (
                     <GroupCard
                       entry={entry}
-                      isLoggedIn={isLoggedIn}
+                      isLoggedIn={unlocked}
                       exchangeRate={exchangeRate}
                       showUsd={showUsd}
                       onSelect={() => onSelect?.(entry)}
@@ -824,7 +920,7 @@ function ProductGrid({ entries, isLoggedIn, discount = 0, onAdd, exchangeRate, s
                   ) : (
                     <ProductCard
                       product={entry.product}
-                      isLoggedIn={isLoggedIn}
+                      isLoggedIn={unlocked}
                       discount={discount}
                       onAdd={onAdd}
                       exchangeRate={exchangeRate}
@@ -1557,7 +1653,7 @@ function CartDrawer({
     return Number(product?.stock ?? 0);
   };
   const stockProblems = cart.filter((it) => getAvailable(it.id) < it.qty);
-  const checkoutDisabled = !cart.length || stockProblems.length > 0;
+  const checkoutDisabled = PEDIDOS_SUSPENDIDOS || !cart.length || stockProblems.length > 0;
 
   return (
     <div className={`fixed inset-0 z-[60] ${open ? "" : "pointer-events-none"}`}>
@@ -1694,6 +1790,11 @@ function CartDrawer({
                   Tenés un descuento del {effectiveDiscount}% activo para tus precios.
                 </p>
               ) : null}
+              {PEDIDOS_SUSPENDIDOS ? (
+                <p className="rounded-2xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  {MENSAJE_PEDIDOS_SUSPENDIDOS}
+                </p>
+              ) : null}
               <button
                 onClick={onCheckout}
                 disabled={checkoutDisabled}
@@ -1709,7 +1810,7 @@ function CartDrawer({
   );
 }
 
-function OrderModal({ open, onClose, submitting, result, onSubmit, profile }) {
+function OrderModal({ open, onClose, submitting, result, onSubmit, profile, isLoggedIn }) {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [phone, setPhone] = useState("");
@@ -1770,7 +1871,37 @@ function OrderModal({ open, onClose, submitting, result, onSubmit, profile }) {
           </button>
         </div>
 
-        {result ? (
+        {PEDIDOS_SUSPENDIDOS ? (
+          <div className="mt-6 space-y-4">
+            <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-4 text-sm text-amber-800">
+              {MENSAJE_PEDIDOS_SUSPENDIDOS}
+            </div>
+            <div className="flex justify-end">
+              <button onClick={onClose} className="rounded-2xl border border-slate-200 px-4 py-2 text-sm text-slate-600 hover:bg-slate-100">
+                Cerrar
+              </button>
+            </div>
+          </div>
+        ) : !isLoggedIn ? (
+          <div className="mt-6 space-y-4">
+            <div className="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-4 text-sm text-sky-800">
+              Para hacer un pedido tenés que ser distribuidor de Samurai con tu cuenta aprobada. Si todavía no tenés
+              cuenta, completá el formulario de "Volvete distribuidor" y te contactamos para darte de alta.
+            </div>
+            <div className="flex justify-end gap-2">
+              <button onClick={onClose} className="rounded-2xl border border-slate-200 px-4 py-2 text-sm text-slate-600 hover:bg-slate-100">
+                Cerrar
+              </button>
+              <Link
+                to="/quiero-ser-cliente"
+                onClick={onClose}
+                className="rounded-2xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
+              >
+                Quiero ser distribuidor
+              </Link>
+            </div>
+          </div>
+        ) : result ? (
           <div className="mt-6 space-y-4">
             {result.ok ? (
               <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-4 text-sm text-emerald-600">

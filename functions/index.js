@@ -5,7 +5,8 @@ const { onDocumentCreated, onDocumentWritten } = require("firebase-functions/v2/
 const { defineSecret } = require("firebase-functions/params");
 const { setGlobalOptions } = require("firebase-functions/v2");
 const admin = require("firebase-admin");
-const { getAllConceptos, getClientById, searchClientByDoc, getComprobantesByClientId, getAllComprobantes, getComprobanteById, getStockByDeposito, getDepositosViaStockBySKU, searchClientesByFiltro, getAllClientes, getCobranzasList, getCobranzaById, getStockDisponibleBySKU, buscarCobranzasPorClientePaginado, testPageIndexRaw, probeBancosEndpoints, debugComprobantesPaging, debugSaldoByCuit, debugClienteSearchRaw, debugProbeCcEndpoints, debugProbeRemitosEndpoints, debugProbeCrearComprobanteEndpoints, debugProbeCrearComprobantePayload, debugProbeStockDescuento, cobrarComprobante, crearComprobante, crearCliente, getDatosAfip, updateCliente } = require("./contabiliumService");
+const { getAllConceptos, getClientById, searchClientByDoc, getComprobantesByClientId, getAllComprobantes, getComprobanteById, getStockByDeposito, getDepositosViaStockBySKU, searchClientesByFiltro, getAllClientes, getCobranzasList, getCobranzaById, getStockDisponibleBySKU, buscarCobranzasPorClientePaginado, testPageIndexRaw, probeBancosEndpoints, probeMovimientosDepositoEndpoints, probeChequesEndpoints, debugComprobantesPaging, debugSaldoByCuit, debugClienteSearchRaw, debugProbeCcEndpoints, debugProbeRemitosEndpoints, debugProbeCrearComprobanteEndpoints, debugProbeCrearComprobantePayload, debugProbeStockDescuento, cobrarComprobante, crearComprobante, crearCliente, getDatosAfip, updateCliente } = require("./contabiliumService");
+const { getGaliciaTokenQA, getSaldosGaliciaQA, solicitarExtractoGaliciaQA, validarExtractosGaliciaQA, descargarExtractoGaliciaQA, parseCsvMovimientosGalicia } = require("./galiciaService");
 
 
 admin.initializeApp();
@@ -25,6 +26,49 @@ const ALLOWED_ORIGINS = new Set([
   "https://www.samurai.ar",
 ]);
 
+// Notificaciones push (FCM) — mismos eventos que ya generan la campanita
+// interna, pero también con sonido en el celular. `fcmTokens` vive en el
+// propio doc de cada usuario (users/{uid}), como array porque una cuenta
+// puede tener la app abierta en varios dispositivos a la vez.
+async function enviarPushAUsuario(uid, { title, body, link, data } = {}) {
+  if (!uid) return;
+  try {
+    const ref = admin.firestore().doc(`users/${uid}`);
+    const snap = await ref.get();
+    const tokens = snap.exists ? snap.data().fcmTokens || [] : [];
+    if (!tokens.length) return;
+    const resp = await admin.messaging().sendEachForMulticast({
+      notification: { title, body },
+      data: { link: link || "/", ...(data || {}) },
+      tokens,
+    });
+    // Un token puede quedar obsoleto (usuario desinstaló, borró el sitio de
+    // su navegador, etc.) — si Firebase lo confirma como no-registrado, lo
+    // sacamos para no seguir intentando mandarle en vano.
+    const invalidos = [];
+    resp.responses.forEach((r, i) => {
+      const code = r.error?.code;
+      if (!r.success && (code === "messaging/registration-token-not-registered" || code === "messaging/invalid-registration-token")) {
+        invalidos.push(tokens[i]);
+      }
+    });
+    if (invalidos.length) {
+      await ref.update({ fcmTokens: admin.firestore.FieldValue.arrayRemove(...invalidos) });
+    }
+  } catch (err) {
+    console.error(`[push] enviarPushAUsuario(${uid}) error:`, err);
+  }
+}
+
+async function enviarPushAAdmins({ title, body, link, data } = {}) {
+  try {
+    const snap = await admin.firestore().collection("users").where("role", "==", "admin").get();
+    await Promise.all(snap.docs.map((d) => enviarPushAUsuario(d.id, { title, body, link, data })));
+  } catch (err) {
+    console.error("[push] enviarPushAAdmins error:", err);
+  }
+}
+
 function setCorsHeaders(req, res) {
   const origin = req.get("Origin");
   if (origin && ALLOWED_ORIGINS.has(origin)) {
@@ -42,8 +86,38 @@ function setCorsHeaders(req, res) {
 //   firebase functions:secrets:set CONTABILIUM_API_KEY
 const CONTABILIUM_EMAIL   = defineSecret("CONTABILIUM_EMAIL");
 const CONTABILIUM_API_KEY = defineSecret("CONTABILIUM_API_KEY");
+// Login real (usuario/contraseña) de la consola web de Contabilium — se usa
+// solo para el ajuste manual de stock, que no tiene API oficial (ver
+// contabiliumWebAutomation.js). Es un secreto distinto de CONTABILIUM_EMAIL
+// / CONTABILIUM_API_KEY (esos son para la API oficial con OAuth).
+const CONTABILIUM_WEB_EMAIL = defineSecret("CONTABILIUM_WEB_EMAIL");
+const CONTABILIUM_WEB_PASSWORD = defineSecret("CONTABILIUM_WEB_PASSWORD");
 const RESEND_API_KEY      = defineSecret("RESEND_API_KEY");
 const MERCADOPAGO_ACCESS_TOKEN = defineSecret("MERCADOPAGO_ACCESS_TOKEN");
+const GALICIA_APP_ID = defineSecret("GALICIA_APP_ID");
+const GALICIA_APP_KEY = defineSecret("GALICIA_APP_KEY");
+const GALICIA_ENTERPRISE_ID = defineSecret("GALICIA_ENTERPRISE_ID");
+// Clave de Google Maps de uso exclusivo desde el backend (Geocoding API) —
+// distinta de la clave pública que usa el navegador para dibujar el mapa.
+// Esta no tiene restricción de "sitio web" (Cloud Functions no manda un
+// Referer que la pase), así que nunca debe exponerse al cliente: solo vive
+// como secreto de Firebase.
+const GOOGLE_MAPS_SERVER_KEY = defineSecret("GOOGLE_MAPS_SERVER_KEY");
+// Clave de Anthropic para leer comprobantes de pago (foto) con IA y
+// extraer banco/monto/fecha — usada para aplicar recibos de cuenta
+// corriente automáticamente sin intervención humana.
+const ANTHROPIC_API_KEY = defineSecret("ANTHROPIC_API_KEY");
+// "Basic Empresa" en el portal de Open Galicia = Authorization Password
+// documentado (se concatena CUIT:AuthorizationPassword y se codifica en
+// Base64 para el header Authorization Basic del pedido de token).
+const GALICIA_AUTH_PASSWORD = defineSecret("GALICIA_BASIC_EMPRESA");
+// Certificado cliente para Mutual TLS (ambiente QA). El .cer todavía no lo
+// tenemos (bloqueado por un problema de DNS del lado de Galicia al
+// descargarlo) — hasta que se cargue este secret, cualquier llamada real
+// va a fallar con un error claro en vez de un fetch failed silencioso.
+const GALICIA_QA_CERT_PEM = defineSecret("GALICIA_QA_CERT_PEM");
+const GALICIA_QA_KEY_PEM = defineSecret("GALICIA_QA_KEY_PEM");
+const GALICIA_QA_KEY_PASSPHRASE = defineSecret("GALICIA_QA_KEY_PASSPHRASE");
 
 // Envía un mail vía la API de Resend (https://resend.com). "from" usa el
 // dominio samurai.ar, ya verificado en la cuenta de Resend.
@@ -188,6 +262,177 @@ exports.syncContabiliumStock = onSchedule(
         { errors: [String(err)], lastSync: admin.firestore.FieldValue.serverTimestamp() },
         { merge: true }
       );
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────
+// Todos los días, chequea si hay clientes de Contabilium (dados de alta ahí
+// directamente, sin pasar por el alta de Samurai) que todavía no tienen
+// ninguna cuenta acá — y les crea una completa (Auth + Firestore + link de
+// invitación por reset de contraseña), mismo criterio que se usó a mano el
+// 31/8/2026 para los 61 que se habían acumulado sin vincular. Antes de esto
+// no había NADA que detectara este caso — por eso se fueron acumulando.
+async function syncClientesContabiliumSinCuenta(email, apiKey) {
+  const db = admin.firestore();
+  const clientes = await getAllClientes(email, apiKey);
+  const clientesPorId = new Map(clientes.map((c) => [c.Id, c]));
+
+  const usersSnap = await db.collection("users").where("kind", "==", "client").get();
+  const linkedIds = new Set(usersSnap.docs.map((d) => d.data().contabiliumId).filter((id) => id != null));
+
+  // Además de dar de alta a los que faltan, refresca nombre/CUIT/condición
+  // IVA/email de TODOS los ya vinculados contra el dato real de Contabilium
+  // — así Clientes 360, el CRM y el mapa nunca quedan con un nombre viejo
+  // (ej. el username crudo del alta) aunque nadie toque "Sincronizar" a mano.
+  let actualizados = 0;
+  {
+    let batch = db.batch();
+    let opsEnBatch = 0;
+    for (const docSnap of usersSnap.docs) {
+      const u = docSnap.data();
+      if (!u.contabiliumId) continue;
+      const c = clientesPorId.get(u.contabiliumId);
+      if (!c) continue;
+      const nombreReal = (c.RazonSocial || c.NombreFantasia || "").trim() || null;
+      const cuitReal = c.NroDoc || null;
+      const condicionIvaReal = c.CondicionIva || null;
+      const emailReal = c.Email || null;
+      const cambia =
+        (nombreReal && nombreReal !== u.name) ||
+        (cuitReal && cuitReal !== u.cuit) ||
+        (condicionIvaReal && condicionIvaReal !== u.condicionIva) ||
+        (emailReal !== (u.contabiliumEmail || null));
+      if (!cambia) continue;
+      batch.update(docSnap.ref, {
+        ...(nombreReal ? { name: nombreReal } : {}),
+        ...(cuitReal ? { cuit: cuitReal } : {}),
+        ...(condicionIvaReal ? { condicionIva: condicionIvaReal } : {}),
+        contabiliumEmail: emailReal,
+        contabiliumSync: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      actualizados++;
+      opsEnBatch++;
+      if (opsEnBatch >= 450) {
+        await batch.commit();
+        batch = db.batch();
+        opsEnBatch = 0;
+      }
+    }
+    if (opsEnBatch > 0) await batch.commit();
+  }
+
+  const sinCuenta = clientes.filter((c) => !linkedIds.has(c.Id));
+  const creados = [];
+
+  for (const c of sinCuenta) {
+    const nombre = (c.RazonSocial || c.NombreFantasia || "").trim();
+    if (!nombre) continue;
+
+    const baseSlug = slugifyUsername(nombre);
+    let usernameLower = baseSlug;
+    let suffix = 1;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const existing = await db.collection("users").where("usernameLower", "==", usernameLower).limit(1).get();
+      if (existing.empty) break;
+      suffix++;
+      usernameLower = `${baseSlug}-${suffix}`;
+    }
+
+    const hasRealEmail = !!c.Email;
+    const email2 = hasRealEmail ? c.Email.toLowerCase() : `${usernameLower}@samurai.internal`;
+
+    let authUser;
+    try {
+      authUser = await admin.auth().getUserByEmail(email2);
+    } catch {
+      authUser = await admin.auth().createUser({ email: email2, displayName: nombre });
+    }
+    const uid = authUser.uid;
+
+    await db.doc(`users/${uid}`).set(
+      {
+        uid,
+        name: nombre,
+        username: usernameLower,
+        usernameLower,
+        email: email2,
+        emailLower: email2,
+        contactEmail: hasRealEmail ? c.Email : null,
+        role: "viewer",
+        status: "activo",
+        approved: true,
+        kind: "client",
+        customerTypeId: null,
+        creditLimit: null,
+        contabiliumId: c.Id,
+        cuit: c.NroDoc || null,
+        condicionIva: c.CondicionIva || null,
+        idListaPrecio: c.IdListaPrecio ?? null,
+        contabiliumEmail: c.Email || null,
+        contabiliumSync: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        autoCreatedFromContabilium: true,
+      },
+      { merge: true }
+    );
+
+    let link = null;
+    try {
+      link = await admin.auth().generatePasswordResetLink(email2, { url: `${SITE_URL}/login`, handleCodeInApp: false });
+    } catch {
+      link = null;
+    }
+
+    creados.push({ contabiliumId: c.Id, nombre, uid, hasRealEmail, link });
+  }
+
+  if (creados.length > 0) {
+    await db.collection("notifications").add({
+      type: "clientes_contabilium_auto_creados",
+      cantidad: creados.length,
+      clientes: creados.map((c) => ({ nombre: c.nombre, uid: c.uid, hasRealEmail: c.hasRealEmail })),
+      read: false,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
+
+  return { totalContabilium: clientes.length, sinCuentaEncontrados: sinCuenta.length, creados: creados.length, actualizados };
+}
+
+exports.syncClientesContabiliumSinCuentaDaily = onSchedule(
+  {
+    schedule: "every day 08:00",
+    timeZone: "America/Argentina/Buenos_Aires",
+    secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY],
+    timeoutSeconds: 300,
+  },
+  async () => {
+    try {
+      const result = await syncClientesContabiliumSinCuenta(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value());
+      console.log("[contabilium] clientes sin cuenta sync ok:", result);
+    } catch (err) {
+      console.error("[contabilium] clientes sin cuenta sync error:", err);
+    }
+  }
+);
+
+// Refresco manual desde el panel (staff-only) — mismo chequeo que corre
+// solo todos los días a las 8, para poder probarlo/forzarlo sin esperar.
+exports.triggerClientesContabiliumSinCuenta = onRequest(
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 300 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const result = await syncClientesContabiliumSinCuenta(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value());
+      return res.json(result);
+    } catch (err) {
+      console.error("[contabilium] trigger clientes sin cuenta error:", err);
+      return res.status(500).json({ error: String(err) });
     }
   }
 );
@@ -408,6 +653,16 @@ exports.getMercadoPagoMovimientos = onRequest(
         );
       }
 
+      // En una transferencia saliente (money_transfer), Mercado Pago no manda
+      // el nombre del destinatario — solo su ID interno de MP. Lo mandamos
+      // igual para que el frontend pueda mostrar un nombre conocido si ya se
+      // identificó antes a mano (no hay forma de resolverlo automáticamente).
+      const nombreDestinatario = (p) => {
+        const c = p.collector;
+        if (!c) return null;
+        return [c.first_name, c.last_name].filter(Boolean).join(" ") || c.email || null;
+      };
+
       const movimientos = results
         .filter((p) => p.status === "approved")
         .map((p) => ({
@@ -418,6 +673,8 @@ exports.getMercadoPagoMovimientos = onRequest(
           descripcion: p.description || p.statement_descriptor || null,
           tipoOperacion: p.operation_type || null,
           metodo: p.payment_method_id || p.payment_type_id || null,
+          destinatarioId: p.collector?.id || null,
+          destinatarioNombre: nombreDestinatario(p),
         }));
       return res.json({ movimientos, total: movimientos.length });
     } catch (err) {
@@ -570,11 +827,17 @@ exports.syncClientProfile = onRequest(
         condicionIva:     client.CondicionIva  ?? null,
         contabiliumEmail: client.Email || null,
         contabiliumSync:  admin.firestore.FieldValue.serverTimestamp(),
+        // El nombre y CUIT quedan alineados con Contabilium en cada sync —
+        // así Clientes 360 (que busca por estos dos campos en Firestore) los
+        // encuentra siempre, en vez de quedarse con el username crudo del
+        // alta ("ilianagarcia" en vez de "ILEANA FERNANDA GARCIA").
+        name: client.RazonSocial || client.NombreFantasia || userData.name || null,
+        cuit: client.NroDoc || userData.cuit || null,
       };
 
       await userRef.update(patch);
 
-      return res.json({ ok: true, contabiliumId: client.Id, idListaPrecio: client.IdListaPrecio });
+      return res.json({ ok: true, contabiliumId: client.Id, idListaPrecio: client.IdListaPrecio, name: patch.name });
     } catch (err) {
       console.error("[contabilium] syncClientProfile error:", err);
       return res.status(500).json({ error: String(err) });
@@ -810,6 +1073,37 @@ exports.onOrderCreated = onDocumentCreated("orders/{orderId}", async (event) => 
     console.log(`[notify] notificación creada para orden #${orderId}`);
   } catch (err) {
     console.error("[notify] onOrderCreated error:", err);
+  }
+});
+
+// Chequeo diario de vehículo: cuando el chofer lo envía (nuevo o
+// reenviado tras un rechazo) le avisa a los admins para que lo revisen;
+// cuando un admin lo aprueba/rechaza le avisa al chofer — en los dos casos
+// con push (con sonido en el celular), no solo la campanita interna.
+exports.onChequeoVehiculoWritten = onDocumentWritten("chequeosVehiculo/{id}", async (event) => {
+  const before = event.data?.before?.exists ? event.data.before.data() : null;
+  const after = event.data?.after?.exists ? event.data.after.data() : null;
+  if (!after) return;
+
+  try {
+    if (after.estado === "pendiente" && before?.estado !== "pendiente") {
+      await enviarPushAAdmins({
+        title: "🚐 Chequeo de vehículo",
+        body: `${after.choferNombre || "Un chofer"} envió su chequeo del ${after.fecha} — necesita tu OK.`,
+        link: "/admin/chequeos-vehiculo",
+      });
+    } else if (after.estado !== "pendiente" && before?.estado !== after.estado) {
+      const aprobado = after.estado === "aprobado";
+      await enviarPushAUsuario(after.choferUid, {
+        title: aprobado ? "✅ Chequeo aprobado" : "⚠️ Chequeo rechazado",
+        body: aprobado
+          ? "Ya tenés el OK para arrancar."
+          : after.comentarioAdmin || "Corregí lo que haga falta y volvé a enviarlo.",
+        link: "/chofer/chequeo-vehiculo",
+      });
+    }
+  } catch (err) {
+    console.error("[onChequeoVehiculoWritten] error:", err);
   }
 });
 
@@ -1114,7 +1408,12 @@ async function requireStaff(req, res) {
   }
   const db = admin.firestore();
   const callerSnap = await db.doc(`users/${uid}`).get();
-  const staffRoles = ["admin"];
+  // "chofer" entra acá también: necesita pegarle a los mismos endpoints
+  // staff-only que usan el mapa y stock consignado (getClientesConUbicacion,
+  // listContabiliumClientes, getDepositoStockAdmin, etc.) — el panel de
+  // chofer solo expone esas 3 secciones en el frontend, pero el permiso de
+  // backend queda al mismo nivel que admin.
+  const staffRoles = ["admin", "chofer"];
   if (!callerSnap.exists || !staffRoles.includes(callerSnap.data().role)) {
     res.status(403).json({ error: "Acceso denegado" });
     return null;
@@ -1266,6 +1565,70 @@ exports.adminSearchContabiliumClientes = onRequest(
   }
 );
 
+// Busca a qué cliente corresponde un número de teléfono — la búsqueda normal
+// (adminSearchContabiliumClientes) solo filtra por nombre/CUIT contra el
+// "filtro" de Contabilium, que no matchea teléfono. Acá se trae la base
+// completa de clientes y se compara en memoria, normalizando a solo dígitos
+// y comparando por sufijo (así "+54 9 11 3060-0478", "01130600478" y
+// "1130600478" matchean entre sí sin importar el formato exacto cargado).
+function soloDigitos(s) {
+  return String(s || "").replace(/\D/g, "");
+}
+
+// Contabilium tiene clientes con el campo Ciudad cargado literalmente como
+// "SIN IDENTIFICAR" (u otros placeholders parecidos) en vez de vacío — un
+// dato mal cargado del lado de Contabilium, no algo que dependa de nuestro
+// código. Se filtra acá, centralizado, para que no se muestre como si fuera
+// una ciudad real en ningún lado (mapa, Clientes 360, exports, etc).
+const CIUDADES_INVALIDAS = new Set(["SIN IDENTIFICAR", "SIN ESPECIFICAR", "SIN DATOS", "N/A", "NA", "-"]);
+function limpiarCiudad(ciudad) {
+  const c = String(ciudad || "").trim();
+  if (!c || CIUDADES_INVALIDAS.has(c.toUpperCase())) return "";
+  return c;
+}
+
+exports.adminBuscarClientePorTelefono = onRequest(
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 60 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const telefono = String(req.query.telefono || "").trim();
+      const digitos = soloDigitos(telefono);
+      if (digitos.length < 6) return res.status(400).json({ error: "Falta ?telefono= (mínimo 6 dígitos)" });
+
+      const email = CONTABILIUM_EMAIL.value();
+      const apiKey = CONTABILIUM_API_KEY.value();
+      const clientes = await getAllClientes(email, apiKey);
+
+      // Compara los últimos 8 dígitos (el número de línea, sin código de
+      // país/área) — es lo único que suele coincidir entre formatos.
+      const cola = digitos.slice(-8);
+      const resultados = clientes
+        .filter((c) => {
+          const tel1 = soloDigitos(c.Telefono);
+          const tel2 = soloDigitos(c.Celular);
+          return (tel1 && tel1.slice(-8) === cola) || (tel2 && tel2.slice(-8) === cola);
+        })
+        .map((c) => ({
+          contabiliumId: c.Id,
+          razonSocial: c.RazonSocial,
+          cuit: c.NroDoc || null,
+          telefono: c.Telefono || null,
+          celular: c.Celular || null,
+          email: c.Email || null,
+        }));
+
+      return res.json({ total: resultados.length, resultados });
+    } catch (err) {
+      console.error("[adminBuscarClientePorTelefono] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
 // Da de alta un cliente en Samurai (Auth + Firestore) ya vinculado a un
 // cliente/depósito existente en Contabilium — para distribuidores que
 // compraron/tienen consignación pero nunca se registraron solos en la web.
@@ -1410,8 +1773,49 @@ exports.triggerAutoLinkClientes = onRequest(
   }
 );
 
+// Crea la ficha de Cliente en Contabilium a partir del CUIT (padrón AFIP,
+// mismo criterio que adminCrearClienteContabilium) y devuelve los datos ya
+// resueltos para guardar en el user doc de Samurai. Separado en su propia
+// función para poder llamarlo tanto desde ese endpoint como desde el alta
+// de usuario nueva (createUserWithPassword) sin duplicar la lógica.
+async function crearClienteContabiliumDesdeCuit(email, apiKey, { cuit, telefono, contactEmail }) {
+  const afip = await getDatosAfip(email, apiKey, cuit);
+  if (!afip || !afip.RazonSocial) {
+    throw new Error("AFIP no devolvió datos para ese CUIT — revisalo o cargá el cliente a mano en Contabilium.");
+  }
+  const payload = {
+    RazonSocial: afip.RazonSocial,
+    NombreFantasia: afip.RazonSocial,
+    CondicionIva: afip.CategoriaImpositiva || "CF",
+    TipoDoc: afip.TipoDoc || "CUIT",
+    NroDoc: afip.NroDoc || String(cuit).replace(/\D/g, ""),
+    Pais: "Argentina",
+    Provincia: afip.ProvinciaNombre || "",
+    Ciudad: afip.CiudadNombre || "",
+    Domicilio: afip.Domicilio || "",
+    PisoDepto: afip.PisoDto || "",
+    Cp: afip.CodigoPostal || "",
+    Telefono: telefono || "",
+    Email: contactEmail || "",
+    Personeria: afip.Personeria || "F",
+  };
+  await crearCliente(email, apiKey, payload);
+  // crearCliente no devuelve un Id consistente entre respuestas — se busca
+  // el cliente recién creado por CUIT para tener su Id real de Contabilium.
+  const creado = await searchClientByDoc(email, apiKey, payload.NroDoc);
+  if (!creado) {
+    throw new Error("El cliente se creó en Contabilium pero no se pudo confirmar su Id — revisalo a mano.");
+  }
+  return {
+    contabiliumId: creado.Id,
+    razonSocial: creado.RazonSocial || afip.RazonSocial,
+    condicionIva: payload.CondicionIva,
+    cuit: payload.NroDoc,
+  };
+}
+
 exports.createUserWithPassword = onRequest(
-  { cors: false },
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY] },
   async (req, res) => {
     setCorsHeaders(req, res);
     if (req.method === "OPTIONS") return res.status(204).send("");
@@ -1421,13 +1825,30 @@ exports.createUserWithPassword = onRequest(
     if (!staffUid) return;
 
     try {
-      const { name, password } = req.body || {};
+      const { name, password, cuit, telefono } = req.body || {};
       if (!name || !String(name).trim()) return res.status(400).json({ error: "Nombre requerido" });
       if (!password || String(password).length < 6) {
         return res.status(400).json({ error: "La contraseña debe tener al menos 6 caracteres" });
       }
+      const cuitLimpio = cuit ? String(cuit).replace(/\D/g, "") : "";
+      if (cuit && cuitLimpio.length !== 11) {
+        return res.status(400).json({ error: "El CUIT debe tener 11 dígitos" });
+      }
 
       const db = admin.firestore();
+
+      // Si se pasó CUIT, primero se crea (o falla) el cliente en Contabilium
+      // — así no queda una cuenta Samurai creada sin su contraparte real
+      // cuando algo sale mal (CUIT inválido, AFIP caído, etc.).
+      let contabiliumDatos = null;
+      if (cuitLimpio) {
+        contabiliumDatos = await crearClienteContabiliumDesdeCuit(
+          CONTABILIUM_EMAIL.value(),
+          CONTABILIUM_API_KEY.value(),
+          { cuit: cuitLimpio, telefono, contactEmail: null }
+        );
+      }
+
       const base = slugifyUsername(name);
       let username = base;
       let n = 1;
@@ -1456,10 +1877,21 @@ exports.createUserWithPassword = onRequest(
         status: "activo",
         approved: true,
         kind: "client",
+        ...(contabiliumDatos
+          ? {
+              contabiliumId: contabiliumDatos.contabiliumId,
+              cuit: contabiliumDatos.cuit,
+              condicionIva: contabiliumDatos.condicionIva,
+            }
+          : {}),
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      return res.json({ uid: authUser.uid, username });
+      return res.json({
+        uid: authUser.uid,
+        username,
+        contabiliumId: contabiliumDatos?.contabiliumId || null,
+      });
     } catch (err) {
       console.error("[users] createUserWithPassword error:", err);
       const code = err?.errorInfo?.code || err?.code || "";
@@ -1643,6 +2075,1170 @@ exports.getMyDepositoStock = onRequest(
   }
 );
 
+// Vista de "supervisor regional" — algunos clientes (ej. Alfredo Bavcevich,
+// que coordina un grupo de distribuidores propios) necesitan ver un resumen
+// de los distribuidores que tienen a cargo (stock consignado, deuda,
+// facturas recientes) sin ser staff. El campo `vendedoresAsignados` en su
+// propio doc de usuario (array de UIDs) es lo único que habilita esto — sin
+// esa lista, ningún endpoint de acá abajo devuelve nada de nadie.
+const LAVALLE_DEPOSITO_ID = 135151;
+
+async function bicisDeDepositoResumen(db, email, apiKey, depositoId) {
+  if (!depositoId) return [];
+  const stockRaw = await getStockByDepositoWithRetry(email, apiKey, depositoId);
+  const items = await buildDepositoStockItems(db, email, apiKey, stockRaw);
+  return items
+    .filter((s) => (s.category || "").toUpperCase() === "BICICLETAS" && Number(s.stockActual || 0) > 0)
+    .map((s) => ({ name: s.name, sku: s.sku, stockActual: s.stockActual, priceArs: s.priceArs }));
+}
+
+// Trae el resumen (stock, deuda, últimas facturas) de UN solo vendedor. Vive
+// separado de la lista liviana (getMisVendedores) para que el frontend pida
+// cada vendedor en su propio pedido chico en vez de uno gigante que tarda
+// mucho y es mucho más fácil que una conexión inestable lo corte a mitad de
+// camino.
+async function buildVendedorResumen(db, email, apiKey, vendedorUid) {
+  const vSnap = await db.doc(`users/${vendedorUid}`).get();
+  if (!vSnap.exists) return { uid: vendedorUid, name: null, error: "Usuario no encontrado" };
+  const v = vSnap.data();
+
+  const desdeFecha = (() => {
+    const d = new Date();
+    d.setFullYear(d.getFullYear() - 3);
+    return d.toISOString().slice(0, 10);
+  })();
+
+  const [bicis, comprobantesInfo] = await Promise.all([
+    bicisDeDepositoResumen(db, email, apiKey, v.contabiliumDepositoId),
+    v.contabiliumId
+      ? getComprobantesByClientId(email, apiKey, v.contabiliumId, { tipos: ["FCA", "NCA", "NDA", "COT"], desde: desdeFecha })
+      : Promise.resolve([]),
+  ]);
+
+  let saldoTotal = null;
+  let facturasRecientes = [];
+  if (v.contabiliumId) {
+    saldoTotal = comprobantesInfo.reduce((acc, c) => {
+      const saldoAbs = parseArNumber(c.Saldo);
+      return acc + (c.TipoFc === "NCA" ? -saldoAbs : saldoAbs);
+    }, 0);
+    facturasRecientes = comprobantesInfo
+      .slice()
+      .sort((a, b) => (b.FechaEmision || "").localeCompare(a.FechaEmision || ""))
+      .slice(0, 5)
+      .map((c) => ({
+        numero: c.Numero,
+        tipo: c.TipoFc,
+        fecha: c.FechaEmision,
+        total: parseArNumber(c.ImporteTotalNeto),
+        saldo: parseArNumber(c.Saldo),
+      }));
+  }
+
+  return {
+    uid: vendedorUid,
+    name: v.name || v.username || "",
+    depositoNombre: v.contabiliumDepositoNombre || null,
+    stockBicis: bicis.reduce((acc, b) => acc + Number(b.stockActual || 0), 0),
+    bicis,
+    saldoTotal,
+    facturasRecientes,
+  };
+}
+
+// Lista liviana (solo Firestore, sin tocar Contabilium) de a quiénes tiene
+// asignados el caller — el frontend la usa para pintar las tarjetas al
+// toque, y después pide el detalle pesado de cada una por separado con
+// getVendedorResumen.
+exports.getMisVendedores = onRequest(
+  { cors: false },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "No autorizado" });
+    let uid;
+    try {
+      uid = (await admin.auth().verifyIdToken(idToken)).uid;
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+
+    try {
+      const db = admin.firestore();
+      const callerSnap = await db.doc(`users/${uid}`).get();
+      if (!callerSnap.exists) return res.status(404).json({ error: "Usuario no encontrado" });
+      const caller = callerSnap.data();
+      const asignados = Array.isArray(caller.vendedoresAsignados) ? caller.vendedoresAsignados : [];
+      if (asignados.length === 0) {
+        return res.status(403).json({ error: "No tenés vendedores asignados" });
+      }
+
+      const vendedores = await mapWithConcurrency(asignados, 10, async (vendedorUid) => {
+        const vSnap = await db.doc(`users/${vendedorUid}`).get();
+        if (!vSnap.exists) return { uid: vendedorUid, name: null, error: "Usuario no encontrado" };
+        const v = vSnap.data();
+        return {
+          uid: vendedorUid,
+          name: v.name || v.username || "",
+          depositoNombre: v.contabiliumDepositoNombre || null,
+          depositoId: v.contabiliumDepositoId || null,
+          contabiliumId: v.contabiliumId || null,
+        };
+      });
+
+      return res.json({ vendedores });
+    } catch (err) {
+      console.error("[getMisVendedores] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Detalle pesado (stock, deuda, facturas) de un solo vendedor puntual — se
+// pide uno por uno desde el frontend en vez de todos juntos, así cada
+// tarjeta es un pedido chico e independiente.
+exports.getVendedorResumen = onRequest(
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 60 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "No autorizado" });
+    let uid;
+    try {
+      uid = (await admin.auth().verifyIdToken(idToken)).uid;
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+
+    try {
+      const { vendedorUid } = req.body || {};
+      if (!vendedorUid) return res.status(400).json({ error: "Falta vendedorUid" });
+
+      const db = admin.firestore();
+      const callerSnap = await db.doc(`users/${uid}`).get();
+      if (!callerSnap.exists) return res.status(404).json({ error: "Usuario no encontrado" });
+      const caller = callerSnap.data();
+      const asignados = Array.isArray(caller.vendedoresAsignados) ? caller.vendedoresAsignados : [];
+      // Un admin/chofer puede ver el detalle de cualquier cliente (ej. desde
+      // Clientes 360, mirando la cartera de un supervisor como Alfredo) —
+      // el chequeo de "está en tu lista" es solo para el propio supervisor.
+      if (!["admin", "chofer"].includes(caller.role) && !asignados.includes(vendedorUid)) {
+        return res.status(403).json({ error: "Ese vendedor no está en tu lista" });
+      }
+
+      const resumen = await buildVendedorResumen(db, CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value(), vendedorUid);
+      return res.json(resumen);
+    } catch (err) {
+      console.error("[getVendedorResumen] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Devuelve el último día de "YYYY-MM" como "YYYY-MM-DD".
+function ultimoDiaDelMes(mes) {
+  const [y, m] = mes.split("-").map(Number);
+  const ultimo = new Date(y, m, 0).getDate();
+  return `${mes}-${String(ultimo).padStart(2, "0")}`;
+}
+
+// Cuenta corriente mensual de un supervisor con `vendedoresAsignados` (ej.
+// Alfredo Bavcevich): cobra flete (monto fijo por viaje de Lavalle a su
+// depósito — Contabilium no registra "viajes", así que se carga a mano con
+// setViajesVendedorMes) + comisión (% sobre lo que facturan sus clientes
+// asignados ese mes, calculado automático desde Contabilium). Lo puede ver
+// el propio vendedor (su uid) o un admin/chofer pasando `vendedorUid`.
+async function buildResumenComision(db, email, apiKey, targetUid, mes) {
+  const targetSnap = await db.doc(`users/${targetUid}`).get();
+  if (!targetSnap.exists) throw new Error("Usuario no encontrado");
+  const target = targetSnap.data();
+  const asignados = Array.isArray(target.vendedoresAsignados) ? target.vendedoresAsignados : [];
+
+  const comisionPorcentaje = Number(target.comisionPorcentaje ?? 5);
+  const tarifaFletePorViaje = Number(target.tarifaFletePorViaje ?? 10000);
+
+  const mesDocSnap = await db.doc(`resumenVendedorMensual/${targetUid}_${mes}`).get();
+  const viajes = Number(mesDocSnap.exists ? mesDocSnap.data().viajes || 0 : 0);
+  const fleteTotal = viajes * tarifaFletePorViaje;
+
+  const desde = `${mes}-01`;
+  const hasta = ultimoDiaDelMes(mes);
+
+  let ventasTotal = 0;
+  // Detalle bici por bici (modelo + cliente + comisión de esa venta puntual)
+  // — no solo el total agregado, para que el vendedor vea de dónde sale
+  // cada peso de lo que tiene que cobrar, no solo el número final.
+  const detalle = [];
+  if (asignados.length > 0) {
+    const clientesSnaps = await Promise.all(asignados.map((cUid) => db.doc(`users/${cUid}`).get()));
+    const contabiliumIds = new Set(
+      clientesSnaps.filter((s) => s.exists && s.data().contabiliumId).map((s) => s.data().contabiliumId)
+    );
+    const nombrePorContabiliumId = new Map();
+    for (const s of clientesSnaps) {
+      if (!s.exists || !s.data().contabiliumId) continue;
+      const u = s.data();
+      nombrePorContabiliumId.set(u.contabiliumId, u.contabiliumDepositoNombre || u.name || "(sin nombre)");
+    }
+    if (contabiliumIds.size > 0) {
+      const comprobantes = await getAllComprobantes(email, apiKey, { desde, hasta });
+      const relevantes = comprobantes.filter(
+        (c) => contabiliumIds.has(c.IdCliente) && (c.TipoFc === "FCA" || c.TipoFc === "NCA")
+      );
+      for (const c of relevantes) {
+        const signo = c.TipoFc === "NCA" ? -1 : 1;
+        const montoComprobante = parseArNumber(c.ImporteTotalNeto) * signo;
+        ventasTotal += montoComprobante;
+
+        const nombreCliente = nombrePorContabiliumId.get(c.IdCliente) || c.RazonSocial || "(sin nombre)";
+        try {
+          const full = await getComprobanteById(email, apiKey, c.Id);
+          const items = full?.Items || [];
+          for (const it of items) {
+            const montoItem = (Number(it.Total ?? (Number(it.PrecioUnitario) || 0) * (Number(it.Cantidad) || 0)) || 0) * signo;
+            detalle.push({
+              cliente: nombreCliente,
+              modelo: it.Concepto || it.Descripcion || "—",
+              cantidad: Number(it.Cantidad || 0),
+              monto: montoItem,
+              comision: montoItem * (comisionPorcentaje / 100),
+              tipo: c.TipoFc,
+              numero: c.Numero,
+              fecha: c.FechaEmision,
+            });
+          }
+        } catch (err) {
+          console.warn("[buildResumenComision] no se pudo traer el detalle del comprobante", c.Id, err.message);
+          // Sin el detalle de items no queda registro bici por bici, pero el
+          // comprobante entero ya se sumó a ventasTotal — al menos el total
+          // agregado no queda mal, solo el desglose de esa factura puntual.
+          detalle.push({
+            cliente: nombreCliente,
+            modelo: `(no se pudo traer el detalle de ${c.Numero})`,
+            cantidad: null,
+            monto: montoComprobante,
+            comision: montoComprobante * (comisionPorcentaje / 100),
+            tipo: c.TipoFc,
+            numero: c.Numero,
+            fecha: c.FechaEmision,
+          });
+        }
+        await new Promise((r) => setTimeout(r, 150));
+      }
+    }
+  }
+
+  detalle.sort((a, b) => String(b.fecha || "").localeCompare(String(a.fecha || "")));
+
+  const comisionTotal = ventasTotal * (comisionPorcentaje / 100);
+  const totalACobrar = fleteTotal + comisionTotal;
+
+  return {
+    mes,
+    viajes,
+    tarifaFletePorViaje,
+    fleteTotal,
+    comisionPorcentaje,
+    ventasTotal,
+    comisionTotal,
+    totalACobrar,
+    cantidadClientesAsignados: asignados.length,
+    detalle,
+  };
+}
+
+exports.getResumenComisionVendedor = onRequest(
+  // El desglose bici por bici pide el detalle de cada comprobante por
+  // separado (getComprobanteById) — con varias facturas en el mes puede
+  // tardar más que el timeout corto original.
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 180 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "No autorizado" });
+    let uid;
+    try {
+      uid = (await admin.auth().verifyIdToken(idToken)).uid;
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+
+    try {
+      const { mes, vendedorUid } = req.body || {};
+      if (!mes || !/^\d{4}-\d{2}$/.test(mes)) return res.status(400).json({ error: "Falta mes (formato YYYY-MM)" });
+
+      const db = admin.firestore();
+      let targetUid = uid;
+      if (vendedorUid && vendedorUid !== uid) {
+        const callerSnap = await db.doc(`users/${uid}`).get();
+        const caller = callerSnap.exists ? callerSnap.data() : null;
+        if (!caller || !["admin", "chofer"].includes(caller.role)) {
+          return res.status(403).json({ error: "No tenés permiso para ver la cuenta de otro vendedor" });
+        }
+        targetUid = vendedorUid;
+      }
+
+      const resumen = await buildResumenComision(db, CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value(), targetUid, mes);
+      return res.json(resumen);
+    } catch (err) {
+      console.error("[getResumenComisionVendedor] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Carga a mano cuántos viajes (Lavalle → su depósito) hizo un vendedor en un
+// mes puntual — Contabilium no lo registra, así que es la única forma de
+// contarlo para calcular el flete. Lo puede cargar el propio vendedor (su
+// uid) o un admin/chofer pasando `vendedorUid`.
+exports.setViajesVendedorMes = onRequest(
+  { cors: false },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "No autorizado" });
+    let uid;
+    try {
+      uid = (await admin.auth().verifyIdToken(idToken)).uid;
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+
+    try {
+      const { mes, viajes, vendedorUid } = req.body || {};
+      if (!mes || !/^\d{4}-\d{2}$/.test(mes)) return res.status(400).json({ error: "Falta mes (formato YYYY-MM)" });
+      if (!(Number(viajes) >= 0)) return res.status(400).json({ error: "viajes tiene que ser un número >= 0" });
+
+      const db = admin.firestore();
+      let targetUid = uid;
+      if (vendedorUid && vendedorUid !== uid) {
+        const callerSnap = await db.doc(`users/${uid}`).get();
+        const caller = callerSnap.exists ? callerSnap.data() : null;
+        if (!caller || !["admin", "chofer"].includes(caller.role)) {
+          return res.status(403).json({ error: "No tenés permiso para cargar la cuenta de otro vendedor" });
+        }
+        targetUid = vendedorUid;
+      }
+
+      await db.doc(`resumenVendedorMensual/${targetUid}_${mes}`).set(
+        { viajes: Number(viajes), actualizadoPor: uid, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+        { merge: true }
+      );
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("[setViajesVendedorMes] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Lista liviana, para el admin, de quiénes tienen `vendedoresAsignados`
+// cargado (hoy en día, solo Alfredo Bavcevich) — para poder elegirlos en el
+// selector del resumen de comisión/flete.
+exports.adminListDistribuidoresConEquipo = onRequest(
+  { cors: false },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const db = admin.firestore();
+      // No hay forma confiable de filtrar "array no vacío" del lado del
+      // servidor en Firestore — son pocos usuarios en total, así que se
+      // trae todo y se filtra en memoria.
+      const snap = await db.collection("users").get();
+      const lista = snap.docs
+        .filter((d) => Array.isArray(d.data().vendedoresAsignados) && d.data().vendedoresAsignados.length > 0)
+        .map((d) => ({
+          uid: d.id,
+          name: d.data().name || d.data().username || "",
+          cantidadClientesAsignados: d.data().vendedoresAsignados.length,
+          comisionPorcentaje: d.data().comisionPorcentaje ?? 5,
+          tarifaFletePorViaje: d.data().tarifaFletePorViaje ?? 10000,
+        }));
+      return res.json({ distribuidores: lista });
+    } catch (err) {
+      console.error("[adminListDistribuidoresConEquipo] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Permite a un admin/chofer configurar la tarifa de flete (por viaje) y el
+// % de comisión de un vendedor puntual (ej. Alfredo) — quedan guardados en
+// su propio doc de usuario, con default 10000 y 5% si nunca se cargó nada.
+exports.adminSetTarifasVendedor = onRequest(
+  { cors: false },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { vendedorUid, comisionPorcentaje, tarifaFletePorViaje } = req.body || {};
+      if (!vendedorUid) return res.status(400).json({ error: "Falta vendedorUid" });
+      const patch = {};
+      if (comisionPorcentaje != null) patch.comisionPorcentaje = Number(comisionPorcentaje);
+      if (tarifaFletePorViaje != null) patch.tarifaFletePorViaje = Number(tarifaFletePorViaje);
+      if (Object.keys(patch).length === 0) return res.status(400).json({ error: "Nada para actualizar" });
+
+      await admin.firestore().doc(`users/${vendedorUid}`).set(patch, { merge: true });
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("[adminSetTarifasVendedor] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Detalle completo del depósito propio de Samurai en Lavalle (modelos,
+// colores, cantidades) para quien coordina un grupo de vendedores — mismo
+// gate que getMisVendedores (campo `vendedoresAsignados`), separado en su
+// propio botón "Depósito" al lado de "Mi stock" en vez de vivir adentro de
+// "Mis vendedores".
+exports.getMiDepositoPropio = onRequest(
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY] },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "No autorizado" });
+    let uid;
+    try {
+      uid = (await admin.auth().verifyIdToken(idToken)).uid;
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+
+    try {
+      const db = admin.firestore();
+      const callerSnap = await db.doc(`users/${uid}`).get();
+      if (!callerSnap.exists) return res.status(404).json({ error: "Usuario no encontrado" });
+      const caller = callerSnap.data();
+      if (!Array.isArray(caller.vendedoresAsignados) || caller.vendedoresAsignados.length === 0) {
+        return res.status(403).json({ error: "No tenés acceso a este depósito" });
+      }
+
+      const email = CONTABILIUM_EMAIL.value();
+      const apiKey = CONTABILIUM_API_KEY.value();
+      const stockRaw = await getStockByDepositoWithRetry(email, apiKey, LAVALLE_DEPOSITO_ID);
+      // includeZeroStock: true para que el filtro de talles pueda mostrar
+      // "no disponible" en vez de simplemente omitir el talle sin stock.
+      const items = await buildDepositoStockItems(db, email, apiKey, stockRaw, { includeZeroStock: true });
+
+      return res.json({ depositoId: LAVALLE_DEPOSITO_ID, depositoNombre: "Lavalle", items });
+    } catch (err) {
+      console.error("[getMiDepositoPropio] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Ajuste manual de stock — Contabilium no tiene API oficial para esto, solo
+// su consola web ("Modificación de stock"). Se resuelve el idConcepto del
+// producto por SKU con la API oficial (confiable), y el ajuste en sí se
+// hace con un navegador headless que se loguea en la consola web y repite
+// los dos pedidos internos que reverse-engineamos ahí (ver
+// contabiliumWebAutomation.js). Solo staff admin — toca stock real.
+exports.ajustarStockManual = onRequest(
+  {
+    cors: false,
+    secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD],
+    timeoutSeconds: 120,
+    memory: "1GiB",
+  },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+
+    try {
+      const { depositoId, sku, cantidad, tipoModificacion, idCC, nroRef, observaciones } = req.body || {};
+      if (!depositoId || !sku || cantidad == null || !["R", "M"].includes(tipoModificacion)) {
+        return res.status(400).json({ error: "Faltan datos: depositoId, sku, cantidad, tipoModificacion ('R' o 'M')" });
+      }
+
+      const email = CONTABILIUM_EMAIL.value();
+      const apiKey = CONTABILIUM_API_KEY.value();
+      const conceptos = await getAllConceptos(email, apiKey);
+      const concepto = conceptos.find((c) => (c.Codigo || "").trim() === String(sku).trim());
+      if (!concepto) return res.status(404).json({ error: `No se encontró el producto con SKU ${sku} en Contabilium` });
+
+      // Contabilium exige un "idCC" (cuenta corriente) por depósito que no
+      // se puede derivar de nuestros datos ni de su API — se lo pedimos al
+      // admin UNA sola vez la primera vez que ajusta stock en ese depósito,
+      // y de ahí en más lo recordamos en Firestore para no volver a pedirlo.
+      const idCCDocRef = admin.firestore().doc("internalData/contabiliumIdCC");
+      const idCCSnap = await idCCDocRef.get();
+      const idCCMap = idCCSnap.exists ? idCCSnap.data().porDeposito || {} : {};
+      const depositoKey = String(depositoId);
+      let idCCFinal = idCC != null ? Number(idCC) : idCCMap[depositoKey];
+      if (idCCFinal == null) {
+        return res.status(409).json({
+          error: "Falta el ID de Cuenta Corriente (idCC) para este depósito — ingresalo una sola vez.",
+          needsIdCC: true,
+        });
+      }
+      if (idCC != null && idCCMap[depositoKey] !== Number(idCC)) {
+        await idCCDocRef.set({ porDeposito: { ...idCCMap, [depositoKey]: Number(idCC) } }, { merge: true });
+      }
+
+      const { ajustarStockWeb } = require("./contabiliumWebAutomation");
+      const db = admin.firestore();
+      await ajustarStockWeb({
+        db,
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+        idConcepto: concepto.Id,
+        idInventario: Number(depositoId),
+        cantidad,
+        tipoModificacion,
+        idCC: idCCFinal,
+        nroRef,
+        observaciones,
+      });
+
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("[ajustarStockManual] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Transferencia real de stock entre depósitos. Dos formas de entrar acá:
+// - Staff (admin/chofer): puede transferir entre cualquier par de depósitos.
+// - Un supervisor con `vendedoresAsignados` (ej. Alfredo Bavcevich): puede
+//   transferir SOLO (a) desde su propio depósito hacia uno de sus clientes
+//   asignados, o (b) desde el depósito de Lavalle hacia su propio depósito
+//   — nunca entre depósitos ajenos. Se valida siempre del lado del server,
+//   no alcanza con que el frontend solo ofrezca esas opciones.
+exports.transferirStockManual = onRequest(
+  {
+    cors: false,
+    secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD],
+    timeoutSeconds: 120,
+    memory: "1GiB",
+  },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "No autorizado" });
+    let uid;
+    try {
+      uid = (await admin.auth().verifyIdToken(idToken)).uid;
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+
+    try {
+      const { depositoOrigenId, depositoDestinoId, sku, cantidad, items: itemsBody, observaciones, depositoOrigenNombre, depositoDestinoNombre, sinRemito } = req.body || {};
+      // Acepta tanto el formato viejo (sku + cantidad sueltos, un solo
+      // producto) como el nuevo (items: [{sku, cantidad}, ...] — varios
+      // productos en la misma transferencia/remito).
+      const items = Array.isArray(itemsBody) && itemsBody.length > 0 ? itemsBody : sku ? [{ sku, cantidad }] : [];
+      if (!depositoOrigenId || !depositoDestinoId || items.length === 0 || items.some((it) => !it.sku || !it.cantidad || Number(it.cantidad) <= 0)) {
+        return res.status(400).json({ error: "Faltan datos: depositoOrigenId, depositoDestinoId, items (sku + cantidad > 0 cada uno)" });
+      }
+      if (Number(depositoOrigenId) === Number(depositoDestinoId)) {
+        return res.status(400).json({ error: "El depósito de origen y destino no pueden ser el mismo" });
+      }
+
+      const db0 = admin.firestore();
+      const callerSnap = await db0.doc(`users/${uid}`).get();
+      if (!callerSnap.exists) return res.status(404).json({ error: "Usuario no encontrado" });
+      const caller = callerSnap.data();
+      const origenId = Number(depositoOrigenId);
+      const destinoId = Number(depositoDestinoId);
+
+      if (!["admin", "chofer"].includes(caller.role)) {
+        const asignados = Array.isArray(caller.vendedoresAsignados) ? caller.vendedoresAsignados : [];
+        if (asignados.length === 0) {
+          return res.status(403).json({ error: "No tenés permiso para transferir stock" });
+        }
+        const miDeposito = caller.contabiliumDepositoId || null;
+        const esDesdeLavalleAMiDeposito = origenId === LAVALLE_DEPOSITO_ID && destinoId === miDeposito;
+        let esHaciaUnCliente = false;
+        if (miDeposito && origenId === miDeposito) {
+          const clientesSnaps = await Promise.all(asignados.map((cUid) => db0.doc(`users/${cUid}`).get()));
+          esHaciaUnCliente = clientesSnaps.some((s) => s.exists && s.data().contabiliumDepositoId === destinoId);
+        }
+        if (!esDesdeLavalleAMiDeposito && !esHaciaUnCliente) {
+          return res.status(403).json({ error: "Ese movimiento no está permitido — solo podés mover stock entre tu depósito, Lavalle y tus clientes." });
+        }
+      }
+
+      const email = CONTABILIUM_EMAIL.value();
+      const apiKey = CONTABILIUM_API_KEY.value();
+      const conceptos = await getAllConceptos(email, apiKey);
+      const itemsResueltos = [];
+      for (const it of items) {
+        const concepto = conceptos.find((c) => (c.Codigo || "").trim() === String(it.sku).trim());
+        if (!concepto) return res.status(404).json({ error: `No se encontró el producto con SKU ${it.sku} en Contabilium` });
+        itemsResueltos.push({ idConcepto: concepto.Id, cantidad: it.cantidad });
+      }
+
+      // Se mueve el stock de verdad y se genera el remito interno automático
+      // de la transferencia (a nombre de la propia empresa, "movimiento
+      // interno") — siempre funciona, no depende de tener un cliente
+      // vinculado ni de precios. El remito "real" (a nombre de un
+      // proveedor/cliente, para circular en la calle) es un paso aparte,
+      // explícito, después de que este movimiento ya se confirmó — ver
+      // generarRemitoRealManual.
+      const { transferirStockWeb, generarRemitoAutoDesdeTransferencia } = require("./contabiliumWebAutomation");
+      const { idTransferencia } = await transferirStockWeb({
+        db: admin.firestore(),
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+        items: itemsResueltos,
+        idInventarioOrigen: Number(depositoOrigenId),
+        idInventarioDestino: Number(depositoDestinoId),
+        observaciones,
+        depositoOrigenNombre,
+        depositoDestinoNombre,
+      });
+
+      // El remito es opcional — algunos movimientos (ej. un supervisor
+      // repartiendo entre sus propios clientes) no necesitan el papel, solo
+      // mover el stock. Si se pide sin remito, se salta ese paso entero.
+      const auto = sinRemito
+        ? { remitoArchivo: null, remitoPdfBase64: null }
+        : await generarRemitoAutoDesdeTransferencia({
+            db: admin.firestore(),
+            email: CONTABILIUM_WEB_EMAIL.value(),
+            password: CONTABILIUM_WEB_PASSWORD.value(),
+            idTransferencia,
+            observaciones,
+            depositoOrigenNombre,
+            depositoDestinoNombre,
+            idInventarioOrigen: Number(depositoOrigenId),
+            idInventarioDestino: Number(depositoDestinoId),
+          });
+
+      return res.json({
+        ok: true,
+        idTransferencia,
+        remitoArchivo: auto.remitoArchivo,
+        remitoPdfBase64: auto.remitoPdfBase64,
+      });
+    } catch (err) {
+      console.error("[transferirStockManual] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Remito "real" (a nombre de un proveedor/cliente elegido a mano) para que
+// las bicicletas puedan circular en la calle con papeles válidos — paso
+// EXPLÍCITO y aparte del movimiento de stock (que ya generó su propio
+// remito interno, a nombre de FEPA TOP). En vez de crear un comprobante
+// nuevo vía POST /comprobantes/crear (probado y descartado: esos quedan con
+// "Numero": "0001-00000000" — Contabilium no los numera de verdad por esa
+// vía, así que nunca se les puede bajar un PDF real) esto reutiliza el
+// mismo remito interno que ya generó el movimiento — bien numerado por la
+// consola clásica — y le reasigna el cliente + observación antes de bajar
+// el PDF de nuevo. Ver asignarProveedorARemito en contabiliumWebAutomation.js.
+exports.generarRemitoRealManual = onRequest(
+  {
+    cors: false,
+    secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD],
+    timeoutSeconds: 120,
+  },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "No autorizado" });
+    let uid;
+    try {
+      uid = (await admin.auth().verifyIdToken(idToken)).uid;
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+
+    try {
+      const { remitoArchivo: remitoArchivoBody, proveedorContabiliumId, observaciones } = req.body || {};
+      if (!remitoArchivoBody) {
+        return res.status(400).json({ error: "Falta remitoArchivo (el remito interno que generó el movimiento)." });
+      }
+      if (!proveedorContabiliumId) {
+        return res.status(400).json({ error: "Elegí un proveedor/cliente real para el remito de circulación." });
+      }
+
+      const dbAuth = admin.firestore();
+      const callerSnap = await dbAuth.doc(`users/${uid}`).get();
+      if (!callerSnap.exists) return res.status(404).json({ error: "Usuario no encontrado" });
+      const caller = callerSnap.data();
+      if (!["admin", "chofer"].includes(caller.role)) {
+        const asignados = Array.isArray(caller.vendedoresAsignados) ? caller.vendedoresAsignados : [];
+        if (asignados.length === 0) {
+          return res.status(403).json({ error: "No tenés permiso para generar remitos" });
+        }
+        const clientesSnaps = await Promise.all(asignados.map((cUid) => dbAuth.doc(`users/${cUid}`).get()));
+        const esUnoDeMisClientes = clientesSnaps.some(
+          (s) => s.exists && s.data().contabiliumId === Number(proveedorContabiliumId)
+        );
+        if (!esUnoDeMisClientes) {
+          return res.status(403).json({ error: "Ese cliente no es uno de los tuyos." });
+        }
+      }
+
+      const { asignarProveedorARemito } = require("./contabiliumWebAutomation");
+      const resultado = await asignarProveedorARemito({
+        db: admin.firestore(),
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+        remitoArchivo: remitoArchivoBody,
+        proveedorContabiliumId,
+        observaciones,
+      });
+
+      if (!resultado.remitoPdfBase64) {
+        return res.status(500).json({ error: "No se pudo actualizar el remito o no se pudo bajar el PDF actualizado — probá de nuevo." });
+      }
+
+      return res.json({
+        ok: true,
+        numero: resultado.numero,
+        remitoArchivo: resultado.remitoArchivo,
+        remitoPdfBase64: resultado.remitoPdfBase64,
+      });
+    } catch (err) {
+      console.error("[generarRemitoRealManual] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Endpoint temporal de investigación — trae el JSON real de un remito
+// puntual (buscado por su número visible) para confirmar qué campos expone
+// Contabilium de verdad, en vez de seguir adivinando la URL del PDF contra
+// producción. Se borra una vez que se resuelva.
+exports.diagProbarWebmethodsMovimientos = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 120 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { probarWebmethodsMovimientos } = require("./contabiliumWebAutomation");
+      const resultados = await probarWebmethodsMovimientos({
+        db: admin.firestore(),
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+      });
+      return res.json({ encontrados: resultados.length, resultados });
+    } catch (err) {
+      console.error("[diagProbarWebmethodsMovimientos] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+exports.diagObtenerRemito = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 60 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const numero = String(req.query.numero || "").trim();
+      if (!numero) return res.status(400).json({ error: "Falta ?numero= (ej: 0001-00000543)" });
+      const { diagObtenerRemito } = require("./contabiliumWebAutomation");
+      const resultado = await diagObtenerRemito({
+        db: admin.firestore(),
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+        numero,
+      });
+      return res.json(resultado);
+    } catch (err) {
+      console.error("[diagObtenerRemito] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Endpoint temporal de investigación (SOLO LECTURA, no escribe nada en
+// Contabilium) — busca en el sitio clásico algún módulo de "depósitos" que
+// permita renombrarlos, para poder mostrar el mismo código propio (1-80)
+// de Samurai también ahí. Se borra una vez que se resuelva.
+exports.diagExplorarModuloDepositos = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 120 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { explorarModuloDepositos } = require("./contabiliumWebAutomation");
+      const resultado = await explorarModuloDepositos({
+        db: admin.firestore(),
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+      });
+      return res.json(resultado);
+    } catch (err) {
+      console.error("[diagExplorarModuloDepositos] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Renombra UN depósito de Contabilium (solo el campo "Nombre", no toca
+// dirección/teléfono ni el ID). Prueba de un solo depósito por vez a
+// propósito — nunca hace un batch, para que cada cambio se pueda revisar
+// antes de seguir con el siguiente.
+exports.adminRenombrarDeposito = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 120, memory: "512MiB" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { id, nombreNuevo } = req.body || {};
+      if (!id || !nombreNuevo) return res.status(400).json({ error: "Faltan id y/o nombreNuevo" });
+      const { renombrarDepositoWeb } = require("./contabiliumWebAutomation");
+      const resultado = await renombrarDepositoWeb({
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+        id: Number(id),
+        nombreNuevo: String(nombreNuevo),
+      });
+      return res.json(resultado);
+    } catch (err) {
+      console.error("[adminRenombrarDeposito] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Detalle completo de un remito por su id (solo lectura) — para mostrarlo
+// tal cual está en Contabilium antes de decidir si hace falta editarlo.
+exports.adminObtenerRemitoDetalle = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 120, memory: "1GiB" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const idRemito = req.method === "POST" ? req.body?.idRemito : req.query.idRemito;
+      if (!idRemito) return res.status(400).json({ error: "Falta idRemito" });
+      const { obtenerRemitoPorId } = require("./contabiliumWebAutomation");
+      const remito = await obtenerRemitoPorId({
+        db: admin.firestore(),
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+        idRemito: Number(idRemito),
+      });
+      return res.json(remito);
+    } catch (err) {
+      console.error("[adminObtenerRemitoDetalle] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Actualiza SOLO la observación de un remito ya existente en Contabilium.
+exports.adminEditarObservacionRemito = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 120, memory: "1GiB" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { idRemito, observaciones } = req.body || {};
+      if (!idRemito) return res.status(400).json({ error: "Falta idRemito" });
+      const { editarObservacionRemito } = require("./contabiliumWebAutomation");
+      const remito = await editarObservacionRemito({
+        db: admin.firestore(),
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+        idRemito: Number(idRemito),
+        observaciones: String(observaciones || ""),
+      });
+      return res.json(remito);
+    } catch (err) {
+      console.error("[adminEditarObservacionRemito] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Endpoint temporal de investigación — prueba nombres de método candidatos
+// para ver si alguno devuelve el idCC de un depósito automáticamente. Se
+// borra una vez que se resuelva (o se confirme que no hay forma).
+// Exporta el listado completo del mapa a un Excel con dos solapas:
+// "Consignados" (con su situación/color marcada a mano) y "Sin depósito"
+// (compradores, sin ese seguimiento). Mismo criterio "tiene depósito" que
+// usa el mapa (contabiliumDepositoId cargado en su users/{uid}).
+exports.exportarMapaClientes = onRequest(
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 120 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+
+    try {
+      const XLSX = require("xlsx");
+      const db = admin.firestore();
+      const email = CONTABILIUM_EMAIL.value();
+      const apiKey = CONTABILIUM_API_KEY.value();
+
+      const [clientes, usersSnap, situSnap, customerTypesSnap, reportDetailSnap] = await Promise.all([
+        getAllClientes(email, apiKey),
+        db.collection("users").where("kind", "==", "client").get(),
+        db.collection("situacionClientes").get(),
+        db.collection("customerTypes").get(),
+        db.doc("meta/clientesReportDetail").get(),
+      ]);
+
+      const sinMovimiento = await getContabiliumIdsSinMovimiento(db);
+      const provinciaFiltro = String(req.body?.provincia || "").trim().toUpperCase();
+
+      const tituloPorCustomerTypeId = new Map();
+      for (const doc of customerTypesSnap.docs) {
+        tituloPorCustomerTypeId.set(doc.id, doc.data().title || "");
+      }
+      const reporteFilaPorContabiliumId = new Map();
+      for (const row of reportDetailSnap.exists ? reportDetailSnap.data().rows || [] : []) {
+        if (row.contabiliumId != null) reporteFilaPorContabiliumId.set(row.contabiliumId, row);
+      }
+
+      const depositoPorContabiliumId = new Map();
+      const datosExtraPorContabiliumId = new Map(); // instagram, bicicletería, perfil comercial
+      for (const doc of usersSnap.docs) {
+        const u = doc.data();
+        if (u.contabiliumId == null) continue;
+        depositoPorContabiliumId.set(u.contabiliumId, u.contabiliumDepositoNombre || (u.contabiliumDepositoId ? "Sí" : null));
+        datosExtraPorContabiliumId.set(u.contabiliumId, {
+          instagram: u.instagram || "",
+          bicicleteria: u.bicicleteria || "",
+          perfilComercial: (u.customerTypeId && tituloPorCustomerTypeId.get(u.customerTypeId)) || "",
+        });
+      }
+      const situacionPorContabiliumId = new Map();
+      for (const doc of situSnap.docs) {
+        situacionPorContabiliumId.set(Number(doc.id), doc.data());
+      }
+
+      const consignados = [];
+      const sinDeposito = [];
+      for (const c of clientes) {
+        if (CLIENTES_EXCLUIDOS_DEL_CRM.has(c.Id) || CLIENTES_FANTASMA_EXCLUIDOS.has(c.Id) || sinMovimiento.has(c.Id)) continue;
+        if (provinciaFiltro && String(c.Provincia || "").trim().toUpperCase() !== provinciaFiltro) continue;
+        const nombre = c.RazonSocial || c.NombreFantasia || "(sin nombre)";
+        const depositoNombre = depositoPorContabiliumId.get(c.Id);
+        const extra = datosExtraPorContabiliumId.get(c.Id) || {};
+        const reporteFila = reporteFilaPorContabiliumId.get(c.Id) || null;
+        const ctaCte = !reporteFila
+          ? "s/dato"
+          : reporteFila.saldoDeudor > 0
+          ? `Debe $${Math.round(reporteFila.saldoDeudor).toLocaleString("es-AR")}`
+          : reporteFila.saldoAFavor > 0
+          ? `A favor $${Math.round(reporteFila.saldoAFavor).toLocaleString("es-AR")}`
+          : "Al día";
+        const base = {
+          Nombre: nombre,
+          CUIT: c.NroDoc || "",
+          Dirección: c.Domicilio || "",
+          CP: c.Cp || "",
+          Ciudad: limpiarCiudad(c.Ciudad),
+          Provincia: c.Provincia || "",
+          Teléfono: c.Telefono || c.Celular || "",
+          Bicicletería: extra.bicicleteria || "",
+          Instagram: extra.instagram ? `@${extra.instagram}` : "",
+          "Modalidad logística": depositoNombre ? "Consignado (distribuidor)" : "Comprador directo",
+          "Perfil comercial": extra.perfilComercial || "(sin perfil)",
+          "Estado cta. cte.": ctaCte,
+          "Último pedido": reporteFila?.fechaUltimaFactura || "(sin facturas)",
+        };
+        if (depositoNombre) {
+          const situ = situacionPorContabiliumId.get(c.Id);
+          consignados.push({
+            ...base,
+            Depósito: depositoNombre,
+            Situación: situ?.etiqueta || "(sin marcar)",
+            Color: situ?.color || "",
+            Llamado: situ?.llamado ? "Sí" : "No",
+            Nota: situ?.nota || "",
+            "Marcado por": situ?.updatedByNombre || "",
+          });
+        } else {
+          sinDeposito.push(base);
+        }
+      }
+
+      // El color se ve como texto en la columna "Color" — Excel no permite
+      // pintar celdas fácil desde acá sin una librería más pesada, pero
+      // dejamos también el emoji al lado del nombre de la situación para
+      // que se distinga de un vistazo igual.
+      const emojiPorColor = { verde: "🟢", amarillo: "🟡", naranja: "🟠", rojo: "🔴", vencido: "🟣" };
+      for (const row of consignados) {
+        if (row.Color) row.Situación = `${emojiPorColor[row.Color] || ""} ${row.Situación}`;
+      }
+
+      const wb = XLSX.utils.book_new();
+      const wsConsignados = XLSX.utils.json_to_sheet(consignados);
+      const wsSinDeposito = XLSX.utils.json_to_sheet(sinDeposito);
+      XLSX.utils.book_append_sheet(wb, wsConsignados, "Consignados");
+      XLSX.utils.book_append_sheet(wb, wsSinDeposito, "Sin depósito");
+
+      const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+      const base64 = buf.toString("base64");
+
+      return res.json({
+        ok: true,
+        base64,
+        filename: `Clientes Samurai${provinciaFiltro ? ` - ${req.body.provincia}` : ""} ${new Date().toISOString().slice(0, 10)}.xlsx`,
+        totalConsignados: consignados.length,
+        totalSinDeposito: sinDeposito.length,
+      });
+    } catch (err) {
+      console.error("[exportarMapaClientes] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+exports.debugProbeIdCC = onRequest(
+  { cors: false, secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 120, memory: "1GiB" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { idInventario } = req.body || {};
+      const { probarCandidatosIdCC } = require("./contabiliumWebAutomation");
+      const resultados = await probarCandidatosIdCC({
+        db: admin.firestore(),
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+        idInventario: Number(idInventario) || 137664,
+      });
+      return res.json({ resultados });
+    } catch (err) {
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Ubicaciones (lat/lon) de los vendedores asignados al caller — para el
+// mapa de Alfredo. Mismo gate que getMisVendedores. A diferencia de
+// getClientesConUbicacion (que trae y geocodifica TODA la cartera, staff
+// only), acá se pide el detalle puntual de cada uno de sus 8 clientes por
+// id, y se reutilizan las mismas cachés de geocodificación que ya llenó el
+// mapa del CRM — no vuelve a pegarle a Google/GeoRef si ya está cacheado.
+exports.getUbicacionesMisVendedores = onRequest(
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY] },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "No autorizado" });
+    let uid;
+    try {
+      uid = (await admin.auth().verifyIdToken(idToken)).uid;
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+
+    try {
+      const db = admin.firestore();
+      const callerSnap = await db.doc(`users/${uid}`).get();
+      if (!callerSnap.exists) return res.status(404).json({ error: "Usuario no encontrado" });
+      const caller = callerSnap.data();
+      const asignados = Array.isArray(caller.vendedoresAsignados) ? caller.vendedoresAsignados : [];
+      if (asignados.length === 0) {
+        return res.status(403).json({ error: "No tenés vendedores asignados" });
+      }
+
+      const email = CONTABILIUM_EMAIL.value();
+      const apiKey = CONTABILIUM_API_KEY.value();
+
+      const cacheRef = db.doc("meta/geocodeLocalidades");
+      const cacheSnap = await cacheRef.get();
+      const cache = cacheSnap.exists ? cacheSnap.data().porClave || {} : {};
+      const cacheDirRef = db.doc("meta/geocodeDirecciones");
+      const cacheDirSnap = await cacheDirRef.get();
+      const cacheDir = cacheDirSnap.exists ? cacheDirSnap.data().porClave || {} : {};
+      const claveDe = (ciudad, provincia) => `${String(ciudad || "").trim().toUpperCase()}|${String(provincia || "").trim().toUpperCase()}`;
+      const claveDireccion = (direccion, ciudad, provincia) =>
+        `${String(direccion || "").trim().toUpperCase()}|${claveDe(ciudad, provincia)}`;
+
+      const items = await mapWithConcurrency(asignados, 5, async (vendedorUid) => {
+        const vSnap = await db.doc(`users/${vendedorUid}`).get();
+        if (!vSnap.exists) return null;
+        const v = vSnap.data();
+        if (v.contabiliumId == null) return null;
+        const c = await getClientById(email, apiKey, v.contabiliumId);
+        if (!c) return null;
+        const clave = c.Ciudad ? claveDe(c.Ciudad, c.Provincia) : null;
+        const geoLocalidad = clave ? cache[clave] : null;
+        const claveDir = c.Domicilio && c.Ciudad ? claveDireccion(c.Domicilio, c.Ciudad, c.Provincia) : null;
+        const geoDireccion = claveDir ? cacheDir[claveDir] : null;
+        const geo = geoDireccion || geoLocalidad;
+        if (!geo) return null;
+        return {
+          uid: vendedorUid,
+          nombre: v.name || v.username || c.RazonSocial || c.NombreFantasia || "",
+          contabiliumId: v.contabiliumId,
+          ciudad: limpiarCiudad(c.Ciudad),
+          provincia: c.Provincia || "",
+          direccion: c.Domicilio || "",
+          cp: c.Cp || "",
+          lat: geo.lat,
+          lon: geo.lon,
+          ubicacionPrecisa: !!geoDireccion,
+        };
+      });
+
+      return res.json({ items: items.filter(Boolean) });
+    } catch (err) {
+      console.error("[getUbicacionesMisVendedores] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
 // ─────────────────────────────────────────────────────────────
 // M7b — Stock consignado por depósito, consultado por un admin
 // (para ver el stock de cualquier cliente sin que él tenga que loguearse).
@@ -1756,6 +3352,202 @@ exports.adminAsignarVendedor = onRequest(
   }
 );
 
+// Agrega (o saca) un cliente de la lista `vendedoresAsignados` de un
+// distribuidor con equipo propio (ej. Alfredo Bavcevich) — esa lista es lo
+// único que habilita "Mis clientes"/el resumen de comisión para ver a ese
+// cliente. Opcionalmente también fija el depósito de Contabilium del
+// cliente en el mismo paso (para el caso típico: cliente nuevo que ya tiene
+// depósito armado en Contabilium pero todavía no vinculado acá).
+exports.adminAsignarClienteADistribuidor = onRequest(
+  { cors: false },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { distribuidorUid, clienteUid, quitar, contabiliumDepositoId } = req.body || {};
+      if (!distribuidorUid || !clienteUid) return res.status(400).json({ error: "Faltan distribuidorUid y clienteUid" });
+
+      const db = admin.firestore();
+      const distribuidorRef = db.doc(`users/${distribuidorUid}`);
+      const distribuidorSnap = await distribuidorRef.get();
+      if (!distribuidorSnap.exists) return res.status(404).json({ error: "Distribuidor no encontrado" });
+
+      await distribuidorRef.update({
+        vendedoresAsignados: quitar
+          ? admin.firestore.FieldValue.arrayRemove(clienteUid)
+          : admin.firestore.FieldValue.arrayUnion(clienteUid),
+      });
+
+      if (!quitar && contabiliumDepositoId) {
+        await db.doc(`users/${clienteUid}`).set({ contabiliumDepositoId: Number(contabiliumDepositoId) }, { merge: true });
+      }
+
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("[adminAsignarClienteADistribuidor] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Importa masivamente la "situación" (color/etiqueta/llamado/nota) que el
+// staff carga a mano en el Excel que baja del mapa (mismas columnas que
+// exportarMapaClientes: Situación/Color/Llamado/Nota/Marcado por), más
+// cualquier texto libre suelto (columna extra sin encabezado, o anotado a
+// mano al lado del nombre) que se guarda como una entrada nueva en
+// seguimiento.historial para no perder ese contexto.
+// Cruce por CUIT (normalizado, sin guiones/espacios) — es más confiable que
+// el nombre, que en Contabilium puede variar entre RazonSocial/NombreFantasia.
+exports.adminImportarSituacionesClientes = onRequest(
+  { cors: false, invoker: "public", timeoutSeconds: 120 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { filas } = req.body || {};
+      if (!Array.isArray(filas) || !filas.length) return res.status(400).json({ error: "Falta filas (array)" });
+
+      const db = admin.firestore();
+      const staffSnap = await db.doc(`users/${staffUid}`).get();
+      const staffNombre = staffSnap.data()?.name || staffSnap.data()?.username || "Importación Excel";
+
+      const onlyDigits = (s) => (s || "").toString().replace(/\D/g, "");
+
+      const usersSnap = await db.collection("users").where("kind", "==", "client").get();
+      const porCuit = new Map();
+      usersSnap.docs.forEach((d) => {
+        const u = d.data();
+        const cuitDigits = onlyDigits(u.cuit);
+        if (cuitDigits) porCuit.set(cuitDigits, { uid: d.id, contabiliumId: u.contabiliumId, nombre: u.name || "" });
+      });
+
+      let actualizados = 0;
+      let soloNota = 0;
+      let sinCambios = 0;
+      const noEncontrados = [];
+      const batch = db.batch();
+      let opsEnBatch = 0;
+
+      for (const fila of filas) {
+        const cuitDigits = onlyDigits(fila.cuit);
+        const match = cuitDigits ? porCuit.get(cuitDigits) : null;
+        if (!match) {
+          noEncontrados.push({ nombre: fila.nombreExcel || "", cuit: fila.cuit || "" });
+          continue;
+        }
+
+        let huboCambio = false;
+
+        // Situación/color/llamado/nota — mismo documento y forma que usa el
+        // mapa (situacionClientes/{contabiliumId}), así el próximo click en
+        // el mapa sigue funcionando igual.
+        const tieneSituacion =
+          fila.color || fila.llamado === true || (fila.nota && fila.nota.trim()) || (fila.marcadoPor && fila.marcadoPor.trim());
+        if (match.contabiliumId && tieneSituacion) {
+          const ref = db.doc(`situacionClientes/${match.contabiliumId}`);
+          batch.set(
+            ref,
+            {
+              ...(fila.color ? { color: fila.color } : {}),
+              ...(fila.situacionEtiqueta ? { etiqueta: fila.situacionEtiqueta } : {}),
+              ...(fila.nota ? { nota: fila.nota } : {}),
+              ...(fila.llamado === true ? { llamado: true } : {}),
+              updatedByNombre: fila.marcadoPor || staffNombre,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+          opsEnBatch += 1;
+          huboCambio = true;
+        }
+
+        // El nombre real (de Samurai) suele ser el prefijo del nombre tal
+        // cual quedó escrito en el Excel, con anotaciones sueltas pegadas
+        // al final (ej. "ANGEL OMAR GODANO ( WAPP ENVIADO)") — se la separa
+        // comparando contra el nombre real ya resuelto por CUIT.
+        let anotacionNombre = "";
+        if (fila.nombreExcel && match.nombre) {
+          const normal = (s) => s.toString().trim().toUpperCase().replace(/\s+/g, " ");
+          const excelNorm = normal(fila.nombreExcel);
+          const realNorm = normal(match.nombre);
+          if (excelNorm.startsWith(realNorm)) {
+            anotacionNombre = fila.nombreExcel
+              .trim()
+              .slice(realNorm.length)
+              .replace(/^[\s()–\-:,.]+|[\s()]+$/g, "")
+              .trim();
+          } else if (excelNorm !== realNorm) {
+            // No matcheó como prefijo (mayúsculas/orden distinto) — se
+            // guarda todo el texto del Excel igual, mejor de más que perder
+            // la anotación.
+            anotacionNombre = fila.nombreExcel.trim();
+          }
+        }
+
+        // Todo lo que es texto libre (columna extra del Excel + lo que
+        // quedó anotado junto al nombre) se guarda como una entrada de
+        // seguimiento nueva, para no perder el detalle de la revisión.
+        const textoLibre = [fila.notaExtra, anotacionNombre].filter((t) => t && t.trim()).join(" — ");
+        if (textoLibre) {
+          const userRef = db.doc(`users/${match.uid}`);
+          const entrada = {
+            contactado: fila.llamado === true,
+            cuentaCoincide: null,
+            notas: `Importado desde Excel (${textoLibre.length > 500 ? textoLibre.slice(0, 500) + "…" : textoLibre})`,
+            tareaPendiente: "",
+            imagenes: [],
+            contactadoPor: staffUid,
+            vendedorAsignado: null,
+            fecha: admin.firestore.Timestamp.now(),
+          };
+          batch.update(userRef, {
+            "seguimiento.historial": admin.firestore.FieldValue.arrayUnion(entrada),
+            // Mismos "campos espejo" que actualiza Clientes360 al cargar una
+            // nota a mano (Clientes360.jsx ~1281-1301) — las listas/filtros
+            // del CRM leen estos campos sueltos, no el array completo.
+            "seguimiento.contactado": entrada.contactado,
+            "seguimiento.cuentaCoincide": entrada.cuentaCoincide,
+            "seguimiento.notas": entrada.notas,
+            "seguimiento.tareaPendiente": entrada.tareaPendiente,
+            "seguimiento.contactadoPor": entrada.contactadoPor,
+            "seguimiento.fecha": entrada.fecha,
+          });
+          opsEnBatch += 1;
+          huboCambio = true;
+          if (!tieneSituacion) soloNota += 1;
+        }
+
+        if (huboCambio) actualizados += 1;
+        else sinCambios += 1;
+
+        // Firestore corta un batch en 500 operaciones — con margen, mandamos
+        // de a tandas si el Excel es grande.
+        if (opsEnBatch >= 400) {
+          await batch.commit();
+          opsEnBatch = 0;
+        }
+      }
+      if (opsEnBatch > 0) await batch.commit();
+
+      return res.json({
+        total: filas.length,
+        actualizados,
+        soloNota,
+        sinCambios,
+        noEncontrados,
+      });
+    } catch (err) {
+      console.error("[adminImportarSituacionesClientes] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
 exports.adminGetClientPhone = onRequest(
   { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY] },
   async (req, res) => {
@@ -1768,10 +3560,62 @@ exports.adminGetClientPhone = onRequest(
       const { contabiliumId } = req.body || {};
       if (!contabiliumId) return res.status(400).json({ error: "contabiliumId requerido" });
       const cliente = await getClientById(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value(), contabiliumId);
-      return res.json({ telefono: cliente?.Telefono || null });
+      const observaciones = cliente?.Observaciones || "";
+      // Busca un @handle o un link de instagram.com/... anotado a mano en
+      // las Observaciones de Contabilium, para sugerirlo en Samurai sin
+      // tener que pedirle a nadie que lo tipee de nuevo.
+      const matchLink = observaciones.match(/instagram\.com\/([a-zA-Z0-9._]+)/i);
+      const matchHandle = observaciones.match(/@([a-zA-Z0-9._]+)/);
+      const instagramDetectado = matchLink?.[1] || matchHandle?.[1] || null;
+      return res.json({
+        telefono: cliente?.Telefono || null,
+        celular: cliente?.Celular || null,
+        ciudad: limpiarCiudad(cliente?.Ciudad) || null,
+        provincia: cliente?.Provincia || null,
+        razonSocial: cliente?.RazonSocial || null,
+        direccion: cliente?.Domicilio || null,
+        cp: cliente?.Cp || null,
+        instagramDetectado,
+      });
     } catch (err) {
       console.error("[contabilium] adminGetClientPhone error:", err);
       return res.status(500).json({ error: String(err) });
+    }
+  }
+);
+
+// Carga/edita el teléfono y/o celular de un cliente directo en Contabilium
+// — son los dos únicos campos de teléfono que tiene (Telefono y Celular).
+// Contabilium no soporta PATCH parcial: hay que traer el registro completo
+// y mandarlo de nuevo con los campos pisados.
+exports.adminActualizarTelefonosCliente = onRequest(
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY] },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { contabiliumId, telefono, celular } = req.body || {};
+      if (!contabiliumId) return res.status(400).json({ error: "contabiliumId requerido" });
+      if (telefono === undefined && celular === undefined) {
+        return res.status(400).json({ error: "Mandá al menos telefono o celular" });
+      }
+      const email = CONTABILIUM_EMAIL.value();
+      const apiKey = CONTABILIUM_API_KEY.value();
+      const cliente = await getClientById(email, apiKey, contabiliumId);
+      if (!cliente) return res.status(404).json({ error: "Cliente no encontrado en Contabilium" });
+      const patched = {
+        ...cliente,
+        ...(telefono !== undefined ? { Telefono: telefono } : {}),
+        ...(celular !== undefined ? { Celular: celular } : {}),
+      };
+      await updateCliente(email, apiKey, contabiliumId, patched);
+      return res.json({ ok: true, telefono: patched.Telefono || null, celular: patched.Celular || null });
+    } catch (err) {
+      console.error("[adminActualizarTelefonosCliente] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
     }
   }
 );
@@ -1836,6 +3680,54 @@ exports.diagComprobantesPaging = onRequest(
       const result = await debugComprobantesPaging(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value());
       return res.json(result);
     } catch (err) {
+      return res.status(500).json({ error: String(err) });
+    }
+  }
+);
+
+// Trae TODAS las Cotizaciones (COT) de la empresa, con el nombre/CUIT real
+// del cliente ya resuelto (se cruza contra el listado completo de clientes,
+// una sola vez, en vez de un llamado por comprobante) — para la pantalla
+// "COTs" del admin.
+exports.listCotizaciones = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 300 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const parseAr = (v) => Number(String(v || "0").replace(/\./g, "").replace(",", "."));
+      const email = CONTABILIUM_EMAIL.value();
+      const apiKey = CONTABILIUM_API_KEY.value();
+
+      const [comprobantes, clientes] = await Promise.all([
+        getAllComprobantes(email, apiKey, {}),
+        getAllClientes(email, apiKey),
+      ]);
+
+      const clientePorId = new Map(clientes.map((c) => [c.Id, c]));
+
+      const cots = comprobantes
+        .filter((c) => c.TipoFc === "COT")
+        .map((c) => {
+          const cliente = clientePorId.get(c.IdCliente);
+          return {
+            id: c.Id,
+            numero: c.Numero,
+            fecha: c.FechaEmision,
+            clienteId: c.IdCliente,
+            clienteNombre: cliente?.RazonSocial || cliente?.NombreFantasia || null,
+            cuit: cliente?.NroDoc || null,
+            total: parseAr(c.ImporteTotalNeto),
+            saldo: parseAr(c.Saldo),
+          };
+        })
+        .sort((a, b) => (b.fecha || "").localeCompare(a.fecha || ""));
+
+      return res.json({ total: cots.length, items: cots });
+    } catch (err) {
+      console.error("[contabilium] listCotizaciones error:", err);
       return res.status(500).json({ error: String(err) });
     }
   }
@@ -2238,6 +4130,53 @@ exports.diagListClientesVinculados = onRequest(
 // Base completa de clientes de Contabilium (169+ registros, no solo los que
 // se registraron en la app) — usada por el CRM interno para asignar a
 // vendedores/telemarketers la cartera real de Contabilium.
+// Cuentas de Contabilium que NO son clientes comerciales reales — personas
+// del equipo (vendedores/staff) que tienen una cuenta de cliente cargada en
+// Contabilium por otro motivo (compra personal, cuenta previa a sumarse al
+// equipo, etc.). Se excluyen del mapa/CRM comercial y del Excel exportado,
+// aunque sigan existiendo como comprobante/cliente en Contabilium para todo
+// lo demás (facturación, etc.) — este filtro es solo para las vistas
+// "cartera de clientes". Confirmado a mano contra un reclamo real (sept
+// 2026): Mauro Prandi y Gerardo Martínez tienen cuenta de cliente en
+// Contabilium siendo del equipo.
+const CLIENTES_EXCLUIDOS_DEL_CRM = new Set([
+  102561235, // PRANDI MAURO — vendedor
+  115207269, // GERARDO ENRIQUE MARTINEZ — vendedor
+]);
+
+// Clientes marcados a mano por el equipo comercial como "fantasma": tienen
+// cuenta/depósito cargado en Contabilium pero sin movimiento real (alta de
+// prueba, stock cargado directo sin transferencia, etc.) — reportado por
+// WhatsApp. Se excluyen igual que los de arriba, aunque el motivo sea otro.
+const CLIENTES_FANTASMA_EXCLUIDOS = new Set([
+  125076379, // YOELMYS CUEVAS TRIMIÑO — stock cargado sin movimiento real (sept 2026)
+]);
+
+// Además de la lista a mano, se aplica una regla automática y en vivo: un
+// cliente solo aparece en el mapa/CRM si hoy tiene algo pendiente — stock
+// consignado actual, deuda o saldo a favor. Si está en cero stock y cero
+// saldo (deuda Y a favor) no se borra (sigue existiendo en Contabilium y en
+// Firestore), solo se oculta de estas vistas de cartera — apenas vuelva a
+// tener stock o movimiento de cuenta corriente, la próxima sincronización de
+// meta/clientesReportDetail lo hace reaparecer solo, sin que haga falta
+// tocar nada a mano. Ojo: a diferencia de una versión anterior de esta
+// regla, NO mira el historial de facturación — un cliente real que ya
+// vendió todo y está al día (ej. Edgardo Petean, sept 2026) queda oculto
+// igual mientras esté en cero, que es justamente lo que se pidió.
+async function getContabiliumIdsSinMovimiento(db) {
+  const snap = await db.doc("meta/clientesReportDetail").get();
+  const rows = snap.exists ? snap.data().rows || [] : [];
+  const sinMovimiento = new Set();
+  for (const r of rows) {
+    if (!r.contabiliumId) continue;
+    const sinStock = !r.stockConsignado || r.stockConsignado <= 0;
+    const sinDeuda = !r.saldoDeudor || r.saldoDeudor <= 0;
+    const sinAFavor = !r.saldoAFavor || r.saldoAFavor <= 0;
+    if (sinStock && sinDeuda && sinAFavor) sinMovimiento.add(r.contabiliumId);
+  }
+  return sinMovimiento;
+}
+
 exports.listContabiliumClientes = onRequest(
   { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 120 },
   async (req, res) => {
@@ -2247,20 +4186,207 @@ exports.listContabiliumClientes = onRequest(
     if (!staffUid) return;
     try {
       const clientes = await getAllClientes(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value());
-      const items = clientes.map((c) => ({
-        id: `cb-${c.Id}`,
-        contabiliumId: c.Id,
-        nombre: c.RazonSocial || c.NombreFantasia || "(sin nombre)",
-        cuit: c.NroDoc || "",
-        telefono: c.Telefono || "",
-        telefono2: "",
-        provincia: c.Provincia || "",
-        ciudad: c.Ciudad || "",
-        rubro: "",
-      }));
+      const items = clientes
+        .filter((c) => !CLIENTES_EXCLUIDOS_DEL_CRM.has(c.Id))
+        .map((c) => ({
+          id: `cb-${c.Id}`,
+          contabiliumId: c.Id,
+          nombre: c.RazonSocial || c.NombreFantasia || "(sin nombre)",
+          cuit: c.NroDoc || "",
+          telefono: c.Telefono || "",
+          telefono2: "",
+          provincia: c.Provincia || "",
+          ciudad: limpiarCiudad(c.Ciudad),
+          rubro: "",
+        }));
       return res.json({ items });
     } catch (err) {
       console.error("[contabilium] listContabiliumClientes error:", err);
+      return res.status(500).json({ error: String(err) });
+    }
+  }
+);
+
+// Geocodifica una dirección puntual (calle + altura) en tres pasos:
+//  1) GeoRef (apis.datos.gob.ar, oficial INDEC) — mejor precisión cuando la
+//     tiene, pero su nomenclador de calles no cubre todas las localidades
+//     chicas.
+//  2) Si GeoRef no encontró nada, Nominatim (OpenStreetMap) — cubre mucha
+//     más calle "de pueblo" (incluye calles numeradas tipo "Calle 17"), a
+//     costa de no siempre acertar el número de puerta exacto, pero sí la
+//     calle real en vez del centro de la ciudad.
+//  3) Si tampoco Nominatim la encontró, Google Geocoding API (paga, pero se
+//     cachea por dirección en Firestore así que en la práctica se llama una
+//     sola vez por cliente) — cubre lo que ninguno de los dos gratuitos
+//     tiene cargado.
+// Nominatim exige 1 request/segundo y un User-Agent identificable — por
+// eso el caso 2 se llama con throttling aparte del de GeoRef.
+async function geocodeDireccionPuntual(direccion, ciudad, provincia, googleApiKey) {
+  const direccionLimpia = String(direccion || "").trim();
+  if (!direccionLimpia) return null;
+
+  try {
+    const params = new URLSearchParams({
+      direccion: direccionLimpia,
+      provincia: provincia || "",
+      localidad: ciudad || "",
+      max: "1",
+    });
+    const r = await fetch(`https://apis.datos.gob.ar/georef/api/direcciones?${params.toString()}`);
+    const body = await r.json();
+    const d = body?.direcciones?.[0];
+    if (d?.ubicacion?.lat != null) {
+      return { lat: d.ubicacion.lat, lon: d.ubicacion.lon, fuente: "georef" };
+    }
+  } catch {
+    // sigue al fallback de Nominatim
+  }
+
+  try {
+    const q = [direccionLimpia, ciudad, provincia, "Argentina"].filter(Boolean).join(", ");
+    const params = new URLSearchParams({ q, format: "json", limit: "1", countrycodes: "ar" });
+    const r = await fetch(`https://nominatim.openstreetmap.org/search?${params.toString()}`, {
+      headers: { "User-Agent": "SamuraiBikesAdmin/1.0 (soporte@samurai.ar)" },
+    });
+    const body = await r.json();
+    if (body?.[0]) {
+      return { lat: Number(body[0].lat), lon: Number(body[0].lon), fuente: "nominatim" };
+    }
+  } catch {
+    // sigue al fallback de Google
+  }
+
+  if (googleApiKey) {
+    try {
+      const q = [direccionLimpia, ciudad, provincia, "Argentina"].filter(Boolean).join(", ");
+      const params = new URLSearchParams({ address: q, region: "ar", key: googleApiKey });
+      const r = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?${params.toString()}`);
+      const body = await r.json();
+      const loc = body?.results?.[0]?.geometry?.location;
+      if (body?.status === "OK" && loc) {
+        return { lat: loc.lat, lon: loc.lng, fuente: "google" };
+      }
+    } catch {
+      // sin geocodificación posible para esta dirección
+    }
+  }
+
+  return null;
+}
+
+// Misma cartera de listContabiliumClientes, pero con lat/lon por dirección
+// puntual (calle + altura) — para el mapa de clientes del CRM. Cachea cada
+// dirección resuelta en Firestore (por texto exacto de domicilio+ciudad+
+// provincia) para no volver a geocodificarla en corridas siguientes. Si una
+// dirección puntual no se puede resolver, cae al centroide de la localidad
+// (GeoRef por CIUDAD|PROVINCIA, cacheado aparte) en vez de dejar al cliente
+// totalmente sin ubicar.
+exports.getClientesConUbicacion = onRequest(
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, GOOGLE_MAPS_SERVER_KEY], timeoutSeconds: 300 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const clientes = await getAllClientes(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value());
+      const db = admin.firestore();
+      const sinMovimiento = await getContabiliumIdsSinMovimiento(db);
+      const cacheRef = db.doc("meta/geocodeLocalidades");
+      const cacheSnap = await cacheRef.get();
+      const cache = cacheSnap.exists ? cacheSnap.data().porClave || {} : {};
+
+      const claveDe = (ciudad, provincia) => `${String(ciudad || "").trim().toUpperCase()}|${String(provincia || "").trim().toUpperCase()}`;
+
+      const faltantes = new Map(); // clave -> { ciudad, provincia }
+      for (const c of clientes) {
+        if (!c.Ciudad) continue;
+        const clave = claveDe(c.Ciudad, c.Provincia);
+        if (!(clave in cache)) faltantes.set(clave, { ciudad: c.Ciudad, provincia: c.Provincia });
+      }
+
+      for (const [clave, { ciudad, provincia }] of faltantes) {
+        try {
+          const params = new URLSearchParams({
+            nombre: ciudad,
+            provincia: provincia || "",
+            campos: "nombre,provincia.nombre,centroide.lat,centroide.lon",
+            max: "1",
+          });
+          const r = await fetch(`https://apis.datos.gob.ar/georef/api/localidades?${params.toString()}`);
+          const body = await r.json();
+          const loc = body?.localidades?.[0];
+          cache[clave] = loc ? { lat: loc.centroide.lat, lon: loc.centroide.lon } : null;
+        } catch {
+          cache[clave] = null;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 120));
+      }
+
+      if (faltantes.size > 0) {
+        await cacheRef.set({ porClave: cache, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      }
+
+      // Segundo nivel de caché: por dirección puntual (calle+altura+ciudad+
+      // provincia), mucho más preciso que el centroide de la localidad.
+      const cacheDirRef = db.doc("meta/geocodeDirecciones");
+      const cacheDirSnap = await cacheDirRef.get();
+      const cacheDir = cacheDirSnap.exists ? cacheDirSnap.data().porClave || {} : {};
+
+      const claveDireccion = (direccion, ciudad, provincia) =>
+        `${String(direccion || "").trim().toUpperCase()}|${claveDe(ciudad, provincia)}`;
+
+      const direccionesFaltantes = new Map(); // clave -> { direccion, ciudad, provincia }
+      for (const c of clientes) {
+        if (!c.Domicilio || !c.Ciudad) continue;
+        const clave = claveDireccion(c.Domicilio, c.Ciudad, c.Provincia);
+        if (!(clave in cacheDir)) {
+          direccionesFaltantes.set(clave, { direccion: c.Domicilio, ciudad: c.Ciudad, provincia: c.Provincia });
+        }
+      }
+
+      const googleApiKey = GOOGLE_MAPS_SERVER_KEY.value();
+      let cambiosDir = false;
+      for (const [clave, { direccion, ciudad, provincia }] of direccionesFaltantes) {
+        const geo = await geocodeDireccionPuntual(direccion, ciudad, provincia, googleApiKey);
+        cacheDir[clave] = geo;
+        cambiosDir = true;
+        // Nominatim exige como máximo 1 req/seg — como GeoRef (intento 1) no
+        // siempre llega a pedirle nada a Nominatim, este delay solo pesa
+        // cuando realmente hizo falta el fallback.
+        await new Promise((resolve) => setTimeout(resolve, geo?.fuente === "nominatim" ? 1100 : 120));
+      }
+      if (cambiosDir) {
+        await cacheDirRef.set({ porClave: cacheDir, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      }
+
+      const items = clientes
+        .filter((c) => !CLIENTES_EXCLUIDOS_DEL_CRM.has(c.Id) && !CLIENTES_FANTASMA_EXCLUIDOS.has(c.Id) && !sinMovimiento.has(c.Id))
+        .map((c) => {
+        const clave = c.Ciudad ? claveDe(c.Ciudad, c.Provincia) : null;
+        const geoLocalidad = clave ? cache[clave] : null;
+        const claveDir = c.Domicilio && c.Ciudad ? claveDireccion(c.Domicilio, c.Ciudad, c.Provincia) : null;
+        const geoDireccion = claveDir ? cacheDir[claveDir] : null;
+        // Preferí siempre la dirección puntual; si no se pudo geocodificar,
+        // cae al centro de la localidad para no dejar al cliente sin pin.
+        const geo = geoDireccion || geoLocalidad;
+        return {
+          id: `cb-${c.Id}`,
+          contabiliumId: c.Id,
+          nombre: c.RazonSocial || c.NombreFantasia || "(sin nombre)",
+          cuit: c.NroDoc || "",
+          ciudad: limpiarCiudad(c.Ciudad),
+          provincia: c.Provincia || "",
+          direccion: c.Domicilio || "",
+          cp: c.Cp || "",
+          lat: geo?.lat ?? null,
+          lon: geo?.lon ?? null,
+          ubicacionPrecisa: !!geoDireccion,
+        };
+      });
+      return res.json({ items });
+    } catch (err) {
+      console.error("[contabilium] getClientesConUbicacion error:", err);
       return res.status(500).json({ error: String(err) });
     }
   }
@@ -2376,6 +4502,42 @@ exports.diagTestPageIndex = onRequest(
       const apiKey = CONTABILIUM_API_KEY.value();
       const resultados = await testPageIndexRaw(email, apiKey, fechaDesde, fechaHasta);
       return res.json(resultados);
+    } catch (err) {
+      return res.status(500).json({ error: String(err) });
+    }
+  }
+);
+
+// Diagnóstico temporal: descubre el endpoint real de "Movimientos entre
+// depósitos" de Contabilium (no está documentado en lo que ya usamos) para
+// poder automatizar traslados de stock desde Samurai.
+exports.diagProbeMovimientosDeposito = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 60 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const result = await probeMovimientosDepositoEndpoints(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value());
+      return res.json(result);
+    } catch (err) {
+      return res.status(500).json({ error: String(err) });
+    }
+  }
+);
+
+exports.diagProbeCheques = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 60 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const nroCheque = String(req.query.nroCheque || "12197117");
+      const result = await probeChequesEndpoints(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value(), nroCheque);
+      return res.json(result);
     } catch (err) {
       return res.status(500).json({ error: String(err) });
     }
@@ -2525,7 +4687,7 @@ exports.getDepositoStockAdmin = onRequest(
     try {
       const db = admin.firestore();
       const callerSnap = await db.doc(`users/${uid}`).get();
-      const staffRoles = ["admin"];
+      const staffRoles = ["admin", "chofer"];
       if (!callerSnap.exists || !staffRoles.includes(callerSnap.data().role)) {
         return res.status(403).json({ error: "Acceso denegado" });
       }
@@ -2537,7 +4699,10 @@ exports.getDepositoStockAdmin = onRequest(
       const apiKey = CONTABILIUM_API_KEY.value();
       const stockItems = await getStockByDepositoWithRetry(email, apiKey, depositoId);
       const pendingSoldBySku = await getPendingSoldBySku(db, { depositoId });
-      const items = await buildDepositoStockItems(db, email, apiKey, stockItems, { pendingSoldBySku });
+      // includeZeroStock: true para que el admin pueda buscar y ajustar
+      // (agregar) stock de un producto que hoy tiene 0 unidades en este
+      // depósito — si no, ni aparecería en la lista.
+      const items = await buildDepositoStockItems(db, email, apiKey, stockItems, { pendingSoldBySku, includeZeroStock: true });
 
       return res.json({ depositoId, items });
     } catch (err) {
@@ -2701,6 +4866,19 @@ exports.reportSale = onRequest(
         });
       }
 
+      enviarPushAAdmins({
+        title: "🚲 Nueva venta reportada",
+        body: `${user.name || user.email || "Un distribuidor"} reportó ${name || `SKU ${sku}`}`,
+        link: "/admin/ventas-reportadas",
+      });
+      enviarPushAUsuario(uid, {
+        title: tipoDocumentoEmitido ? "✅ Tu venta fue facturada" : "📦 Venta reportada",
+        body: tipoDocumentoEmitido
+          ? `Se facturó automáticamente: ${name || `SKU ${sku}`}`
+          : `Registramos tu venta de ${name || `SKU ${sku}`}, la estamos procesando.`,
+        link: "/mi-stock",
+      });
+
       return res.json({ ok: true, id: ref.id, tipoDocumentoEmitido });
     } catch (err) {
       console.error("[saleRequests] reportSale error:", err);
@@ -2844,12 +5022,38 @@ exports.emitirFacturaVenta = onRequest(
         sku: r.data.sku || null,
       }));
 
-      const comprobante = await crearComprobante(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value(), {
-        idCliente,
-        idDeposito: userData?.contabiliumDepositoId || null,
-        tipoFc: "FCA",
-        items,
-      });
+      let comprobante;
+      try {
+        comprobante = await crearComprobante(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value(), {
+          idCliente,
+          idDeposito: userData?.contabiliumDepositoId || null,
+          tipoFc: "FCA",
+          items,
+        });
+      } catch (crearErr) {
+        // Si Contabilium rechaza por falta de stock, lo más probable es que
+        // ya exista una Cotización (COT) que descontó ese mismo stock antes
+        // (el distribuidor la generó, o alguien la cargó a mano) — en vez de
+        // devolver solo el error crudo de Contabilium, avisamos cuál es.
+        const msg = crearErr.message || String(crearErr);
+        let candidata = null;
+        if (/disponible|stock/i.test(msg)) {
+          try {
+            const totalPedido = items.reduce((acc, it) => acc + Number(it.cantidad) * Number(it.precioUnitario), 0);
+            const recientes = await getComprobantesByClientId(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value(), idCliente, { tipos: ["COT"] });
+            candidata = recientes.find((c) => Math.abs(Number(String(c.ImporteTotalNeto || "0").replace(/\./g, "").replace(",", ".")) - totalPedido) < 1) || null;
+          } catch {
+            candidata = null; // si falla la búsqueda, seguimos con el error original de Contabilium
+          }
+        }
+        if (candidata) {
+          const totalPedido = items.reduce((acc, it) => acc + Number(it.cantidad) * Number(it.precioUnitario), 0);
+          throw new Error(
+            `${msg}\n\nProbablemente ya exista una Cotización (COT) que cubre esta misma venta y ya descontó el stock: ${candidata.Numero} del ${(candidata.FechaEmision || "").slice(0, 10)} por el mismo monto ($${totalPedido.toLocaleString("es-AR")}). Borrala en Contabilium para liberar el stock si querés emitir la factura real.`
+          );
+        }
+        throw crearErr;
+      }
 
       const batch = db.batch();
       for (const r of rows) {
@@ -2898,13 +5102,22 @@ exports.emitirFacturaManual = onRequest(
     if (!staffUid) return;
 
     try {
-      const { contabiliumId, items, tipoFc } = req.body || {};
+      const { contabiliumId, items, tipoFc, fechaEmision } = req.body || {};
       const idCliente = Number(contabiliumId);
       if (!idCliente) return res.status(400).json({ error: "contabiliumId requerido" });
       if (!Array.isArray(items) || items.length === 0) {
         return res.status(400).json({ error: "Agregá al menos un ítem" });
       }
-      const tipoFcValido = ["FCA", "FCB", "FCC"].includes(tipoFc) ? tipoFc : "FCA";
+      // COT (cotización) y REM (remito) no son documentos AFIP — no llevan
+      // CAE, se emiten directo con número real de Contabilium.
+      const tipoFcValido = ["FCA", "FCB", "FCC", "COT", "REM"].includes(tipoFc) ? tipoFc : "FCA";
+      // Fecha de emisión opcional (para cargar con fecha pasada, ej.
+      // facturar en septiembre algo de agosto) — Contabilium lo admite
+      // (formato YYYY-MM-DD). Ojo: para FCA/FCB/FCC electrónicas, AFIP
+      // igual puede rechazar el CAE si la fecha está fuera de la ventana
+      // que permite (unos pocos días de atraso) — Contabilium devuelve el
+      // error tal cual si eso pasa.
+      const fechaEmisionValida = /^\d{4}-\d{2}-\d{2}$/.test(fechaEmision || "") ? fechaEmision : undefined;
 
       const cleanItems = items.map((it, i) => {
         const descripcion = String(it.descripcion || "").trim();
@@ -2927,12 +5140,14 @@ exports.emitirFacturaManual = onRequest(
         idDeposito,
         tipoFc: tipoFcValido,
         items: cleanItems,
+        fechaEmision: fechaEmisionValida,
       });
 
       await db.collection("facturasManuales").add({
         contabiliumId: idCliente,
         items: cleanItems,
         tipoFc: tipoFcValido,
+        fechaEmision: fechaEmisionValida || null,
         emitidoPor: staffUid,
         emitidoAt: admin.firestore.FieldValue.serverTimestamp(),
         comprobante: comprobante || null,
@@ -2952,9 +5167,14 @@ exports.emitirFacturaManual = onRequest(
 // como Montejano.
 const FORMAS_DE_PAGO_VALIDAS = ["Débito", "Depósito", "Efectivo", "Transferencia", "Cheque", "Nota de crédito"];
 // Cheque, igual que Efectivo, no lleva banco/caja — solo el número de
-// cheque como NroReferencia (confirmado contra cobranzas reales ya
-// sincronizadas: siempre traen IdBanco/IdCaja en null).
-const FORMAS_SIN_BANCO = ["Efectivo", "Cheque"];
+// cheque como NroReferencia. Nota de crédito tampoco lleva banco — lo que
+// identifica el pago es el IDNotaCredito. Efectivo SÍ necesita una Caja
+// (no banco): revisando las cobranzas reales sincronizadas, todas las de
+// Efectivo traen `IdCaja: 108982` — sin eso Contabilium tira un error
+// interno ("Object reference not set to an instance of an object") al
+// intentar cobrar, en vez de un error claro.
+const FORMAS_SIN_BANCO = ["Efectivo", "Cheque", "Nota de crédito"];
+const CAJA_EFECTIVO_ID = 108982;
 exports.cobrarComprobante = onRequest(
   { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 60 },
   async (req, res) => {
@@ -2966,11 +5186,14 @@ exports.cobrarComprobante = onRequest(
     if (!staffUid) return;
 
     try {
-      const { idComprobante, importeTotalNeto } = req.body || {};
+      const { idComprobante, importeTotalNeto, fecha } = req.body || {};
       const id = Number(idComprobante);
       const total = Number(importeTotalNeto);
       if (!id) return res.status(400).json({ error: "idComprobante requerido" });
       if (!Number.isFinite(total) || total <= 0) return res.status(400).json({ error: "importeTotalNeto inválido" });
+      if (fecha && !/^\d{4}-\d{2}-\d{2}$/.test(fecha)) {
+        return res.status(400).json({ error: "fecha inválida, formato esperado AAAA-MM-DD" });
+      }
 
       // Acepta una o varias líneas de pago en el mismo recibo. Es clave que
       // vayan TODAS juntas en un solo llamado: la API de Contabilium
@@ -2997,12 +5220,15 @@ exports.cobrarComprobante = onRequest(
         if (p.formaDePago === "Cheque" && !p.nroReferencia) {
           return res.status(400).json({ error: "El número de cheque es obligatorio" });
         }
+        if (p.formaDePago === "Nota de crédito" && !p.idNotaCredito) {
+          return res.status(400).json({ error: "Elegí qué nota de crédito estás aplicando" });
+        }
         sumaImportes += importe;
         pagos.push({
           FormaDePago: p.formaDePago,
           IDBanco: FORMAS_SIN_BANCO.includes(p.formaDePago) ? null : Number(p.idBanco),
-          IDCaja: null,
-          IDNotaCredito: null,
+          IDCaja: p.formaDePago === "Efectivo" ? CAJA_EFECTIVO_ID : null,
+          IDNotaCredito: p.formaDePago === "Nota de crédito" ? Number(p.idNotaCredito) : null,
           Importe: importe,
           NroReferencia: p.nroReferencia || "",
           IDComprobanteAsociado: "",
@@ -3017,6 +5243,7 @@ exports.cobrarComprobante = onRequest(
         id,
         importeTotalNeto: total,
         saldo: saldoRestante,
+        fecha,
         pagos,
       });
 
@@ -3152,6 +5379,144 @@ exports.reviewComprobantePago = onRequest(
 // y fecha ± unos días). Si no encuentra match, queda "pendiente" para que
 // el staff lo revise a mano.
 // ─────────────────────────────────────────────────────────────
+// Mismo mapeo que src/services/bancos.ts (Contabilium no expone un
+// endpoint de bancos) — se repite acá porque el backend no puede importar
+// un archivo del frontend.
+const BANCOS_POR_ID_SERVER = {
+  217296: "Banco Galicia S.A",
+  217302: "Banco Santander Río S.A",
+  201286: "Banco Supervielle S.A",
+  201285: "MercadoPago",
+};
+// Palabras clave para reconocer cada banco en lo que devuelve la IA (que
+// puede escribir "Galicia", "Banco Galicia", "GALICIA", etc.)
+const BANCO_KEYWORDS = [
+  { idBanco: 217296, keywords: ["galicia"] },
+  { idBanco: 217302, keywords: ["santander"] },
+  { idBanco: 201286, keywords: ["supervielle"] },
+  { idBanco: 201285, keywords: ["mercado pago", "mercadopago", "mp"] },
+];
+function idBancoDesdeTexto(texto) {
+  const t = String(texto || "").toLowerCase();
+  for (const { idBanco, keywords } of BANCO_KEYWORDS) {
+    if (keywords.some((k) => t.includes(k))) return idBanco;
+  }
+  return null;
+}
+
+// Le pide a Claude que lea la foto/PDF del comprobante y devuelva monto,
+// fecha y banco en JSON. Se usa para aplicar el recibo en Contabilium sin
+// que un humano tenga que mirar la imagen y elegir el banco a mano. Si la
+// IA no está segura o no puede leerla, devuelve null y el pago queda
+// pendiente de revisión manual (nunca se fuerza una aplicación dudosa).
+async function leerComprobanteConIA(imageUrl, anthropicApiKey) {
+  if (!anthropicApiKey) return null;
+  try {
+    const imgRes = await fetch(imageUrl);
+    if (!imgRes.ok) return null;
+    const contentType = imgRes.headers.get("content-type") || "image/jpeg";
+    const buffer = Buffer.from(await imgRes.arrayBuffer());
+    // Los PDF no son un "image/*" válido para el bloque de imagen del API —
+    // si el comprobante se subió como PDF, no se puede leer con este
+    // camino (queda pendiente de revisión manual, como antes).
+    if (!contentType.startsWith("image/")) return null;
+    const base64 = buffer.toString("base64");
+
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": anthropicApiKey,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 300,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "image", source: { type: "base64", media_type: contentType, data: base64 } },
+              {
+                type: "text",
+                text:
+                  "Esta es una captura de un comprobante de transferencia o depósito bancario argentino, hecho A FAVOR " +
+                  "de la empresa (nosotros somos quien RECIBE la plata, no quien la envía). Extraé el monto transferido, " +
+                  "la fecha, el banco/cuenta DE DESTINO — es decir, en qué banco cayó la plata que recibimos, no de " +
+                  "dónde salió — fijate en campos como 'Cuenta destino', 'Para', 'Destinatario', el banco asociado al " +
+                  "CBU/alias destino, o el nombre del banco/billetera receptora (Galicia, Santander Río, Supervielle o " +
+                  "Mercado Pago son las opciones más probables). OJO: si la captura es de la app/sitio de Mercado Pago " +
+                  "(tiene su logo arriba) pero el bloque 'Origen y destino' muestra que el destinatario tiene una cuenta " +
+                  "en OTRO banco (ej: 'Fepa Top Sas — Banco Supervielle — CBU 0270...'), el banco de destino real es ESE " +
+                  "banco (Supervielle en el ejemplo), no 'Mercado Pago' — el logo de la app es solo de quién envió el " +
+                  "pago, no de dónde cayó la plata. Sacá el banco de destino del texto del bloque destino, nunca del " +
+                  "logo/marca de la pantalla. Si el comprobante solo muestra el banco emisor/origen " +
+                  "y no hay forma de saber el destino, dejá el banco en null en vez de adivinar. También extraé el " +
+                  "número de referencia/operación/transacción si figura (a veces dice 'Nro de operación', 'Nro de " +
+                  "transacción', 'Referencia', 'Comprobante Nro', o un código alfanumérico largo cerca del monto). " +
+                  "Respondé ÚNICAMENTE con un JSON de una línea, sin texto adicional, con esta forma exacta: " +
+                  '{"monto": <número sin puntos ni comas, ej 305000>, "fecha": "YYYY-MM-DD" o null, ' +
+                  '"banco": "<nombre del banco/billetera DE DESTINO tal cual aparece>" o null, ' +
+                  '"referencia": "<número/código de operación tal cual aparece>" o null, ' +
+                  '"confianza": "alta"|"media"|"baja"}. ' +
+                  'Usá "confianza":"baja" si la imagen no es un comprobante bancario claro, no podés leer el monto con ' +
+                  'certeza, o no podés determinar el banco de destino con confianza.',
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    if (!r.ok) {
+      console.error("[pagosCC] Anthropic API error:", r.status, await r.text());
+      return null;
+    }
+    const body = await r.json();
+    const text = body?.content?.find((b) => b.type === "text")?.text || "";
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    return {
+      monto: Number(parsed.monto) || null,
+      fecha: parsed.fecha || null,
+      banco: parsed.banco || null,
+      referencia: parsed.referencia || null,
+      confianza: parsed.confianza || "baja",
+    };
+  } catch (err) {
+    console.error("[pagosCC] leerComprobanteConIA error:", err);
+    return null;
+  }
+}
+
+// Lee una foto de comprobante subida por el staff (desde el formulario de
+// recibo en Clientes 360) y devuelve monto/fecha/banco/referencia para
+// precargar el formulario — el staff siempre confirma/edita antes de
+// aplicar el recibo real, esto solo ahorra tipeo.
+exports.leerComprobantePagoAdmin = onRequest(
+  { cors: false, secrets: [ANTHROPIC_API_KEY], timeoutSeconds: 60 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+
+    try {
+      const { url } = req.body || {};
+      if (!url) return res.status(400).json({ error: "Falta la url de la imagen" });
+      const lectura = await leerComprobanteConIA(url, ANTHROPIC_API_KEY.value());
+      if (!lectura) return res.json({ ok: true, lectura: null });
+      const idBanco = lectura.banco ? idBancoDesdeTexto(lectura.banco) : null;
+      return res.json({ ok: true, lectura: { ...lectura, idBanco } });
+    } catch (err) {
+      console.error("[leerComprobantePagoAdmin] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
 function buscarCobranzaCoincidente(cobranzas, monto, fechaDeclarada) {
   const tolerancia = Math.max(500, Math.abs(monto) * 0.01);
   const fechaMs = new Date(fechaDeclarada).getTime();
@@ -3168,7 +5533,12 @@ function buscarCobranzaCoincidente(cobranzas, monto, fechaDeclarada) {
 }
 
 exports.reportarPagoCuentaCorriente = onRequest(
-  { cors: false },
+  {
+    cors: false,
+    invoker: "public",
+    secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, ANTHROPIC_API_KEY],
+    timeoutSeconds: 60,
+  },
   async (req, res) => {
     setCorsHeaders(req, res);
     if (req.method === "OPTIONS") return res.status(204).send("");
@@ -3194,15 +5564,17 @@ exports.reportarPagoCuentaCorriente = onRequest(
       const u = userSnap.data();
       if (!u.contabiliumId) return res.status(400).json({ error: "Tu cuenta todavía no está vinculada a Contabilium" });
 
+      const montoNum = Number(monto);
+
       const cobranzasSnap = await db.collection("cobranzas").where("idPersona", "==", u.contabiliumId).get();
       const cobranzas = cobranzasSnap.docs.map((d) => d.data());
-      const match = buscarCobranzaCoincidente(cobranzas, Number(monto), fecha);
+      const match = buscarCobranzaCoincidente(cobranzas, montoNum, fecha);
 
       const docData = {
         distributorUid: uid,
         distributorName: u.contabiliumDepositoNombre || u.name || "",
         contabiliumId: u.contabiliumId,
-        monto: Number(monto),
+        monto: montoNum,
         fecha,
         nota: nota || null,
         comprobanteUrl: url,
@@ -3211,9 +5583,88 @@ exports.reportarPagoCuentaCorriente = onRequest(
         matchedCobranzaImporte: match ? Number(match.importeReal ?? match.importeTotal ?? 0) : null,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       };
+
+      // Si no había ya una cobranza cargada a mano que coincida, probamos
+      // que la propia IA lea la foto del comprobante (banco, monto, fecha)
+      // y — si hay una única factura sin ningún pago previo cuyo saldo
+      // coincide exacto con el monto reportado — cargamos el recibo en
+      // Contabilium solos, sin pasar por revisión de un humano. Cualquier
+      // señal de duda (IA no segura, hay 0 o más de una factura candidata,
+      // banco no identificado) hace que quede "pendiente" como antes: nunca
+      // se fuerza una aplicación dudosa de plata real.
+      let aplicadoAutomaticamente = false;
+      if (!match) {
+        try {
+          const lectura = await leerComprobanteConIA(url, ANTHROPIC_API_KEY.value());
+          const idBancoDetectado = lectura?.banco ? idBancoDesdeTexto(lectura.banco) : null;
+          const montoCoincideConIA =
+            lectura?.monto != null && Math.abs(lectura.monto - montoNum) <= Math.max(500, montoNum * 0.01);
+
+          if (lectura?.confianza === "alta" && montoCoincideConIA && idBancoDetectado) {
+            const facturas = await getComprobantesByClientId(
+              CONTABILIUM_EMAIL.value(),
+              CONTABILIUM_API_KEY.value(),
+              u.contabiliumId,
+              { tipos: ["FCA", "NCA", "NDA"] }
+            );
+            // Condición conservadora: la factura tiene que estar 100% sin
+            // pagos previos (Saldo === Total) y ese saldo tiene que
+            // coincidir con el monto reportado — así nunca reemplazamos un
+            // recibo que ya tenía otras líneas cargadas (evita el bug de
+            // duplicar/pisar cobranzas existentes).
+            const candidatas = facturas.filter((f) => {
+              const saldo = parseArNumber(f.Saldo);
+              const total = parseArNumber(f.ImporteTotalNeto);
+              return saldo > 0 && Math.abs(saldo - total) < 1 && Math.abs(saldo - montoNum) <= 1;
+            });
+
+            if (candidatas.length === 1) {
+              const factura = candidatas[0];
+              const total = parseArNumber(factura.ImporteTotalNeto);
+              await cobrarComprobante(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value(), {
+                id: factura.Id,
+                importeTotalNeto: total,
+                saldo: 0,
+                pagos: [
+                  {
+                    FormaDePago: "Transferencia",
+                    IDBanco: idBancoDetectado,
+                    IDCaja: null,
+                    IDNotaCredito: null,
+                    Importe: montoNum,
+                    NroReferencia: "Auto (IA) — comprobante subido por el cliente",
+                    IDComprobanteAsociado: "",
+                  },
+                ],
+              });
+              try {
+                const hoy = new Date().toISOString().slice(0, 10);
+                await doContabiliumCobranzasSync(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value(), {
+                  fechaDesde: hoy,
+                  fechaHasta: hoy,
+                });
+              } catch (syncErr) {
+                console.error("[pagosCC] no se pudo re-sincronizar cobranzas del día:", syncErr);
+              }
+              aplicadoAutomaticamente = true;
+              docData.estado = "confirmado_auto";
+              docData.aplicadoAutomaticamenteConIA = true;
+              docData.facturaAplicada = factura.Numero || factura.Id;
+              docData.bancoDetectadoIA = lectura.banco;
+              docData.montoDetectadoIA = lectura.monto;
+            }
+          }
+        } catch (err) {
+          // Cualquier error acá (IA caída, Contabilium rechazó el recibo,
+          // etc.) nunca debe romper el reporte del cliente — sigue el flujo
+          // normal y queda pendiente de revisión manual.
+          console.error("[pagosCC] auto-aplicación con IA falló, queda pendiente:", err);
+        }
+      }
+
       const ref = await db.collection("pagosReportados").add(docData);
 
-      if (!match) {
+      if (!match && !aplicadoAutomaticamente) {
         await db.collection("notifications").add({
           type: "pago_cc_pendiente",
           distributorUid: uid,
@@ -3223,9 +5674,44 @@ exports.reportarPagoCuentaCorriente = onRequest(
           read: false,
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
+        enviarPushAAdmins({
+          title: "🧾 Comprobante para revisar",
+          body: `${docData.distributorName} reportó un pago de ${docData.monto} — necesita revisión manual`,
+          link: "/admin/ventas-reportadas?tab=comprobantes",
+        });
+      } else if (aplicadoAutomaticamente) {
+        // Igual se avisa al staff cuando la IA aplicó un recibo solo — es
+        // plata real, conviene que quede visible aunque no haga falta
+        // ninguna acción.
+        await db.collection("notifications").add({
+          type: "pago_cc_auto_aplicado",
+          distributorUid: uid,
+          distributorName: docData.distributorName,
+          pagoReportadoId: ref.id,
+          monto: docData.monto,
+          facturaAplicada: docData.facturaAplicada,
+          read: false,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        enviarPushAAdmins({
+          title: "✅ Pago aplicado automático",
+          body: `${docData.distributorName} — ${docData.monto} aplicado a la factura ${docData.facturaAplicada}`,
+          link: "/admin/ventas-reportadas?tab=comprobantes",
+        });
+        enviarPushAUsuario(uid, {
+          title: "✅ Tu pago fue confirmado",
+          body: `Registramos tu pago de ${docData.monto} contra la factura ${docData.facturaAplicada}.`,
+          link: "/mi-stock",
+        });
+      } else if (match) {
+        enviarPushAUsuario(uid, {
+          title: "✅ Tu pago fue confirmado",
+          body: `Encontramos tu pago de ${docData.monto} ya registrado en tu cuenta.`,
+          link: "/mi-stock",
+        });
       }
 
-      return res.json({ ok: true, id: ref.id, confirmadoAutomaticamente: !!match });
+      return res.json({ ok: true, id: ref.id, confirmadoAutomaticamente: !!match || aplicadoAutomaticamente });
     } catch (err) {
       console.error("[pagosCC] reportarPagoCuentaCorriente error:", err);
       return res.status(500).json({ error: String(err) });
@@ -3245,12 +5731,24 @@ exports.reviewPagoReportado = onRequest(
     try {
       const { id, aprobado, nota } = req.body || {};
       if (!id || typeof aprobado !== "boolean") return res.status(400).json({ error: "Faltan datos" });
-      await admin.firestore().doc(`pagosReportados/${id}`).update({
+      const pagoRef = admin.firestore().doc(`pagosReportados/${id}`);
+      await pagoRef.update({
         estado: aprobado ? "confirmado_manual" : "rechazado",
         revisadoPor: staffUid,
         revisadoAt: admin.firestore.FieldValue.serverTimestamp(),
         notaRevision: nota || null,
       });
+      const pagoSnap = await pagoRef.get();
+      const pagoData = pagoSnap.data();
+      if (pagoData?.distributorUid) {
+        enviarPushAUsuario(pagoData.distributorUid, {
+          title: aprobado ? "✅ Tu pago fue confirmado" : "❌ Tu comprobante fue rechazado",
+          body: aprobado
+            ? `Confirmamos tu pago de ${pagoData.monto}.`
+            : `Tu comprobante de ${pagoData.monto} fue rechazado${nota ? `: ${nota}` : ". Contactanos para más detalle."}`,
+          link: "/mi-stock",
+        });
+      }
       return res.json({ ok: true });
     } catch (err) {
       console.error("[pagosCC] reviewPagoReportado error:", err);
@@ -3696,6 +6194,9 @@ async function computeBusinessDashboard(db, email, apiKey) {
       id: f.Id,
       fecha: (f.FechaEmision || "").slice(0, 10),
       cliente: f.RazonSocial || "",
+      // Igual que en el remito: el ID real de Contabilium, para cruzar por
+      // número y no por el texto de la razón social.
+      idCliente: f.IdCliente ?? null,
       facturado: parseAr(f.ImporteTotalNeto),
       bicis: bicisFactura,
       facturadoBicis: facturadoBicisFactura,
@@ -3834,9 +6335,21 @@ async function importarRemitosDetalle(db, remitosNuevos) {
       id: r.idRemito,
       fecha: parseFechaDDMMYYYY(r.fecha),
       cliente: esInterno ? "FEPA TOP (interno)" : nombre,
+      // El ID real de Contabilium del destinatario — para poder cruzar
+      // remito↔factura↔cobranza por número, no por nombre de texto (que
+      // Contabilium a veces escribe distinto entre un lado y el otro,
+      // ej. "GRASSELLI" en la factura vs "GRASSELLI WALTER" en el remito).
+      idPersona: r.idPersona ?? null,
       bicis,
       esInterno,
       numero: r.numero,
+      // Los remitos FEPA→FEPA (movimientos internos entre depósitos
+      // propios) se cargaron durante mucho tiempo sin poner el depósito/
+      // distribuidor real en ningún campo estructurado — quedó anotado a
+      // mano en la observación (ej. "retira bicis julian... lleva a
+      // lavalle"). La guardamos para poder mostrarla en vez de un genérico
+      // "FEPA TOP (interno)" sin info.
+      observaciones: r.observaciones || null,
     };
     if (porIdExistente.has(fila.id)) actualizados++;
     else nuevos++;
@@ -3905,6 +6418,66 @@ exports.importarRemitos = onRequest(
     } catch (err) {
       console.error("[importarRemitos] error:", err);
       return res.status(500).json({ error: String(err) });
+    }
+  }
+);
+
+// Trae los remitos en vivo desde la web de Contabilium (paginando +
+// detalle de cada uno) y los procesa con la misma lógica que el import
+// manual — pensado para reemplazarlo en el uso normal del día a día. El
+// import manual (exports.importarRemitos) queda como respaldo por si esta
+// vía se cae (sesión vencida, cambios en el sitio, etc).
+exports.sincronizarRemitosDesdeWeb = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 540, memory: "512MiB" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { desde, hasta } = req.body || {};
+      const { listarRemitosCompletos } = require("./contabiliumWebAutomation");
+      const remitos = await listarRemitosCompletos({
+        db: admin.firestore(),
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+        fechaDesde: desde || "",
+        fechaHasta: hasta || "",
+      });
+      if (remitos.length === 0) {
+        return res.json({ nuevos: 0, actualizados: 0, total: 0, traidos: 0, aviso: "Contabilium no devolvió remitos para ese rango" });
+      }
+      const result = await importarRemitosDetalle(admin.firestore(), remitos);
+      return res.json({ ...result, traidos: remitos.length });
+    } catch (err) {
+      console.error("[sincronizarRemitosDesdeWeb] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+exports.syncRemitosDesdeWeb = onSchedule(
+  {
+    schedule: "every 2 hours",
+    secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD],
+    timeoutSeconds: 540,
+    memory: "512MiB",
+  },
+  async () => {
+    try {
+      const { listarRemitosCompletos } = require("./contabiliumWebAutomation");
+      const db = admin.firestore();
+      // Ventana amplia (4 meses) para no perder ediciones tardías de
+      // remitos viejos (ej. alguien completa la observación después), sin
+      // tener que traer la base histórica entera en cada corrida.
+      const desdeDate = new Date();
+      desdeDate.setMonth(desdeDate.getMonth() - 4);
+      const fechaDesde = desdeDate.toISOString().slice(0, 10);
+      const remitos = await listarRemitosCompletos({ db, email: CONTABILIUM_WEB_EMAIL.value(), password: CONTABILIUM_WEB_PASSWORD.value(), fechaDesde, fechaHasta: "" });
+      const result = await importarRemitosDetalle(db, remitos);
+      console.log("[syncRemitosDesdeWeb] ok:", JSON.stringify(result));
+    } catch (err) {
+      console.error("[syncRemitosDesdeWeb] error:", err);
     }
   }
 );
@@ -4179,16 +6752,44 @@ exports.adminDeleteUser = onRequest(
 const MIN_DEPOSITOS_ESPERADOS = 55;
 const SKU_REFERENCIA_DEPOSITOS = "200012";
 
-async function computeDepositosSync(email, apiKey) {
-  const depositos = await getDepositosViaStockBySKU(email, apiKey, SKU_REFERENCIA_DEPOSITOS);
+// Los 3 depósitos propios de FEPA — siempre son el código 1, 2 y 3 (en ese
+// orden). El resto (distribuidores/clientes) recibe 4, 5, 6... en el orden
+// en que se detectaron por primera vez, y ese código queda fijo para
+// siempre aunque se vuelva a correr la sincronización: un depósito nuevo
+// solo suma un número al final, nunca reordena a los que ya tenían uno.
+const FEPA_DEPOSITOS_ID = [135151, 133531, 131151]; // Lavalle, Depósito Cañuelas, CREDIFIN
 
-  if (depositos.length < MIN_DEPOSITOS_ESPERADOS) {
+async function computeDepositosSync(email, apiKey) {
+  const depositosNuevos = await getDepositosViaStockBySKU(email, apiKey, SKU_REFERENCIA_DEPOSITOS);
+
+  if (depositosNuevos.length < MIN_DEPOSITOS_ESPERADOS) {
     throw new Error(
-      `Solo se recibieron ${depositos.length} depósitos (se esperaban al menos ${MIN_DEPOSITOS_ESPERADOS}). No se actualizó la lista guardada, por seguridad.`
+      `Solo se recibieron ${depositosNuevos.length} depósitos (se esperaban al menos ${MIN_DEPOSITOS_ESPERADOS}). No se actualizó la lista guardada, por seguridad.`
     );
   }
 
-  await admin.firestore().doc("internalData/contabiliumDepositos").set({
+  const docRef = admin.firestore().doc("internalData/contabiliumDepositos");
+  const prevSnap = await docRef.get();
+  const previos = prevSnap.exists ? prevSnap.data().depositos || [] : [];
+  const codigoPorId = new Map(previos.filter((d) => d.codigo != null).map((d) => [d.id, d.codigo]));
+
+  FEPA_DEPOSITOS_ID.forEach((id, i) => codigoPorId.set(id, i + 1));
+
+  let siguienteCodigo = codigoPorId.size ? Math.max(...codigoPorId.values()) : 3;
+  const depositos = [...depositosNuevos]
+    .sort((a, b) => a.id - b.id)
+    .map((d) => {
+      let codigo = codigoPorId.get(d.id);
+      if (codigo == null) {
+        siguienteCodigo += 1;
+        codigo = siguienteCodigo;
+        codigoPorId.set(d.id, codigo);
+      }
+      return { ...d, codigo };
+    })
+    .sort((a, b) => a.codigo - b.codigo);
+
+  await docRef.set({
     depositos,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
@@ -4967,4 +7568,135 @@ exports.onUserDepositoLinked = onDocumentWritten(
     }
   }
 );
+
+// ─────────────────────────────────────────────────────────────
+// Open Galicia (Banco Galicia) — ambiente QA/Homologación. Consulta de
+// Saldos y Movimientos de Cuenta, vía autenticación JWT + Mutual SSL,
+// siguiendo la documentación oficial provista por el banco.
+// ─────────────────────────────────────────────────────────────
+
+const GALICIA_SECRETS = [
+  GALICIA_APP_ID,
+  GALICIA_APP_KEY,
+  GALICIA_ENTERPRISE_ID,
+  GALICIA_AUTH_PASSWORD,
+  GALICIA_QA_CERT_PEM,
+  GALICIA_QA_KEY_PEM,
+  GALICIA_QA_KEY_PASSPHRASE,
+];
+
+function galiciaMtlsCreds() {
+  return {
+    certPem: GALICIA_QA_CERT_PEM.value(),
+    keyPem: GALICIA_QA_KEY_PEM.value(),
+    keyPassphrase: GALICIA_QA_KEY_PASSPHRASE.value(),
+  };
+}
+
+async function authGaliciaQA() {
+  return getGaliciaTokenQA({
+    appId: GALICIA_APP_ID.value(),
+    appKey: GALICIA_APP_KEY.value(),
+    enterpriseId: GALICIA_ENTERPRISE_ID.value(),
+    authorizationPassword: GALICIA_AUTH_PASSWORD.value(),
+    ...galiciaMtlsCreds(),
+  });
+}
+
+// Saldos de todas las cuentas de la empresa en Galicia.
+exports.getGaliciaSaldos = onRequest({ cors: false, secrets: GALICIA_SECRETS, timeoutSeconds: 60 }, async (req, res) => {
+  setCorsHeaders(req, res);
+  if (req.method === "OPTIONS") return res.status(204).send("");
+  const staffUid = await requireStaff(req, res);
+  if (!staffUid) return;
+  try {
+    const { accessToken } = await authGaliciaQA();
+    const saldos = await getSaldosGaliciaQA({
+      appId: GALICIA_APP_ID.value(),
+      appKey: GALICIA_APP_KEY.value(),
+      accessToken,
+      ...galiciaMtlsCreds(),
+    });
+    return res.json(saldos);
+  } catch (err) {
+    console.error("[galicia] getGaliciaSaldos error:", err);
+    return res.status(500).json({ error: String(err) });
+  }
+});
+
+// Paso 1: pide el extracto de movimientos de una cuenta para un rango de
+// fechas. Devuelve un id — el extracto queda "PENDING" hasta que Galicia lo
+// procesa (corre cada ~30 min), después hay que consultar
+// descargarGaliciaMovimientos con ese mismo id.
+exports.solicitarGaliciaMovimientos = onRequest({ cors: false, secrets: GALICIA_SECRETS, timeoutSeconds: 60 }, async (req, res) => {
+  setCorsHeaders(req, res);
+  if (req.method === "OPTIONS") return res.status(204).send("");
+  if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+  const staffUid = await requireStaff(req, res);
+  if (!staffUid) return;
+  try {
+    const { accountNumber, startDate, endDate } = req.body || {};
+    if (!accountNumber || !startDate || !endDate) {
+      return res.status(400).json({ error: "accountNumber, startDate y endDate son requeridos" });
+    }
+    const { accessToken } = await authGaliciaQA();
+    const data = await solicitarExtractoGaliciaQA({
+      appId: GALICIA_APP_ID.value(),
+      appKey: GALICIA_APP_KEY.value(),
+      accessToken,
+      accountNumber,
+      startDate,
+      endDate,
+      ...galiciaMtlsCreds(),
+    });
+    return res.json(data);
+  } catch (err) {
+    console.error("[galicia] solicitarGaliciaMovimientos error:", err);
+    return res.status(500).json({ error: String(err) });
+  }
+});
+
+// Pasos 2 y 3: chequea si un extracto ya está PROCESSED y, si lo está, lo
+// descarga completo (siguiendo la paginación) y lo devuelve ya parseado
+// como array de movimientos. Si todavía está PENDING, devuelve status
+// "PENDING" sin descargar nada — hay que reintentar más tarde.
+exports.descargarGaliciaMovimientos = onRequest({ cors: false, secrets: GALICIA_SECRETS, timeoutSeconds: 120 }, async (req, res) => {
+  setCorsHeaders(req, res);
+  if (req.method === "OPTIONS") return res.status(204).send("");
+  if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+  const staffUid = await requireStaff(req, res);
+  if (!staffUid) return;
+  try {
+    const { extractoId } = req.body || {};
+    if (!extractoId) return res.status(400).json({ error: "extractoId requerido" });
+
+    const { accessToken } = await authGaliciaQA();
+    const appId = GALICIA_APP_ID.value();
+    const appKey = GALICIA_APP_KEY.value();
+    const mtls = galiciaMtlsCreds();
+
+    const extractos = await validarExtractosGaliciaQA({ appId, appKey, accessToken, ...mtls });
+    const extracto = extractos.find((e) => e.id === extractoId);
+    if (!extracto) return res.status(404).json({ error: "No se encontró ese extracto" });
+    if (extracto.status !== "PROCESSED") {
+      return res.json({ status: extracto.status, movimientos: null });
+    }
+
+    let allMovimientos = [];
+    let csvHeader = null;
+    // El primer pedido (sin query param) trae la primera página; si viene
+    // 206 (Partial Content) hay más — pero como este endpoint no admite
+    // pedir "página siguiente" con un parámetro documentado más allá del id
+    // base, solo consumimos la primera respuesta tal cual la documentación.
+    const { csv } = await descargarExtractoGaliciaQA({ appId, appKey, accessToken, extractoId, ...mtls });
+    const movimientos = parseCsvMovimientosGalicia(csv);
+    allMovimientos = allMovimientos.concat(movimientos);
+    csvHeader = csv.split("\n")[0] || null;
+
+    return res.json({ status: "PROCESSED", header: csvHeader, movimientos: allMovimientos });
+  } catch (err) {
+    console.error("[galicia] descargarGaliciaMovimientos error:", err);
+    return res.status(500).json({ error: String(err) });
+  }
+});
 

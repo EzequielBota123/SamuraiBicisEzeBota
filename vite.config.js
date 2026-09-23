@@ -7,7 +7,11 @@ export default defineConfig({
   plugins: [
     react(),
     VitePWA({
-      registerType: 'autoUpdate',
+      // 'prompt' en vez de 'autoUpdate': con autoUpdate, cada deploy nuevo
+      // recargaba la pestaña sola apenas el usuario volvía a ella (sin
+      // avisar, cortando lo que estuviera escribiendo) — ahora se le
+      // muestra un aviso y decide cuándo actualizar (ver UpdateToast).
+      registerType: 'prompt',
       includeAssets: ['favicon.svg', 'icons/apple-touch-icon.png'],
       manifest: {
         name: 'Samurai Bicis',

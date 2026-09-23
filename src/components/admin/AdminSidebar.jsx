@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { NavLink } from "react-router-dom";
 import { subscribeToOrderSyncStatus } from "../../services/contabilium";
+import { useAuth } from "../../auth/AuthContext";
+import { puedeVerCots } from "../../utils/permisosCots";
 
 function timeAgo(date) {
   if (!date) return "nunca";
@@ -21,13 +23,15 @@ const items = [
   { to: "/admin/clientes-360", label: "Clientes 360", icon: Clientes360Icon },
   { to: "/admin/vendedores", label: "Vendedores", icon: VendedoresIcon },
   { to: "/admin/crm", label: "CRM", icon: CrmIcon },
-  // Dinero: cobranzas y bancos
-  { to: "/admin/cobranzas", label: "Cobranzas", icon: CobranzasIcon },
+  // Dinero: bancos ("Cobranzas" se mudó a una solapa dentro de "Ventas
+  // reportadas", para no ocupar un ítem aparte acá)
   { to: "/admin/movimientos-bancarios", label: "Movimientos Bancarios", icon: MovimientosIcon },
   // Operación: stock, ventas, órdenes
   { to: "/admin/stock-consignado", label: "Stock consignado", icon: BoxIcon },
   { to: "/admin/ventas-reportadas", label: "Ventas reportadas", icon: ReceiptIcon },
   { to: "/admin/orders", label: "Órdenes", icon: ReceiptIcon },
+  { to: "/admin/cots", label: "COTs", icon: ReceiptIcon, restricted: true },
+  { to: "/admin/chofer", label: "Choferes", icon: BoxIcon },
   // Administración y catálogo
   { to: "/admin/users", label: "Usuarios", icon: UsersIcon },
   { to: "/admin/products", label: "Productos", icon: BoxIcon },
@@ -37,7 +41,9 @@ const items = [
 ];
 
 export default function AdminSidebar({ collapsed, onToggle, onNavigate }) {
+  const { user } = useAuth();
   const [syncStatus, setSyncStatus] = useState(null);
+  const visibleItems = items.filter((it) => !it.restricted || puedeVerCots(user?.uid));
 
   useEffect(() => {
     return subscribeToOrderSyncStatus(setSyncStatus);
@@ -85,7 +91,7 @@ export default function AdminSidebar({ collapsed, onToggle, onNavigate }) {
       </div>
 
       <nav className="mt-6 space-y-2">
-        {items.map((it) => (
+        {visibleItems.map((it) => (
           <Item key={it.to} {...it} />
         ))}
       </nav>

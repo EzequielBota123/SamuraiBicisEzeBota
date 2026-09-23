@@ -11,6 +11,7 @@ import {
 } from "../../services/notifications";
 import { resolveSaleRequest } from "../../services/comprobantes";
 import ThemeToggle from "../ui/ThemeToggle";
+import { requestNotificationPermission, showDesktopNotification } from "../../utils/desktopNotify";
 
 function money(n) {
   return Number(n || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS" });
@@ -168,9 +169,27 @@ export default function AdminTopbar({ onToggleSidebar, mobileOpen }) {
     setCollapsedNameGroups((prev) => ({ ...prev, [key]: !prev[key] }));
   }
 
+  const seenNotifIdsRef = useRef(null); // null = todavía no llegó la primera tanda
   useEffect(() => {
+    requestNotificationPermission();
     const unsub = subscribeNotifications(
-      (items) => setNotifications(items),
+      (items) => {
+        const seen = seenNotifIdsRef.current;
+        if (seen) {
+          const nuevas = items.filter((n) => !n.read && !seen.has(n.id));
+          for (const n of nuevas) {
+            const cantidad = n.type === "sale_reported" ? saleItemsCount(n) : n.itemsCount;
+            showDesktopNotification(
+              n.distributorName || n.customerName || "Samurai",
+              n.type === "sale_reported"
+                ? `Reportó ${cantidad} unidad(es)`
+                : `Nueva notificación${n.total ? ` — ${money(n.total)}` : ""}`
+            );
+          }
+        }
+        seenNotifIdsRef.current = new Set(items.map((n) => n.id));
+        setNotifications(items);
+      },
       (err) => console.error("notifications:", err)
     );
     return unsub;
@@ -371,7 +390,13 @@ export default function AdminTopbar({ onToggleSidebar, mobileOpen }) {
             </button>
 
             {open && (
-              <div className="absolute right-0 mt-2 w-[360px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-[0_40px_80px_-40px_rgba(15,23,42,0.4)] dark:border-neutral-700 dark:bg-neutral-900">
+              // En mobile va "fixed" con márgenes fijos al viewport — con
+              // "absolute right-0" el panel podía arrancar fuera de la
+              // pantalla por la izquierda si la campana no estaba pegada al
+              // borde derecho (texto cortado, reportado en captura real).
+              // De sm en adelante vuelve al comportamiento normal, anclado
+              // a la campana.
+              <div className="fixed inset-x-3 top-16 z-50 max-h-[calc(100vh-5rem)] overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-[0_40px_80px_-40px_rgba(15,23,42,0.4)] dark:border-neutral-700 dark:bg-neutral-900 sm:absolute sm:inset-x-auto sm:top-auto sm:right-0 sm:left-auto sm:mt-2 sm:max-h-none sm:w-[360px] sm:max-w-[calc(100vw-2rem)]">
                 <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3 dark:border-neutral-800">
                   <p className="text-sm font-semibold text-slate-900 dark:text-white">
                     Notificaciones {unread > 0 && <span className="text-rose-500">({unread})</span>}

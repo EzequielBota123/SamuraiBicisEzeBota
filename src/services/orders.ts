@@ -93,8 +93,14 @@ function toOrderRecord(id: string, snap: DocumentSnapshot<DocumentData>): OrderR
 export async function createOrder({
   customer, items,
 }: { customer: Customer; items: OrderItem[]; }): Promise<string> {
-  // Esperar resolución de sesión (puede ser null si huésped)
   const user = auth.currentUser ?? await authReady();
+  // Pedir sin cuenta genera confusión (pedidos de gente sin vínculo real con
+  // Samurai, ej. el caso "Saul") — solo un distribuidor logueado puede
+  // pedir; a cualquier otro se lo redirige a "Quiero ser distribuidor"
+  // antes de siquiera llegar acá (ver OrderModal en CatalogPage). Esto es
+  // el resguardo real del lado del cliente: aunque alguien saltee la
+  // pantalla, este chequeo (más la regla de Firestore) lo frena igual.
+  if (!user) throw new Error("Necesitás una cuenta de distribuidor para hacer un pedido.");
 
   const cleanItems = items.map(it => ({
     id: String(it.id),
@@ -109,12 +115,12 @@ export async function createOrder({
   const now = serverTimestamp();
 
   const payload: any = {
-    status: user ? "pendiente" : "solicitud",
+    status: "pendiente",
     currency: "ARS",
     createdAt: now,
     updatedAt: now,
     customer: {
-      uid: user?.uid || null,
+      uid: user.uid,
       name: String(customer.name || "").trim(),
       email: customer.email || null,
       phone: customer.phone || null,
@@ -122,8 +128,7 @@ export async function createOrder({
     },
     customerNameLower: String(customer.name || "").trim().toLowerCase(),
     items: cleanItems,
-    // Si está logueado envío el total; huéspedes mandan 0 (las reglas lo exigen)
-    total: user ? sum(cleanItems) : 0,
+    total: sum(cleanItems),
   };
 
   const orderId = await runTransaction(db, async (tx) => {

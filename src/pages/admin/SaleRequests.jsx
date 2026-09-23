@@ -2,6 +2,7 @@ import { useEffect, useState, useMemo, useRef } from "react";
 import { useLocation } from "react-router-dom";
 import { listSaleRequests, resolveSaleRequest, deleteSaleRequest, reviewComprobantePago, emitirFacturaVenta } from "../../services/comprobantes";
 import { LoadingOverlay } from "../../components/ui/LoadingIndicators";
+import Cobranzas from "./Cobranzas";
 
 const money = (n) =>
   Number(n || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 });
@@ -36,9 +37,26 @@ export default function SaleRequests() {
   const location = useLocation();
   const [distribuidorDestacado, setDistribuidorDestacado] = useState(null);
   const groupRefs = useRef({});
+  // Nombre de distribuidor con el que abrir la solapa "Cobranzas" — así se
+  // puede ir directo de una venta reportada a la cuenta corriente de ESE
+  // cliente sin salir a Clientes 360 y volver a buscarlo.
+  const [cobranzasSearch, setCobranzasSearch] = useState("");
+  // Distinto de lo anterior: "Ver cobranzas" de un grupo puntual abre esto
+  // como un pantallazo flotante encima de la lista actual, sin cambiar de
+  // solapa — así no perdés dónde estabas parado en "Ventas reportadas".
+  const [cobranzasModalFor, setCobranzasModalFor] = useState(null);
+  // Vista alternativa al agrupado por distribuidor: todas las ventas
+  // reportadas en una sola lista, ordenadas por fecha (más reciente
+  // arriba de todo) — para cuando lo que importa es ver qué entró último,
+  // sin importar de qué distribuidor es.
+  const [ordenPorFecha, setOrdenPorFecha] = useState(false);
 
   function toggleGroup(name) {
     setCollapsed((prev) => ({ ...prev, [name]: !prev[name] }));
+  }
+
+  function verCobranzasDe(distributorName) {
+    setCobranzasModalFor(distributorName);
   }
 
   // Soporta llegar acá desde una notificación (?tab=pendiente|facturado&distribuidor=X):
@@ -80,6 +98,7 @@ export default function SaleRequests() {
   );
 
   const filtered = useMemo(() => {
+    if (tab === "cobranzas") return [];
     if (tab === "comprobantes") return comprobantesPendientes;
     return (items || []).filter((it) => it.status === tab);
   }, [items, tab, comprobantesPendientes]);
@@ -93,10 +112,19 @@ export default function SaleRequests() {
       byDistributor.get(key).push(it);
     }
     return Array.from(byDistributor.entries()).map(([distributorName, list]) => {
-      const subtotal = list.reduce((acc, it) => acc + Number(it.unitPrice || 0) * Number(it.quantity || 0), 0);
-      return { distributorName, depositoNombre: list[0]?.depositoNombre, items: list, subtotal };
-    }).sort((a, b) => b.items.length - a.items.length);
+      // Más recientes primero, tanto adentro de cada grupo como para decidir
+      // qué grupo va arriba de todo (por la venta más nueva que tenga).
+      const ordenados = list.slice().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      const subtotal = ordenados.reduce((acc, it) => acc + Number(it.unitPrice || 0) * Number(it.quantity || 0), 0);
+      const masReciente = ordenados[0]?.createdAt || null;
+      return { distributorName, depositoNombre: ordenados[0]?.depositoNombre, items: ordenados, subtotal, masReciente };
+    }).sort((a, b) => new Date(b.masReciente) - new Date(a.masReciente));
   }, [filtered]);
+
+  const flatOrdenados = useMemo(
+    () => filtered.slice().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)),
+    [filtered]
+  );
 
   const totalPendiente = useMemo(() => {
     return (items || [])
@@ -202,12 +230,14 @@ export default function SaleRequests() {
         </p>
       </div>
 
+      {tab !== "cobranzas" && (
       <div className="min-w-0 overflow-hidden rounded-3xl border border-amber-200 bg-amber-50 p-5 dark:border-amber-500/30 dark:bg-amber-500/10 sm:p-6">
         <p className="text-xs font-semibold uppercase tracking-wider text-amber-700 dark:text-amber-400">Pendiente de facturar</p>
         <p className="mt-1 truncate text-2xl font-black text-amber-700 dark:text-amber-400 sm:text-4xl" title={money(totalPendiente)}>
           {money(totalPendiente)}
         </p>
       </div>
+      )}
 
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex gap-2">
@@ -240,7 +270,28 @@ export default function SaleRequests() {
               </span>
             )}
           </button>
+          <button
+            onClick={() => setTab("cobranzas")}
+            className={`rounded-2xl px-4 py-2 text-sm font-semibold transition ${
+              tab === "cobranzas" ? "bg-slate-900 text-white dark:bg-white dark:text-neutral-900" : "border border-slate-200 text-slate-600 hover:bg-slate-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+            }`}
+          >
+            💰 Cobranzas
+          </button>
         </div>
+        {tab !== "cobranzas" && (
+          <button
+            onClick={() => setOrdenPorFecha((v) => !v)}
+            title="Todas las ventas reportadas en una sola lista, sin agrupar por distribuidor"
+            className={`inline-flex items-center justify-center gap-1.5 rounded-2xl border px-4 py-2 text-xs font-semibold transition ${
+              ordenPorFecha
+                ? "border-sky-300 bg-sky-50 text-sky-700 dark:border-sky-500/40 dark:bg-sky-500/10 dark:text-sky-400"
+                : "border-slate-200 text-slate-600 hover:bg-slate-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+            }`}
+          >
+            📅 {ordenPorFecha ? "Viendo por fecha" : "Ver por fecha"}
+          </button>
+        )}
         <button
           onClick={handleDeleteAll}
           disabled={filtered.length === 0}
@@ -252,6 +303,57 @@ export default function SaleRequests() {
         </button>
       </div>
 
+      {tab === "cobranzas" && <Cobranzas initialSearch={cobranzasSearch} />}
+
+      {tab !== "cobranzas" && ordenPorFecha && (
+        <div className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm dark:border-neutral-800 dark:bg-neutral-900 dark:shadow-none">
+          {loading && (
+            <LoadingOverlay label="Cargando…" className="rounded-[inherit] border border-slate-200 bg-white text-slate-600" />
+          )}
+          {error && <div className="p-6 text-sm text-rose-600">{error}</div>}
+          {!loading && !error && flatOrdenados.length === 0 && (
+            <div className="p-10 text-center text-sm text-slate-500 dark:text-neutral-400">No hay ventas para mostrar.</div>
+          )}
+          {!loading && !error && flatOrdenados.length > 0 && (
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-slate-100 text-sm text-slate-600 dark:divide-neutral-800 dark:text-neutral-300">
+                <tbody className="divide-y divide-slate-100 dark:divide-neutral-800">
+                  {flatOrdenados.map((it) => (
+                    <tr key={it.id}>
+                      <td className="w-40 px-4 py-4 text-slate-500 dark:text-neutral-400 sm:px-6">{formatDate(it.createdAt)}</td>
+                      <td className="px-4 py-4">
+                        <button
+                          onClick={() => verCobranzasDe(it.distributorName)}
+                          className="text-left font-semibold text-sky-700 hover:underline dark:text-sky-400"
+                        >
+                          {it.distributorName || "Sin nombre"}
+                        </button>
+                        <p className="text-xs text-slate-400 dark:text-neutral-500">{it.name} · SKU: {it.sku}</p>
+                      </td>
+                      <td className="px-4 py-4 text-right text-xs text-slate-500 dark:text-neutral-400">{it.quantity} u.</td>
+                      <td className="px-4 py-4 text-right font-semibold text-slate-900 dark:text-white">
+                        {money(Number(it.unitPrice || 0) * Number(it.quantity || 0))}
+                      </td>
+                      <td className="px-4 py-4 text-right">
+                        <button
+                          disabled={deletingId === it.id}
+                          onClick={() => handleDelete(it.id)}
+                          title="Eliminar"
+                          className="rounded-xl border border-rose-200 bg-white p-1.5 text-rose-500 transition hover:border-rose-300 hover:bg-rose-50 disabled:opacity-60 dark:border-rose-500/30 dark:bg-neutral-900 dark:hover:bg-rose-500/10"
+                        >
+                          <TrashIcon className="h-3.5 w-3.5" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab !== "cobranzas" && !ordenPorFecha && (
       <div className="relative overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm dark:border-neutral-800 dark:bg-neutral-900 dark:shadow-none">
         {loading && (
           <LoadingOverlay label="Cargando…" className="rounded-[inherit] border border-slate-200 bg-white text-slate-600" />
@@ -311,6 +413,13 @@ export default function SaleRequests() {
                         {emittingGroup === group.distributorName ? "Emitiendo…" : "🧾 Emitir factura"}
                       </button>
                     )}
+                    <button
+                      onClick={() => verCobranzasDe(group.distributorName)}
+                      title={`Ver cobranzas de ${group.distributorName}`}
+                      className="shrink-0 rounded-2xl border border-sky-200 bg-sky-50 px-3 py-1.5 text-xs font-semibold text-sky-700 transition hover:bg-sky-100 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-400 dark:hover:bg-sky-500/20"
+                    >
+                      💰 Ver cobranzas
+                    </button>
                     <button
                       onClick={() => handleDeleteGroup(group)}
                       title={`Eliminar todo de ${group.distributorName}`}
@@ -476,6 +585,27 @@ export default function SaleRequests() {
           </div>
         )}
       </div>
+      )}
+
+      {cobranzasModalFor && (
+        <div
+          className="fixed inset-0 z-[9200] flex items-start justify-center overflow-y-auto bg-black/60 p-4 sm:items-center"
+          onClick={() => setCobranzasModalFor(null)}
+        >
+          <div
+            className="my-6 w-full max-w-5xl rounded-3xl bg-white p-5 shadow-2xl dark:bg-neutral-900"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-base font-bold text-slate-900 dark:text-white">💰 Cobranzas de {cobranzasModalFor}</h3>
+              <button onClick={() => setCobranzasModalFor(null)} className="text-slate-400 hover:text-slate-600 dark:text-neutral-500">
+                ✕
+              </button>
+            </div>
+            <Cobranzas initialSearch={cobranzasModalFor} />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

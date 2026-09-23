@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 
 const WORD = "SAMURAI";
 
-// Timeline (ms):
+// Timeline (ms), relativa al momento en que arranca (el tap inicial, no el
+// mount del componente):
 // 0     -> logo/aura empiezan a aparecer, arranca sonido de bici
 // 150   -> ícono aparece
 // 1500  -> letras "SAMURAI" arrancan a aparecer (una por una)
@@ -15,70 +16,75 @@ const CUT_AT = 4000;
 const FADE_OUT_AT = CUT_AT + 650;
 const UNMOUNT_AT = FADE_OUT_AT + 900;
 
+// Los navegadores MÓVILES solo dejan sonar audio con volumen si el .play()
+// se dispara DENTRO del mismo gesto sincrónico de un tap real — un tap que
+// abre la app (ícono, link) no cuenta, porque ocurre antes de que esta
+// página exista. En desktop esto no aplica (autoplay con sonido ya funciona
+// bien), así que ahí la intro sigue arrancando sola, como siempre — el "tocá
+// para entrar" solo aparece en dispositivos táctiles.
+function isTouchDevice() {
+  if (typeof window === "undefined") return false;
+  return window.matchMedia?.("(hover: none) and (pointer: coarse)").matches ?? false;
+}
+
 export default function IntroSplash() {
+  const [needsTap] = useState(isTouchDevice);
+  const [started, setStarted] = useState(() => !isTouchDevice());
   const [phase, setPhase] = useState("in"); // in -> out -> done
   const [mounted, setMounted] = useState(true);
   const [cutting, setCutting] = useState(false);
+  const [ripple, setRipple] = useState(null); // { x, y, id } — feedback visual del tap
   const bikeAudioRef = useRef(null);
   const swordAudioRef = useRef(null);
-  const bikePlayedRef = useRef(false);
-  const swordDueRef = useRef(false);
-  const swordPlayedRef = useRef(false);
+
+  function handleStart(e) {
+    if (started) return;
+    // Onda expansiva desde el punto exacto del tap, para que se sienta que
+    // "pasó algo" en el instante del toque (se autolimpia con onAnimationEnd).
+    const rect = e.currentTarget.getBoundingClientRect();
+    const point = e.touches?.[0] || e.changedTouches?.[0] || e;
+    setRipple({
+      x: (point.clientX ?? rect.width / 2) - rect.left,
+      y: (point.clientY ?? rect.height / 2) - rect.top,
+      id: Date.now(),
+    });
+    // Este .play() va DENTRO del handler del tap a propósito — es lo único
+    // que hace que el navegador móvil lo permita. El de la espada, más abajo,
+    // se dispara después vía setTimeout: como ya hubo un play() exitoso
+    // originado en un gesto real en esta misma página, el navegador sigue
+    // permitiendo reproducir audio el resto de la sesión sin pedir un nuevo
+    // gesto por cada sonido.
+    bikeAudioRef.current?.play().catch(() => {});
+    setStarted(true);
+  }
 
   useEffect(() => {
+    if (!started) return;
     document.body.style.overflow = "hidden";
 
-    // Los navegadores móviles bloquean el audio con sonido hasta que hay un
-    // gesto del usuario (a veces autoplay "cuela" igual según el motor y el
-    // engagement previo con el sitio — por eso a veces suena y a veces no).
-    // Como red de seguridad: si el intento automático falla, en cuanto el
-    // usuario toque/haga click en cualquier lugar (algo casi seguro en los
-    // primeros segundos) disparamos el sonido que quedó pendiente.
-    function unlockPending() {
-      if (!bikePlayedRef.current) {
-        bikeAudioRef.current
-          ?.play()
-          .then(() => { bikePlayedRef.current = true; })
-          .catch(() => {});
-      }
-      if (swordDueRef.current && !swordPlayedRef.current) {
-        swordAudioRef.current
-          ?.play()
-          .then(() => { swordPlayedRef.current = true; })
-          .catch(() => {});
-      }
+    // Desktop: arranca solo, sin tap — acá SÍ hace falta disparar el sonido
+    // de la bici (en el flujo con tap, handleStart ya lo hizo).
+    if (!needsTap) {
+      bikeAudioRef.current?.play().catch(() => {});
     }
-    const unlockEvents = ["pointerdown", "touchstart", "click", "keydown"];
-    unlockEvents.forEach((ev) => document.addEventListener(ev, unlockPending, { passive: true }));
-
-    bikeAudioRef.current
-      ?.play()
-      .then(() => { bikePlayedRef.current = true; })
-      .catch(() => {});
 
     const cutTimer = setTimeout(() => {
       setCutting(true);
-      swordDueRef.current = true;
-      swordAudioRef.current
-        ?.play()
-        .then(() => { swordPlayedRef.current = true; })
-        .catch(() => {});
+      swordAudioRef.current?.play().catch(() => {});
     }, CUT_AT);
     const outTimer = setTimeout(() => setPhase("out"), FADE_OUT_AT);
     const doneTimer = setTimeout(() => {
       setMounted(false);
       document.body.style.overflow = "";
-      unlockEvents.forEach((ev) => document.removeEventListener(ev, unlockPending));
     }, UNMOUNT_AT);
 
     return () => {
-      unlockEvents.forEach((ev) => document.removeEventListener(ev, unlockPending));
       clearTimeout(cutTimer);
       clearTimeout(outTimer);
       clearTimeout(doneTimer);
       document.body.style.overflow = "";
     };
-  }, []);
+  }, [started, needsTap]);
 
   if (!mounted) return null;
 
@@ -140,100 +146,130 @@ export default function IntroSplash() {
 
   return (
     <div
+      onClick={handleStart}
       className={`fixed inset-0 z-[9999] flex h-[100dvh] w-[100dvw] flex-col items-center justify-center overflow-hidden bg-black px-6 transition-opacity duration-[900ms] ease-in-out ${
         phase === "out" ? "pointer-events-none opacity-0" : "opacity-100"
-      }`}
+      } ${started ? "" : "cursor-pointer"}`}
     >
       <audio ref={bikeAudioRef} src="/audio/bici.mp3" preload="auto" />
       <audio ref={swordAudioRef} src="/audio/espada.mp3" preload="auto" />
 
-      <div className="relative flex flex-col items-center">
-        {backgroundEffects}
+      {ripple && (
+        <span
+          key={ripple.id}
+          onAnimationEnd={() => setRipple(null)}
+          className="pointer-events-none absolute z-30 rounded-full bg-white/40"
+          style={{
+            left: ripple.x,
+            top: ripple.y,
+            width: 14,
+            height: 14,
+            transform: "translate(-50%, -50%)",
+            animation: "intro-tap-ripple 550ms ease-out forwards",
+          }}
+        />
+      )}
 
-        {/* Contenido original: visible hasta el momento del corte */}
-        <div
-          className="relative flex flex-col items-center"
-          style={{ opacity: cutting ? 0 : 1 }}
-        >
-          {foregroundContent}
+      {!started ? (
+        // Estado de espera: logo quieto + invitación a tocar. Recién con
+        // este tap arranca todo el timeline de animación + sonido juntos.
+        // active:scale-95 da feedback táctil inmediato apenas apoyás el dedo,
+        // antes de que se dispare el click (que recién pasa al soltar).
+        <div className="flex scale-100 flex-col items-center gap-6 transition-transform duration-150 active:scale-95">
+          <img src="/img/samurai-favicon-round.png" alt="Samurai" className="h-20 w-20 sm:h-24 sm:w-24" />
+          <p
+            className="text-sm font-semibold tracking-[0.15em] text-white/80"
+            style={{ animation: "intro-tap-hint 1.6s ease-in-out infinite" }}
+          >
+            TOCÁ PARA ENTRAR
+          </p>
         </div>
+      ) : (
+        <div className="relative flex flex-col items-center">
+          {backgroundEffects}
 
-        {cutting && (
-          <>
-            {/* Katana que atraviesa el logo en diagonal */}
-            <div
-              className="pointer-events-none absolute inset-[-45%] z-20 flex items-center justify-center"
-              style={{ transform: "rotate(-18deg)" }}
-            >
+          {/* Contenido original: visible hasta el momento del corte */}
+          <div className="relative flex flex-col items-center" style={{ opacity: cutting ? 0 : 1 }}>
+            {foregroundContent}
+          </div>
+
+          {cutting && (
+            <>
+              {/* Katana que atraviesa el logo en diagonal */}
               <div
-                className="relative"
-                style={{ width: "260%", animation: "intro-katana-move 480ms cubic-bezier(0.4,0,0.2,1) forwards" }}
+                className="pointer-events-none absolute inset-[-45%] z-20 flex items-center justify-center"
+                style={{ transform: "rotate(-18deg)" }}
               >
-                {/* resplandor detrás de la hoja */}
-                <svg
-                  viewBox="0 0 600 60"
-                  className="absolute left-0 top-1/2 h-12 w-full -translate-y-1/2"
-                  style={{ filter: "blur(6px)", opacity: 0.8 }}
+                <div
+                  className="relative"
+                  style={{ width: "260%", animation: "intro-katana-move 480ms cubic-bezier(0.4,0,0.2,1) forwards" }}
                 >
-                  <polygon points="0,30 430,10 470,30 430,50" fill="#fff" />
-                </svg>
-                {/* hoja */}
-                <svg viewBox="0 0 600 60" className="relative h-10 w-full" style={{ overflow: "visible" }}>
-                  <defs>
-                    <linearGradient id="bladeSteel" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="#f8fafc" />
-                      <stop offset="42%" stopColor="#e2e8f0" />
-                      <stop offset="50%" stopColor="#ffffff" />
-                      <stop offset="58%" stopColor="#cbd5e1" />
-                      <stop offset="100%" stopColor="#94a3b8" />
-                    </linearGradient>
-                  </defs>
-                  {/* hoja curva tipo katana, punta a la izquierda */}
-                  <polygon
-                    points="0,30 420,12 452,22 452,38 420,48"
-                    fill="url(#bladeSteel)"
-                    stroke="#f1f5f9"
-                    strokeWidth="0.8"
-                  />
-                  {/* línea de brillo */}
-                  <polyline points="10,29 415,17" stroke="#ffffff" strokeWidth="1" opacity="0.9" />
-                  {/* tsuba (guarda) */}
-                  <ellipse cx="459" cy="30" rx="7" ry="15" fill="#a16207" stroke="#facc15" strokeWidth="1" />
-                  {/* empuñadura */}
-                  <rect x="466" y="22" width="70" height="16" rx="4" fill="#1c1917" />
-                  {[478, 490, 502, 514, 526].map((x) => (
-                    <line key={x} x1={x} y1="22" x2={x + 8} y2="38" stroke="#57534e" strokeWidth="1.5" />
-                  ))}
-                  {/* pomo */}
-                  <circle cx="540" cy="30" r="7" fill="#a16207" />
-                </svg>
+                  {/* resplandor detrás de la hoja */}
+                  <svg
+                    viewBox="0 0 600 60"
+                    className="absolute left-0 top-1/2 h-12 w-full -translate-y-1/2"
+                    style={{ filter: "blur(6px)", opacity: 0.8 }}
+                  >
+                    <polygon points="0,30 430,10 470,30 430,50" fill="#fff" />
+                  </svg>
+                  {/* hoja */}
+                  <svg viewBox="0 0 600 60" className="relative h-10 w-full" style={{ overflow: "visible" }}>
+                    <defs>
+                      <linearGradient id="bladeSteel" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor="#f8fafc" />
+                        <stop offset="42%" stopColor="#e2e8f0" />
+                        <stop offset="50%" stopColor="#ffffff" />
+                        <stop offset="58%" stopColor="#cbd5e1" />
+                        <stop offset="100%" stopColor="#94a3b8" />
+                      </linearGradient>
+                    </defs>
+                    {/* hoja curva tipo katana, punta a la izquierda */}
+                    <polygon
+                      points="0,30 420,12 452,22 452,38 420,48"
+                      fill="url(#bladeSteel)"
+                      stroke="#f1f5f9"
+                      strokeWidth="0.8"
+                    />
+                    {/* línea de brillo */}
+                    <polyline points="10,29 415,17" stroke="#ffffff" strokeWidth="1" opacity="0.9" />
+                    {/* tsuba (guarda) */}
+                    <ellipse cx="459" cy="30" rx="7" ry="15" fill="#a16207" stroke="#facc15" strokeWidth="1" />
+                    {/* empuñadura */}
+                    <rect x="466" y="22" width="70" height="16" rx="4" fill="#1c1917" />
+                    {[478, 490, 502, 514, 526].map((x) => (
+                      <line key={x} x1={x} y1="22" x2={x + 8} y2="38" stroke="#57534e" strokeWidth="1.5" />
+                    ))}
+                    {/* pomo */}
+                    <circle cx="540" cy="30" r="7" fill="#a16207" />
+                  </svg>
+                </div>
               </div>
-            </div>
 
-            {/* Mitad superior-izquierda */}
-            <div
-              className="absolute inset-0 flex flex-col items-center"
-              style={{
-                clipPath: "polygon(0 0, 100% 0, 0 100%)",
-                animation: "intro-half-tl 900ms cubic-bezier(0.33,1,0.68,1) 60ms forwards",
-              }}
-            >
-              {foregroundContent}
-            </div>
+              {/* Mitad superior-izquierda */}
+              <div
+                className="absolute inset-0 flex flex-col items-center"
+                style={{
+                  clipPath: "polygon(0 0, 100% 0, 0 100%)",
+                  animation: "intro-half-tl 900ms cubic-bezier(0.33,1,0.68,1) 60ms forwards",
+                }}
+              >
+                {foregroundContent}
+              </div>
 
-            {/* Mitad inferior-derecha */}
-            <div
-              className="absolute inset-0 flex flex-col items-center"
-              style={{
-                clipPath: "polygon(100% 0, 100% 100%, 0 100%)",
-                animation: "intro-half-br 900ms cubic-bezier(0.33,1,0.68,1) 60ms forwards",
-              }}
-            >
-              {foregroundContent}
-            </div>
-          </>
-        )}
-      </div>
+              {/* Mitad inferior-derecha */}
+              <div
+                className="absolute inset-0 flex flex-col items-center"
+                style={{
+                  clipPath: "polygon(100% 0, 100% 100%, 0 100%)",
+                  animation: "intro-half-br 900ms cubic-bezier(0.33,1,0.68,1) 60ms forwards",
+                }}
+              >
+                {foregroundContent}
+              </div>
+            </>
+          )}
+        </div>
+      )}
 
       <style>{`
         @keyframes intro-icon {
@@ -251,6 +287,14 @@ export default function IntroSplash() {
         @keyframes intro-aura-pulse {
           0%, 100% { opacity: 0.35; transform: scale(1); }
           50% { opacity: 0.7; transform: scale(1.25); }
+        }
+        @keyframes intro-tap-hint {
+          0%, 100% { opacity: 0.5; }
+          50% { opacity: 1; }
+        }
+        @keyframes intro-tap-ripple {
+          0% { transform: translate(-50%, -50%) scale(0); opacity: 0.6; }
+          100% { transform: translate(-50%, -50%) scale(22); opacity: 0; }
         }
         @keyframes intro-katana-move {
           0% { transform: translateX(72%); opacity: 0; }

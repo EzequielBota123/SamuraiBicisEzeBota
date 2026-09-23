@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useLocation } from "react-router-dom";
 import * as XLSX from "xlsx";
-import { addDoc, arrayUnion, collection, doc, getDocs, limit, onSnapshot, orderBy, query, serverTimestamp, Timestamp, updateDoc, where } from "firebase/firestore";
+import { addDoc, arrayUnion, collection, doc, getDocs, increment, limit, onSnapshot, orderBy, query, serverTimestamp, Timestamp, updateDoc, where } from "firebase/firestore";
 import { reviewPagoReportado } from "../../services/comprobantes";
 import { puedeEditarNotas as puedeEditarNotasCheck } from "../../utils/permisosNotas";
 import { subirImagenesNota } from "../../utils/notaImagenes";
@@ -13,9 +13,26 @@ import { subscribeCobranzas } from "../../services/cobranzas";
 import { nombreBanco, listaBancos } from "../../services/bancos";
 import { listAuditsByDeposito, getAuditProgramStart, nextAuditDate, isAuditOverdue, isAuditDueSoon, contarVistas } from "../../services/stockAudits";
 import AuditVideoPlayer from "../../components/stock/AuditVideoPlayer";
-import { adminGetClientComprobantes, adminGetClientPhone, adminGetComprobanteDetail, getDepositoStockAdmin, adminLinkClientesByCuit, emitirFacturaManual, cobrarComprobante, verificarCondicionAfip, subscribeClientesReportDetail, adminAsignarVendedor } from "../../services/comprobantes";
+import { adminGetClientComprobantes, adminGetClientPhone, adminActualizarTelefonosCliente, adminGetComprobanteDetail, getDepositoStockAdmin, adminLinkClientesByCuit, emitirFacturaManual, cobrarComprobante, verificarCondicionAfip, subscribeClientesReportDetail, adminAsignarVendedor, searchContabiliumClientes, leerComprobantePagoAdmin, adminListDistribuidoresConEquipo, adminAsignarClienteADistribuidor, adminBuscarClientePorTelefono } from "../../services/comprobantes";
 import { limpiarNombreBici, extraerTalle, extraerModelo } from "../../utils/bikeName";
+import { getContabiliumDepositos, labelDeposito } from "../../services/contabiliumDepositos";
+import { addNotaEntrega, subscribeNotasEntregaPorCliente } from "../../services/notasEntrega";
 import { VENDEDORES } from "./Vendedores";
+import { printComprobante } from "../../utils/printComprobante";
+import {
+  subscribeRedVendedores,
+  guardarVendedorRed,
+  eliminarVendedorRed,
+  parsearItemsExcel,
+  subscribeVentasAtribuidas,
+  atribuirVentaAVendedor,
+} from "../../services/redesVendedores";
+
+// Distribuidores que reparten su stock entre un equipo propio de
+// sub-vendedores (ej. Federico Stortini, con 5 vendedores) — se les muestra
+// la sección "Red de vendedores" en su ficha. La cuenta es manual (Excel que
+// manda el distribuidor), no está atada al stock real de Contabilium.
+const CONTABILIUM_IDS_CON_RED_VENDEDORES = new Set([108857074]); // Federico Stortini
 
 const money = (n) =>
   Number(n || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 });
@@ -283,6 +300,82 @@ function CalendarioNotas({ rows, onVerCliente }) {
   );
 }
 
+// Buscador puntual: "me llamó este número, ¿de quién es?" — no filtra la
+// lista de abajo, es una consulta aparte contra Contabilium (matchea por
+// los últimos 8 dígitos, sin importar el formato con el que esté cargado).
+function BuscarPorTelefono() {
+  const [abierto, setAbierto] = useState(false);
+  const [telefono, setTelefono] = useState("");
+  const [buscando, setBuscando] = useState(false);
+  const [resultados, setResultados] = useState(null);
+  const [error, setError] = useState("");
+
+  async function buscar() {
+    if (!telefono.trim()) return;
+    setBuscando(true);
+    setError("");
+    setResultados(null);
+    try {
+      const r = await adminBuscarClientePorTelefono(telefono.trim());
+      setResultados(r.resultados);
+    } catch (e) {
+      setError(e.message || "No se pudo buscar");
+    } finally {
+      setBuscando(false);
+    }
+  }
+
+  if (!abierto) {
+    return (
+      <button
+        onClick={() => setAbierto(true)}
+        className="text-xs font-medium text-sky-600 hover:underline dark:text-sky-400"
+      >
+        🔍 ¿De quién es este teléfono?
+      </button>
+    );
+  }
+
+  return (
+    <div className="rounded-xl border border-sky-200 bg-sky-50/60 p-3 dark:border-sky-900 dark:bg-sky-950/10">
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          type="text"
+          value={telefono}
+          onChange={(e) => setTelefono(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && buscar()}
+          placeholder="+54 9 11 3060-0478"
+          className="rounded-lg border border-sky-200 bg-white px-2.5 py-1.5 text-xs outline-none focus:border-sky-400 dark:border-sky-900 dark:bg-neutral-900 dark:text-white"
+        />
+        <button
+          onClick={buscar}
+          disabled={buscando}
+          className="rounded-lg bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-sky-700 disabled:opacity-60"
+        >
+          {buscando ? "Buscando…" : "Buscar"}
+        </button>
+        <button onClick={() => setAbierto(false)} className="text-xs text-slate-400 hover:text-sky-600 dark:text-neutral-500">
+          Cerrar
+        </button>
+      </div>
+      {error && <p className="mt-2 text-xs text-rose-600 dark:text-rose-400">{error}</p>}
+      {resultados && resultados.length === 0 && (
+        <p className="mt-2 text-xs text-slate-500 dark:text-neutral-400">No coincide con ningún cliente de Contabilium.</p>
+      )}
+      {resultados && resultados.length > 0 && (
+        <div className="mt-2 space-y-1">
+          {resultados.map((r) => (
+            <div key={r.contabiliumId} className="rounded-lg border border-sky-100 bg-white px-2.5 py-1.5 text-xs dark:border-sky-900/50 dark:bg-neutral-900">
+              <span className="font-semibold text-slate-800 dark:text-white">{r.razonSocial}</span>{" "}
+              <span className="text-slate-400">— {r.telefono || r.celular} {r.cuit ? `· CUIT ${r.cuit}` : ""}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Clientes360() {
   const location = useLocation();
   const [users, setUsers] = useState(null);
@@ -388,7 +481,11 @@ export default function Clientes360() {
         const q = search.trim().toLowerCase();
         return `${u.name || ""} ${u.contabiliumDepositoNombre || ""} ${u.cuit || ""}`.toLowerCase().includes(q);
       })
-      .sort((a, b) => b.pagado - a.pagado || (a.name || "").localeCompare(b.name || ""));
+      .sort((a, b) =>
+        onlyDeudores
+          ? b.saldoDeudor - a.saldoDeudor || (a.name || "").localeCompare(b.name || "")
+          : b.pagado - a.pagado || (a.name || "").localeCompare(b.name || "")
+      );
   }, [users, pagadoPorCuit, cobranzasPorCuit, search, onlySinContactar, onlyDeudores, reportePorUid]);
 
   const contactadosCount = useMemo(() => (users || []).filter((u) => u.seguimiento?.contactado).length, [users]);
@@ -411,7 +508,10 @@ export default function Clientes360() {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold text-slate-900 dark:text-white">Clientes 360</h1>
-          <p className="text-sm text-slate-500 dark:text-neutral-400">
+          <p className="text-xs text-slate-400 dark:text-neutral-500">
+            La ficha completa de cada cliente: deuda, facturas, stock consignado y seguimiento, todo en un solo lugar.
+          </p>
+          <p className="mt-1 text-sm text-slate-500 dark:text-neutral-400">
             {loading ? "Cargando…" : `${rows.length} de ${users.length} clientes`} · todo el dato es en vivo de Contabilium
             {!loading && ` · ${contactadosCount} de ${users.length} contactados`}
           </p>
@@ -480,6 +580,7 @@ export default function Clientes360() {
 
       {vista === "lista" && (
       <>
+      <BuscarPorTelefono />
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
         <input
           type="search"
@@ -547,13 +648,17 @@ export default function Clientes360() {
               <th className="px-4 py-3 font-medium">CUIT</th>
               <th className="px-4 py-3 font-medium">Vínculo Contabilium</th>
               <th className="px-4 py-3 font-medium">Seguimiento</th>
-              <th className="px-4 py-3 text-right font-medium">Cobranzas</th>
+              <th className="px-4 py-3 text-right font-medium">{onlyDeudores ? "Debe" : "Cobranzas"}</th>
               <th className="px-4 py-3"></th>
             </tr>
           </thead>
           <tbody>
             {rows.map((u) => (
-              <tr key={u.id} className="border-b border-slate-50 transition hover:bg-slate-50 dark:border-neutral-800/60 dark:hover:bg-neutral-800/40">
+              <tr
+                key={u.id}
+                onClick={() => setSelected(u.id)}
+                className="cursor-pointer border-b border-slate-50 transition hover:bg-slate-50 dark:border-neutral-800/60 dark:hover:bg-neutral-800/40"
+              >
                 <td className="px-4 py-3 font-medium text-slate-900 dark:text-white">{u.name || "Sin nombre"}</td>
                 <td className="px-4 py-3 text-slate-600 dark:text-neutral-300">{u.cuit || "-"}</td>
                 <td className="px-4 py-3">
@@ -578,7 +683,9 @@ export default function Clientes360() {
                     </span>
                   )}
                 </td>
-                <td className="px-4 py-3 text-right font-medium text-slate-900 dark:text-white">{money(u.pagado)}</td>
+                <td className="px-4 py-3 text-right font-medium text-slate-900 dark:text-white">
+                  {onlyDeudores ? money(u.saldoDeudor) : money(u.pagado)}
+                </td>
                 <td className="px-4 py-3 text-right">
                   <button
                     onClick={() => setSelected(u.id)}
@@ -603,17 +710,243 @@ export default function Clientes360() {
   );
 }
 
-function ClienteDetalle({ cliente, onClose }) {
-  const { user } = useAuth();
+// Panel manual de "quién tiene qué" para distribuidores que reparten su
+// stock entre un equipo propio de sub-vendedores (ej. Stortini). No toca
+// Contabilium ni mueve stock real — el staff carga la cuenta a partir del
+// Excel que manda el distribuidor, y la actualiza a mano cuando cambia.
+function VendedorRedForm({ inicial, onGuardar, onCancelar }) {
+  const [nombre, setNombre] = useState(inicial?.nombre || "");
+  const [texto, setTexto] = useState(
+    inicial?.items?.map((it) => [it.sku, it.nombre, it.cantidad].filter(Boolean).join("\t")).join("\n") || ""
+  );
+  const [guardando, setGuardando] = useState(false);
+  const [errorLocal, setErrorLocal] = useState("");
+
+  const itemsPreview = useMemo(() => parsearItemsExcel(texto), [texto]);
+  const totalPreview = itemsPreview.reduce((acc, it) => acc + it.cantidad, 0);
+
+  async function handleGuardar() {
+    if (!nombre.trim()) {
+      setErrorLocal("Falta el nombre del vendedor");
+      return;
+    }
+    if (itemsPreview.length === 0) {
+      setErrorLocal("No se reconoció ningún ítem — pegá las filas del Excel (SKU, nombre, cantidad)");
+      return;
+    }
+    setGuardando(true);
+    setErrorLocal("");
+    try {
+      await onGuardar({ nombre: nombre.trim(), items: itemsPreview });
+    } catch (e) {
+      setErrorLocal(e.message || "No se pudo guardar");
+    } finally {
+      setGuardando(false);
+    }
+  }
+
+  return (
+    <div className="mt-2 rounded-xl border border-sky-200 bg-white p-3 text-sm dark:border-sky-900/50 dark:bg-neutral-900">
+      <label className="block text-xs font-medium text-slate-500 dark:text-neutral-400">
+        Nombre del vendedor
+        <input
+          type="text"
+          value={nombre}
+          onChange={(e) => setNombre(e.target.value)}
+          placeholder="ej: Storica"
+          className="mt-1 w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-sm outline-none focus:border-sky-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+        />
+      </label>
+      <label className="mt-2 block text-xs font-medium text-slate-500 dark:text-neutral-400">
+        Bicicletas (pegá directo las filas del Excel — SKU, nombre y cantidad)
+        <textarea
+          value={texto}
+          onChange={(e) => setTexto(e.target.value)}
+          rows={8}
+          placeholder={"200022\tBICI MTB BOWIE TALLE S 2026 AZUL-CELESTE\t3\n200021\tBICI MTB BOWIE TALLE L 2026 AZUL-CELESTE\t4"}
+          className="mt-1 w-full rounded-lg border border-slate-200 px-2.5 py-1.5 font-mono text-xs outline-none focus:border-sky-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+        />
+      </label>
+      <p className="mt-1 text-[11px] text-slate-400 dark:text-neutral-500">
+        {itemsPreview.length} ítem(s) reconocidos · {totalPreview} bici(s) en total
+      </p>
+      {errorLocal && <p className="mt-1 text-xs text-rose-600 dark:text-rose-400">{errorLocal}</p>}
+      <div className="mt-2 flex gap-2">
+        <button
+          type="button"
+          disabled={guardando}
+          onClick={handleGuardar}
+          className="rounded-lg bg-sky-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-sky-700 disabled:opacity-60"
+        >
+          {guardando ? "Guardando…" : "✓ Guardar"}
+        </button>
+        <button type="button" onClick={onCancelar} className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-500 hover:text-slate-700 dark:text-neutral-400">
+          Cancelar
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function RedDeVendedores({ distribuidorContabiliumId, actualizadoPorNombre }) {
+  const [vendedores, setVendedores] = useState(null);
+  const [error, setError] = useState("");
+  const [agregando, setAgregando] = useState(false);
+  const [editandoId, setEditandoId] = useState(null);
+  const [expandidoId, setExpandidoId] = useState(null);
+
+  useEffect(() => {
+    const unsub = subscribeRedVendedores(
+      distribuidorContabiliumId,
+      setVendedores,
+      (e) => setError(e.message || "No se pudo cargar la red de vendedores")
+    );
+    return unsub;
+  }, [distribuidorContabiliumId]);
+
+  const totalGeneral = (vendedores || []).reduce((acc, v) => acc + Number(v.totalBicis || 0), 0);
+
+  async function handleGuardar(id, { nombre, items }) {
+    await guardarVendedorRed({ id, distribuidorContabiliumId, nombre, items, actualizadoPorNombre });
+    setAgregando(false);
+    setEditandoId(null);
+  }
+
+  async function handleEliminar(v) {
+    if (!confirm(`¿Eliminar a "${v.nombre}" de la red de vendedores? No se puede deshacer.`)) return;
+    try {
+      await eliminarVendedorRed(v.id);
+    } catch (e) {
+      setError(e.message || "No se pudo eliminar");
+    }
+  }
+
+  return (
+    <div className="mt-4 rounded-2xl border border-sky-200 bg-sky-50/60 p-4 dark:border-sky-900 dark:bg-sky-950/10">
+      <div className="flex items-center justify-between gap-2">
+        <h3 className="text-sm font-bold text-sky-800 dark:text-sky-400">
+          👥 Red de vendedores {vendedores ? `· ${totalGeneral} bici(s) en total` : ""}
+        </h3>
+        {!agregando && (
+          <button
+            type="button"
+            onClick={() => setAgregando(true)}
+            className="rounded-lg bg-sky-600 px-2.5 py-1 text-xs font-semibold text-white hover:bg-sky-700"
+          >
+            + Agregar vendedor
+          </button>
+        )}
+      </div>
+      <p className="mt-1 text-[11px] text-slate-400 dark:text-neutral-500">
+        Cuenta manual de qué bicis tiene cada vendedor del equipo — no mueve stock en Contabilium, solo lleva el registro.
+      </p>
+
+      {error && <p className="mt-2 text-xs text-rose-600 dark:text-rose-400">{error}</p>}
+      {vendedores === null && <p className="mt-2 text-xs text-slate-400 dark:text-neutral-500">Cargando…</p>}
+      {vendedores && vendedores.length === 0 && !agregando && (
+        <p className="mt-2 text-xs text-slate-400 dark:text-neutral-500">Todavía no hay ningún vendedor cargado.</p>
+      )}
+
+      {agregando && (
+        <VendedorRedForm onGuardar={(v) => handleGuardar(null, v)} onCancelar={() => setAgregando(false)} />
+      )}
+
+      <div className="mt-2 space-y-2">
+        {(vendedores || []).map((v) =>
+          editandoId === v.id ? (
+            <VendedorRedForm
+              key={v.id}
+              inicial={v}
+              onGuardar={(datos) => handleGuardar(v.id, datos)}
+              onCancelar={() => setEditandoId(null)}
+            />
+          ) : (
+            <div key={v.id} className="rounded-xl border border-sky-200 bg-white dark:border-sky-900/50 dark:bg-neutral-900">
+              <button
+                type="button"
+                onClick={() => setExpandidoId((cur) => (cur === v.id ? null : v.id))}
+                className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left"
+              >
+                <span className="text-sm font-semibold text-slate-800 dark:text-white">{v.nombre}</span>
+                <span className="flex shrink-0 items-center gap-2 text-xs text-slate-500 dark:text-neutral-400">
+                  {v.totalBicis} bici(s) {expandidoId === v.id ? "▲" : "▼"}
+                </span>
+              </button>
+              {expandidoId === v.id && (
+                <div className="border-t border-sky-100 px-3 py-2 dark:border-sky-900/40">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-left text-slate-400 dark:text-neutral-500">
+                        <th className="pb-1 font-medium">SKU</th>
+                        <th className="pb-1 font-medium">Bici</th>
+                        <th className="pb-1 pr-1 text-right font-medium">Cant.</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(v.items || []).map((it, i) => (
+                        <tr key={i} className="border-t border-slate-50 dark:border-neutral-800/60">
+                          <td className="py-1 text-slate-500 dark:text-neutral-400">{it.sku || "-"}</td>
+                          <td className="py-1 text-slate-700 dark:text-neutral-200">{it.nombre}</td>
+                          <td className="py-1 pr-1 text-right font-semibold text-slate-800 dark:text-white">{it.cantidad}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {v.updatedByNombre && (
+                    <p className="mt-1.5 text-[11px] text-slate-400 dark:text-neutral-500">
+                      Actualizado por {v.updatedByNombre}
+                    </p>
+                  )}
+                  <div className="mt-1.5 flex gap-3">
+                    <button type="button" onClick={() => setEditandoId(v.id)} className="text-xs font-medium text-sky-600 hover:underline dark:text-sky-400">
+                      Editar
+                    </button>
+                    <button type="button" onClick={() => handleEliminar(v)} className="text-xs font-medium text-rose-500 hover:underline">
+                      Eliminar
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )
+        )}
+      </div>
+    </div>
+  );
+}
+
+export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
+  const { user, profile } = useAuth();
   const puedeEditarNotas = puedeEditarNotasCheck(user?.email);
   const [comprobantes, setComprobantes] = useState(null);
   const [stock, setStock] = useState(null);
   const [filtroModelo, setFiltroModelo] = useState("todos");
   const [vendedorGuardando, setVendedorGuardando] = useState(false);
+  const [equiposDisponibles, setEquiposDisponibles] = useState(null); // distribuidores con equipo propio (flete/comisión), ej. Alfredo Bavcevich
+  const [equipoGuardando, setEquipoGuardando] = useState(false);
+  const [equipoMsg, setEquipoMsg] = useState("");
+  const [vendedoresRedFactura, setVendedoresRedFactura] = useState(null); // red de sub-vendedores de este distribuidor (si aplica)
+  const [ventasAtribuidas, setVentasAtribuidas] = useState(null); // qué línea de factura ya se le atribuyó a cuál vendedor
+  const [atribuyendoKey, setAtribuyendoKey] = useState(null); // `${facturaId}_${sku}` en curso
+  const [atribuirError, setAtribuirError] = useState("");
   const [saldoTotal, setSaldoTotal] = useState(0);
   const [error, setError] = useState("");
   const [showCobranzas, setShowCobranzas] = useState(false);
+  const [depositos, setDepositos] = useState([]);
   const [telefono, setTelefono] = useState(undefined); // undefined=cargando, null=no tiene
+  const [celular, setCelular] = useState(undefined); // undefined=cargando, null=no tiene
+  const [editandoTelefono, setEditandoTelefono] = useState(false);
+  const [telefonoInput, setTelefonoInput] = useState("");
+  const [celularInput, setCelularInput] = useState("");
+  const [guardandoTelefono, setGuardandoTelefono] = useState(false);
+  const [ubicacion, setUbicacion] = useState(undefined); // undefined=cargando, null=no tiene
+  const [instagramDetectado, setInstagramDetectado] = useState(null); // sugerido desde Observaciones de Contabilium
+  const [editandoInstagram, setEditandoInstagram] = useState(false);
+  const [instagramInput, setInstagramInput] = useState("");
+  const [guardandoInstagram, setGuardandoInstagram] = useState(false);
+  const [editandoBicicleteria, setEditandoBicicleteria] = useState(false);
+  const [bicicleteriaInput, setBicicleteriaInput] = useState("");
+  const [guardandoBicicleteria, setGuardandoBicicleteria] = useState(false);
   const [facturaAbierta, setFacturaAbierta] = useState(null); // id de la factura desplegada
   const [itemsPorFactura, setItemsPorFactura] = useState({}); // id -> items[] | "loading" | "error"
   const [audits, setAudits] = useState(null); // null=cargando, []=sin videos
@@ -621,13 +954,56 @@ function ClienteDetalle({ cliente, onClose }) {
   const [videoAbierto, setVideoAbierto] = useState(null); // id del audit con el player desplegado
   const [pagosReportados, setPagosReportados] = useState(null);
   const [cheques, setCheques] = useState(null);
+  const [ventasReportadas, setVentasReportadas] = useState(null);
   const [revisandoPagoId, setRevisandoPagoId] = useState(null);
   const [programStart, setProgramStart] = useState(null);
   const [reciboAbierto, setReciboAbierto] = useState(null); // id de la factura con el form de recibo abierto
+  const [remitoDesdeFactura, setRemitoDesdeFactura] = useState(null); // { items } de la factura desde la que se pidió "Hacer un remito"
+  const [soloImpagas, setSoloImpagas] = useState(false);
+  const [notasEntrega, setNotasEntrega] = useState([]);
+  const [nuevaNotaChofer, setNuevaNotaChofer] = useState("");
+  const [guardandoNotaChofer, setGuardandoNotaChofer] = useState(false);
 
   useEffect(() => {
     getAuditProgramStart().then(setProgramStart).catch(() => setProgramStart(null));
   }, []);
+
+  useEffect(() => {
+    getContabiliumDepositos()
+      .then(setDepositos)
+      .catch((e) => console.error("Error cargando depósitos:", e));
+  }, []);
+
+  const depositoDeCliente = useMemo(
+    () => depositos.find((d) => d.id === cliente.contabiliumDepositoId) || null,
+    [depositos, cliente.contabiliumDepositoId]
+  );
+
+  // Notas que el chofer va dejando por entrega — separadas de
+  // seguimiento.historial, de solo lectura acá.
+  useEffect(() => {
+    if (!cliente.id) return;
+    const unsub = subscribeNotasEntregaPorCliente(cliente.id, setNotasEntrega);
+    return unsub;
+  }, [cliente.id]);
+
+  async function handleAgregarNotaChofer() {
+    if (!nuevaNotaChofer.trim() || !user) return;
+    setGuardandoNotaChofer(true);
+    try {
+      await addNotaEntrega({
+        clienteUid: cliente.id,
+        clienteNombre: cliente.name,
+        clienteContabiliumId: cliente.contabiliumId,
+        choferUid: user.uid,
+        choferNombre: profile?.name ? `${profile.name} (admin)` : "Admin",
+        texto: nuevaNotaChofer,
+      });
+      setNuevaNotaChofer("");
+    } finally {
+      setGuardandoNotaChofer(false);
+    }
+  }
 
   async function recargarFacturas() {
     if (!cliente.contabiliumId) return;
@@ -671,7 +1047,9 @@ function ClienteDetalle({ cliente, onClose }) {
   const seg = cliente.seguimiento || {};
   const [contactado, setContactado] = useState(!!seg.contactado);
   const [cuentaCoincide, setCuentaCoincide] = useState(seg.cuentaCoincide ?? "");
-  const [notas, setNotas] = useState(seg.notas || "");
+  // Arranca vacío a propósito (no seg.notas) — cada nota nueva es una
+  // entrada independiente del historial, no una edición de la anterior.
+  const [notas, setNotas] = useState("");
   const [tareaPendiente, setTareaPendiente] = useState(seg.tareaPendiente || "");
   const [imagenesNota, setImagenesNota] = useState([]); // File[] a subir con la próxima nota
   const [subiendoImagenes, setSubiendoImagenes] = useState(false);
@@ -693,6 +1071,10 @@ function ClienteDetalle({ cliente, onClose }) {
     const nombreCompleto = cliente.contabiliumDepositoNombre || cliente.name || "";
     const nombre = nombreCompleto.split(" ")[0] || nombreCompleto;
     const partes = [`Hola ${nombre}, buenos días! Soy Ezequiel de Samurai.`];
+    partes.push(
+      "Te cuento que estamos con una administración nueva, poniéndonos al día con todas las cuentas — así que si ya venías hablando esto con alguien más, disculpá si repito algo. ¿Pudiste entrar a usar el sistema?"
+    );
+    let tieneContenidoEspecifico = false;
 
     if (cliente.contabiliumDepositoId != null && audits) {
       const yaAvisadoAntes = (seg.historial || []).some((h) =>
@@ -703,6 +1085,7 @@ function ClienteDetalle({ cliente, onClose }) {
         partes.push(
           "Vimos que todavía no se registró ningún video de auditoría de stock de tu cuenta. Es un paso simple: entrás a tu cuenta de Samurai, vas a \"Mi Stock\" y tocás el botón \"🎥 Grabar video\". Ahí filmás pausado todas las bicicletas que tenés consignadas, tanto las que están en caja como las que están armadas o fuera de caja, marcándolas una por una a medida que filmás. Te pido que lo hagas a la brevedad, hoy o mañana si es posible."
         );
+        tieneContenidoEspecifico = true;
       } else {
         const ultima = audits[0];
         const vencido = isAuditOverdue(ultima.createdAt, programStart, cliente.auditIntervalDays);
@@ -711,10 +1094,12 @@ function ClienteDetalle({ cliente, onClose }) {
           partes.push(
             "Te escribo nuevamente porque la auditoría de stock de tu cuenta sigue vencida y todavía no recibimos el video actualizado, a pesar del aviso anterior. Te pido por favor que lo resuelvas hoy mismo desde \"Mi Stock\" → \"🎥 Grabar video\", mostrando pausado y una por una todas las bicicletas, con o sin caja."
           );
+          tieneContenidoEspecifico = true;
         } else if (vencido || porVencer) {
           partes.push(
             "Les escribo para pedirles si por favor pueden revisar el vencimiento de los videos publicados para poder avanzar con el control de stock. También aprovecho para comentarles que es de suma importancia que graben los videos de forma que podamos visualizar y contabilizar las unidades ya sea con o sin caja, pausado y marcando una a una a medida que filman. De ser posible hoy y mañana aguardamos los nuevos videos."
           );
+          tieneContenidoEspecifico = true;
         }
       }
     }
@@ -723,13 +1108,15 @@ function ClienteDetalle({ cliente, onClose }) {
       partes.push(
         `Además, en la última revisión de tu cuenta corriente quedó registrado: "${seg.notas}". Te pedimos que nos confirmes esto a la brevedad para poder resolverlo.`
       );
+      tieneContenidoEspecifico = true;
     }
 
     if (seg.tareaPendiente) {
       partes.push(`Por otro lado, nos quedó pendiente: ${seg.tareaPendiente}.`);
+      tieneContenidoEspecifico = true;
     }
 
-    if (partes.length === 1) {
+    if (!tieneContenidoEspecifico) {
       partes.push("Te escribo para hacer un seguimiento de tu cuenta — cualquier novedad o consulta, contame.");
     }
 
@@ -745,6 +1132,70 @@ function ClienteDetalle({ cliente, onClose }) {
       alert(e.message || "No se pudo guardar el vendedor");
     } finally {
       setVendedorGuardando(false);
+    }
+  }
+
+  useEffect(() => {
+    adminListDistribuidoresConEquipo()
+      .then((r) => setEquiposDisponibles(r.distribuidores || []))
+      .catch(() => setEquiposDisponibles([]));
+  }, []);
+
+  // Para distribuidores con red de sub-vendedores (ej. Stortini): trae su
+  // lista de vendedores y qué líneas de factura ya se les atribuyó, para
+  // poder marcar "esto lo vendió Fulano" desde cada factura y descontarle
+  // el stock que tiene cargado.
+  useEffect(() => {
+    if (!cliente.contabiliumId || !CONTABILIUM_IDS_CON_RED_VENDEDORES.has(cliente.contabiliumId)) {
+      setVendedoresRedFactura(null);
+      setVentasAtribuidas(null);
+      return;
+    }
+    const u1 = subscribeRedVendedores(cliente.contabiliumId, setVendedoresRedFactura, () => setVendedoresRedFactura([]));
+    const u2 = subscribeVentasAtribuidas(cliente.contabiliumId, setVentasAtribuidas, () => setVentasAtribuidas([]));
+    return () => {
+      u1();
+      u2();
+    };
+  }, [cliente.contabiliumId]);
+
+  async function handleAtribuirVenta(c, it, vendedor) {
+    const sku = it.Codigo || it.Sku || "";
+    const key = `${c.Id}_${sku}`;
+    setAtribuyendoKey(key);
+    setAtribuirError("");
+    try {
+      await atribuirVentaAVendedor({
+        facturaId: c.Id,
+        facturaNumero: c.Numero,
+        sku,
+        cantidad: Number(it.Cantidad) || 1,
+        itemNombre: it.Concepto || it.Descripcion || "",
+        vendedorId: vendedor.id,
+        vendedorNombre: vendedor.nombre,
+        distribuidorContabiliumId: cliente.contabiliumId,
+      });
+    } catch (e) {
+      setAtribuirError(e.message || "No se pudo atribuir la venta");
+    } finally {
+      setAtribuyendoKey(null);
+    }
+  }
+
+  // Suma este cliente al equipo (flete/comisión) de un distribuidor con
+  // `vendedoresAsignados` — ej. Alfredo Bavcevich — directo desde la ficha,
+  // sin depender del buscador de la pantalla Vendedores.
+  async function handleAsignarAEquipo(distribuidorUid) {
+    if (!distribuidorUid) return;
+    setEquipoGuardando(true);
+    setEquipoMsg("");
+    try {
+      await adminAsignarClienteADistribuidor(distribuidorUid, cliente.id, {});
+      setEquipoMsg("✓ Agregado");
+    } catch (e) {
+      setEquipoMsg(e.message || "No se pudo agregar");
+    } finally {
+      setEquipoGuardando(false);
     }
   }
 
@@ -786,7 +1237,7 @@ function ClienteDetalle({ cliente, onClose }) {
     setEditandoEntry(null);
     setContactado(!!seg.contactado);
     setCuentaCoincide(seg.cuentaCoincide === true ? "si" : seg.cuentaCoincide === false ? "no" : "");
-    setNotas(seg.notas || "");
+    setNotas("");
     setTareaPendiente(seg.tareaPendiente || "");
     setImagenesNota([]);
   }
@@ -834,6 +1285,7 @@ function ClienteDetalle({ cliente, onClose }) {
           tareaPendiente,
           imagenes,
           contactadoPor: user?.email || null,
+          vendedorAsignado: cliente.vendedor || null,
           fecha: Timestamp.now(),
         };
         await updateDoc(doc(db, "users", cliente.id), {
@@ -847,8 +1299,17 @@ function ClienteDetalle({ cliente, onClose }) {
           "seguimiento.fecha": serverTimestamp(),
           "seguimiento.historial": arrayUnion(entrada),
         });
+        registrarActividadCliente({
+          clienteId: cliente.id,
+          clienteNombre: cliente.name,
+          vendedor: cliente.vendedor,
+          tipo: "nota",
+          detalle: notas || tareaPendiente || null,
+          realizadoPor: user?.email,
+        });
       }
       setImagenesNota([]);
+      setNotas("");
       setSavedSeg(true);
       setTimeout(() => setSavedSeg(false), 2000);
     } catch (e) {
@@ -937,17 +1398,99 @@ function ClienteDetalle({ cliente, onClose }) {
       setCheques([]);
     }
 
+    // Ventas reportadas por el distribuidor que ya tienen factura/COT
+    // generada automáticamente — para poder aclarar en el detalle de la
+    // factura de dónde salió, en vez de que parezca una factura suelta
+    // sin origen claro.
+    setVentasReportadas(null);
+    if (cliente.id) {
+      getDocs(query(collection(db, "saleRequests"), where("distributorUid", "==", cliente.id)))
+        .then((snap) => {
+          if (cancelled) return;
+          setVentasReportadas(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+        })
+        .catch(() => { if (!cancelled) setVentasReportadas([]); });
+    } else {
+      setVentasReportadas([]);
+    }
+
     setTelefono(undefined);
+    setCelular(undefined);
+    setUbicacion(undefined);
+    setInstagramDetectado(null);
     if (cliente.contabiliumId) {
       adminGetClientPhone(cliente.contabiliumId)
-        .then((r) => { if (!cancelled) setTelefono(r.telefono || null); })
-        .catch(() => { if (!cancelled) setTelefono(null); });
+        .then((r) => {
+          if (cancelled) return;
+          setTelefono(r.telefono || null);
+          setCelular(r.celular || null);
+          const partes = [r.ciudad, r.provincia].filter(Boolean);
+          setUbicacion(partes.length ? partes.join(", ") : null);
+          setInstagramDetectado(r.instagramDetectado || null);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setTelefono(null);
+          setCelular(null);
+          setUbicacion(null);
+        });
     } else {
       setTelefono(null);
+      setCelular(null);
+      setUbicacion(null);
     }
 
     return () => { cancelled = true; };
   }, [cliente]);
+
+  function abrirEdicionTelefono() {
+    setTelefonoInput(telefono || "");
+    setCelularInput(celular || "");
+    setEditandoTelefono(true);
+  }
+
+  async function handleGuardarTelefonos() {
+    setGuardandoTelefono(true);
+    try {
+      const r = await adminActualizarTelefonosCliente(cliente.contabiliumId, {
+        telefono: telefonoInput.trim(),
+        celular: celularInput.trim(),
+      });
+      setTelefono(r.telefono || null);
+      setCelular(r.celular || null);
+      setEditandoTelefono(false);
+    } catch (e) {
+      setError(e.message || "No se pudo guardar el teléfono");
+    } finally {
+      setGuardandoTelefono(false);
+    }
+  }
+
+  async function handleGuardarInstagram() {
+    setGuardandoInstagram(true);
+    try {
+      const limpio = instagramInput.trim().replace(/^@/, "");
+      await updateDoc(doc(db, "users", cliente.id), { instagram: limpio || null });
+      setEditandoInstagram(false);
+    } catch (e) {
+      setError(e.message || "No se pudo guardar el Instagram");
+    } finally {
+      setGuardandoInstagram(false);
+    }
+  }
+
+  async function handleGuardarBicicleteria() {
+    setGuardandoBicicleteria(true);
+    try {
+      const limpio = bicicleteriaInput.trim();
+      await updateDoc(doc(db, "users", cliente.id), { bicicleteria: limpio || null });
+      setEditandoBicicleteria(false);
+    } catch (e) {
+      setError(e.message || "No se pudo guardar la bicicletería");
+    } finally {
+      setGuardandoBicicleteria(false);
+    }
+  }
 
   const loading = comprobantes === null || stock === null;
   const saldoPendiente = saldoTotal;
@@ -962,47 +1505,273 @@ function ClienteDetalle({ cliente, onClose }) {
         className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-t-3xl bg-white p-5 shadow-2xl sm:rounded-3xl dark:bg-neutral-900"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-start justify-between gap-3">
-          <div>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
             <h2 className="text-lg font-bold text-slate-900 dark:text-white">{cliente.name || "Sin nombre"}</h2>
             <p className="text-sm text-slate-500 dark:text-neutral-400">{cliente.cuit || "sin CUIT"}</p>
+            {cliente.contabiliumDepositoId != null && (
+              <p className="text-xs text-slate-400 dark:text-neutral-500">
+                Su depósito es: {depositoDeCliente ? labelDeposito(depositoDeCliente) : `Contabilium #${cliente.contabiliumDepositoId}`}
+              </p>
+            )}
+            {editandoTelefono ? (
+              <div className="mt-1 space-y-1.5 rounded-lg border border-slate-200 p-2 text-xs dark:border-neutral-700" onClick={(e) => e.stopPropagation()}>
+                <label className="block">
+                  <span className="text-slate-400 dark:text-neutral-500">Teléfono</span>
+                  <input
+                    type="text"
+                    value={telefonoInput}
+                    onChange={(e) => setTelefonoInput(e.target.value)}
+                    autoFocus
+                    className="mt-0.5 w-full rounded-lg border border-slate-200 px-2 py-1 text-sm dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+                  />
+                </label>
+                <label className="block">
+                  <span className="text-slate-400 dark:text-neutral-500">Celular (opcional, un segundo número)</span>
+                  <input
+                    type="text"
+                    value={celularInput}
+                    onChange={(e) => setCelularInput(e.target.value)}
+                    className="mt-0.5 w-full rounded-lg border border-slate-200 px-2 py-1 text-sm dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+                  />
+                </label>
+                <div className="flex gap-2 pt-0.5">
+                  <button
+                    onClick={handleGuardarTelefonos}
+                    disabled={guardandoTelefono}
+                    className="text-xs font-semibold text-emerald-600 hover:text-emerald-700 disabled:opacity-60"
+                  >
+                    {guardandoTelefono ? "Guardando…" : "Guardar"}
+                  </button>
+                  <button onClick={() => setEditandoTelefono(false)} className="text-xs text-slate-400 hover:text-slate-600">
+                    Cancelar
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <p className="mt-0.5 text-sm text-slate-500 dark:text-neutral-400">
+                  {telefono === undefined ? (
+                    "📞 cargando…"
+                  ) : telefono ? (
+                    <>
+                      📞 {telefono}{" "}
+                      <a
+                        href={`https://wa.me/54${telefono.replace(/\D/g, "")}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={(e) => e.stopPropagation()}
+                        className="ml-1 text-emerald-600 underline hover:text-emerald-700 dark:text-emerald-400"
+                      >
+                        WhatsApp →
+                      </a>
+                    </>
+                  ) : (
+                    "📞 sin teléfono en Contabilium"
+                  )}
+                  {!soloLectura && cliente.contabiliumId && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); abrirEdicionTelefono(); }}
+                      className="ml-1.5 text-xs text-slate-400 underline hover:text-slate-600"
+                    >
+                      editar
+                    </button>
+                  )}
+                </p>
+                {celular && (
+                  <p className="mt-0.5 text-sm text-slate-500 dark:text-neutral-400">
+                    📱 {celular}{" "}
+                    <a
+                      href={`https://wa.me/54${celular.replace(/\D/g, "")}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      onClick={(e) => e.stopPropagation()}
+                      className="ml-1 text-emerald-600 underline hover:text-emerald-700 dark:text-emerald-400"
+                    >
+                      WhatsApp →
+                    </a>
+                  </p>
+                )}
+              </>
+            )}
             <p className="mt-0.5 text-sm text-slate-500 dark:text-neutral-400">
-              {telefono === undefined ? (
-                "📞 cargando…"
-              ) : telefono ? (
+              {ubicacion === undefined ? "📍 cargando…" : ubicacion ? `📍 ${ubicacion}` : "📍 sin ubicación en Contabilium"}
+            </p>
+            <div className="mt-0.5 text-sm text-slate-500 dark:text-neutral-400">
+              {editandoInstagram ? (
+                <span className="inline-flex items-center gap-1.5">
+                  📷
+                  <input
+                    type="text"
+                    autoFocus
+                    value={instagramInput}
+                    onChange={(e) => setInstagramInput(e.target.value)}
+                    placeholder="usuario (sin @)"
+                    onClick={(e) => e.stopPropagation()}
+                    className="w-32 rounded-lg border border-slate-200 bg-white px-2 py-0.5 text-xs dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+                  />
+                  <button
+                    onClick={(e) => { e.stopPropagation(); handleGuardarInstagram(); }}
+                    disabled={guardandoInstagram}
+                    className="text-xs font-semibold text-emerald-600 hover:text-emerald-700 disabled:opacity-60"
+                  >
+                    {guardandoInstagram ? "..." : "Guardar"}
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setEditandoInstagram(false); }}
+                    className="text-xs text-slate-400 hover:text-slate-600"
+                  >
+                    Cancelar
+                  </button>
+                </span>
+              ) : cliente.instagram ? (
                 <>
-                  📞 {telefono}{" "}
+                  📷{" "}
                   <a
-                    href={`https://wa.me/54${telefono.replace(/\D/g, "")}`}
+                    href={`https://instagram.com/${cliente.instagram}`}
                     target="_blank"
                     rel="noreferrer"
                     onClick={(e) => e.stopPropagation()}
-                    className="ml-1 text-emerald-600 underline hover:text-emerald-700 dark:text-emerald-400"
+                    className="text-sky-600 underline hover:text-sky-700 dark:text-sky-400"
                   >
-                    WhatsApp →
-                  </a>
+                    @{cliente.instagram}
+                  </a>{" "}
+                  {!soloLectura && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setInstagramInput(cliente.instagram); setEditandoInstagram(true); }}
+                      className="text-xs text-slate-400 underline hover:text-slate-600"
+                    >
+                      editar
+                    </button>
+                  )}
                 </>
               ) : (
-                "📞 sin teléfono en Contabilium"
+                <>
+                  📷 sin Instagram cargado
+                  {instagramDetectado && (
+                    <>
+                      {" "}
+                      — detectado en Contabilium:{" "}
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setInstagramInput(instagramDetectado);
+                          setEditandoInstagram(true);
+                        }}
+                        className="font-semibold text-sky-600 underline hover:text-sky-700 dark:text-sky-400"
+                      >
+                        @{instagramDetectado}
+                      </button>
+                    </>
+                  )}
+                  {!soloLectura && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setInstagramInput(""); setEditandoInstagram(true); }}
+                      className="ml-1 text-xs text-slate-400 underline hover:text-slate-600"
+                    >
+                      agregar
+                    </button>
+                  )}
+                </>
               )}
-            </p>
+            </div>
+            <div className="mt-0.5 text-sm text-slate-500 dark:text-neutral-400">
+              {editandoBicicleteria ? (
+                <span className="inline-flex items-center gap-1.5">
+                  🏪
+                  <input
+                    type="text"
+                    autoFocus
+                    value={bicicleteriaInput}
+                    onChange={(e) => setBicicleteriaInput(e.target.value)}
+                    placeholder="Nombre de la bicicletería / sucursal"
+                    onClick={(e) => e.stopPropagation()}
+                    className="w-56 rounded-lg border border-slate-200 bg-white px-2 py-0.5 text-xs dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+                  />
+                  <button
+                    onClick={(e) => { e.stopPropagation(); handleGuardarBicicleteria(); }}
+                    disabled={guardandoBicicleteria}
+                    className="text-xs font-semibold text-emerald-600 hover:text-emerald-700 disabled:opacity-60"
+                  >
+                    {guardandoBicicleteria ? "..." : "Guardar"}
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setEditandoBicicleteria(false); }}
+                    className="text-xs text-slate-400 hover:text-slate-600"
+                  >
+                    Cancelar
+                  </button>
+                </span>
+              ) : cliente.bicicleteria ? (
+                <>
+                  🏪 {cliente.bicicleteria}{" "}
+                  {!soloLectura && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setBicicleteriaInput(cliente.bicicleteria); setEditandoBicicleteria(true); }}
+                      className="text-xs text-slate-400 underline hover:text-slate-600"
+                    >
+                      editar
+                    </button>
+                  )}
+                </>
+              ) : (
+                <>
+                  🏪 sin bicicletería cargada
+                  {!soloLectura && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setBicicleteriaInput(""); setEditandoBicicleteria(true); }}
+                      className="ml-1 text-xs text-slate-400 underline hover:text-slate-600"
+                    >
+                      agregar
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
           </div>
-          <div className="flex shrink-0 items-center gap-2">
-            <select
-              value={cliente.vendedor && VENDEDORES.includes(cliente.vendedor) ? cliente.vendedor : ""}
-              onChange={(e) => handleAsignarVendedor(e.target.value)}
-              disabled={vendedorGuardando}
-              title="Vendedor asignado"
-              className="rounded-xl border border-slate-200 bg-white px-2 py-1.5 text-xs font-medium text-slate-600 outline-none dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300"
-            >
-              <option value="">Sin vendedor</option>
-              {VENDEDORES.map((v) => (
-                <option key={v} value={v}>
-                  {v}
-                </option>
-              ))}
-            </select>
-            {cliente.contabiliumId && (
+          <div className="flex w-full flex-wrap items-center justify-end gap-2 sm:w-auto sm:shrink-0">
+            {!soloLectura && (
+              <select
+                value={cliente.vendedor && VENDEDORES.includes(cliente.vendedor) ? cliente.vendedor : ""}
+                onChange={(e) => handleAsignarVendedor(e.target.value)}
+                disabled={vendedorGuardando}
+                title="Vendedor asignado"
+                className="rounded-xl border border-slate-200 bg-white px-2 py-1.5 text-xs font-medium text-slate-600 outline-none dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300"
+              >
+                <option value="">Sin vendedor</option>
+                {VENDEDORES.map((v) => (
+                  <option key={v} value={v}>
+                    {v}
+                  </option>
+                ))}
+              </select>
+            )}
+            {!soloLectura && equiposDisponibles && equiposDisponibles.length > 0 && (
+              <div className="flex items-center gap-1">
+                <select
+                  defaultValue=""
+                  onChange={(e) => {
+                    const uid = e.target.value;
+                    e.target.value = "";
+                    if (uid) handleAsignarAEquipo(uid);
+                  }}
+                  disabled={equipoGuardando}
+                  title="Sumar a la cartera de flete/comisión de un distribuidor con equipo"
+                  className="rounded-xl border border-slate-200 bg-white px-2 py-1.5 text-xs font-medium text-slate-600 outline-none dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300"
+                >
+                  <option value="" disabled>
+                    + Sumar al equipo de…
+                  </option>
+                  {equiposDisponibles.map((d) => (
+                    <option key={d.uid} value={d.uid}>
+                      {d.name}
+                    </option>
+                  ))}
+                </select>
+                {equipoMsg && <span className="text-[11px] text-slate-400">{equipoMsg}</span>}
+              </div>
+            )}
+            {!soloLectura && cliente.contabiliumId && (
               <button
                 onClick={() => setFacturarOpen(true)}
                 className="rounded-xl bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-indigo-700"
@@ -1010,7 +1779,7 @@ function ClienteDetalle({ cliente, onClose }) {
                 🧾 Facturar
               </button>
             )}
-            {cliente.contabiliumId && (
+            {!soloLectura && cliente.contabiliumId && (
               <button
                 onClick={() => setReciboModalOpen(true)}
                 className="rounded-xl bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-emerald-700"
@@ -1026,6 +1795,13 @@ function ClienteDetalle({ cliente, onClose }) {
             </button>
           </div>
         </div>
+
+        {!soloLectura && cliente.contabiliumId && CONTABILIUM_IDS_CON_RED_VENDEDORES.has(cliente.contabiliumId) && (
+          <RedDeVendedores
+            distribuidorContabiliumId={cliente.contabiliumId}
+            actualizadoPorNombre={profile?.name || user?.email || "Staff"}
+          />
+        )}
 
         {error && <p className="mt-3 text-sm text-rose-600 dark:text-rose-400">{error}</p>}
 
@@ -1054,7 +1830,7 @@ function ClienteDetalle({ cliente, onClose }) {
                 source="Suma de facturas (Contabilium), historial completo"
               />
               <SummaryTile
-                label={saldoPendiente > 0 ? "Debe" : saldoPendiente < 0 ? "Saldo a favor" : "Al día"}
+                label={saldoPendiente > 0 ? "Debe" : saldoPendiente < 0 ? "Saldo" : "Al día"}
                 value={money(saldoPendiente)}
                 accent={saldoPendiente > 0 ? "red" : "green"}
                 source={
@@ -1165,22 +1941,24 @@ function ClienteDetalle({ cliente, onClose }) {
                         <a href={p.comprobanteUrl} target="_blank" rel="noreferrer" className="text-xs font-semibold text-sky-600 hover:underline dark:text-sky-400">
                           Ver comprobante →
                         </a>
-                        <div className="ml-auto flex gap-1.5">
-                          <button
-                            onClick={() => handleRevisarPago(p, true)}
-                            disabled={revisandoPagoId === p.id}
-                            className="rounded-lg bg-emerald-600 px-2.5 py-1 text-xs font-semibold text-white transition hover:bg-emerald-700 disabled:opacity-60"
-                          >
-                            ✓ Ya está en Contabilium
-                          </button>
-                          <button
-                            onClick={() => handleRevisarPago(p, false)}
-                            disabled={revisandoPagoId === p.id}
-                            className="rounded-lg border border-rose-200 px-2.5 py-1 text-xs font-semibold text-rose-600 transition hover:bg-rose-50 disabled:opacity-60 dark:border-rose-900 dark:hover:bg-rose-950/30"
-                          >
-                            Rechazar
-                          </button>
-                        </div>
+                        {!soloLectura && (
+                          <div className="ml-auto flex gap-1.5">
+                            <button
+                              onClick={() => handleRevisarPago(p, true)}
+                              disabled={revisandoPagoId === p.id}
+                              className="rounded-lg bg-emerald-600 px-2.5 py-1 text-xs font-semibold text-white transition hover:bg-emerald-700 disabled:opacity-60"
+                            >
+                              ✓ Ya está en Contabilium
+                            </button>
+                            <button
+                              onClick={() => handleRevisarPago(p, false)}
+                              disabled={revisandoPagoId === p.id}
+                              className="rounded-lg border border-rose-200 px-2.5 py-1 text-xs font-semibold text-rose-600 transition hover:bg-rose-50 disabled:opacity-60 dark:border-rose-900 dark:hover:bg-rose-950/30"
+                            >
+                              Rechazar
+                            </button>
+                          </div>
+                        )}
                       </div>
                     </div>
                   ))}
@@ -1257,12 +2035,28 @@ function ClienteDetalle({ cliente, onClose }) {
             )}
 
             <div className="mt-5">
-              <p className="mb-2 text-sm font-semibold text-slate-900 dark:text-white">Facturas</p>
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <p className="text-sm font-semibold text-slate-900 dark:text-white">Facturas</p>
+                {(comprobantes || []).length > 0 && (
+                  <button
+                    onClick={() => setSoloImpagas((v) => !v)}
+                    className={`rounded-lg border px-2 py-1 text-xs font-medium transition ${
+                      soloImpagas
+                        ? "border-rose-400 bg-rose-50 text-rose-700 dark:border-rose-500 dark:bg-rose-950/40 dark:text-rose-400"
+                        : "border-slate-200 text-slate-500 hover:border-rose-300 dark:border-neutral-700 dark:text-neutral-400"
+                    }`}
+                  >
+                    {soloImpagas ? "✓ " : ""}Solo impagas (sin recibo)
+                  </button>
+                )}
+              </div>
               {(comprobantes || []).length === 0 ? (
                 <p className="text-sm text-slate-400 dark:text-neutral-500">Sin facturas en los últimos 2 años.</p>
+              ) : (soloImpagas ? comprobantes.filter((c) => c.Saldo > 0) : comprobantes).length === 0 ? (
+                <p className="text-sm text-slate-400 dark:text-neutral-500">No hay facturas impagas.</p>
               ) : (
                 <div className="space-y-1.5">
-                  {comprobantes.map((c) => {
+                  {(soloImpagas ? comprobantes.filter((c) => c.Saldo > 0) : comprobantes).map((c) => {
                     const abierta = facturaAbierta === c.Id;
                     const items = itemsPorFactura[c.Id];
                     return (
@@ -1276,6 +2070,16 @@ function ClienteDetalle({ cliente, onClose }) {
                             {c.Tipo === "COT" && (
                               <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-500 dark:bg-neutral-800 dark:text-neutral-400">
                                 Cotización
+                              </span>
+                            )}
+                            {c.Tipo === "NCA" && (
+                              <span className="ml-2 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400">
+                                Nota de crédito
+                                {c.IdComprobanteAsociado &&
+                                  (() => {
+                                    const asociada = comprobantes.find((x) => x.Id === c.IdComprobanteAsociado);
+                                    return asociada ? ` → afecta a ${asociada.Numero}` : "";
+                                  })()}
                               </span>
                             )}
                             <span className="ml-2 text-xs text-slate-400 dark:text-neutral-500">{formatFecha(c.Fecha)}</span>
@@ -1300,36 +2104,145 @@ function ClienteDetalle({ cliente, onClose }) {
                               <p className="text-xs text-slate-400 dark:text-neutral-500">Sin ítems.</p>
                             )}
                             {Array.isArray(items) && items.length > 0 && (
-                              <div className="space-y-1">
-                                {items.map((it, i) => (
-                                  <div key={i} className="flex items-center justify-between text-xs">
-                                    <span className="text-slate-700 dark:text-neutral-300">
-                                      {it.Concepto || it.Descripcion || "—"} <span className="text-slate-400">× {it.Cantidad ?? 0}</span>
-                                    </span>
-                                    <span className="text-slate-500 dark:text-neutral-400">
-                                      {money((it.Total ?? (Number(it.PrecioUnitario) || 0) * (Number(it.Cantidad) || 0)))}
-                                    </span>
-                                  </div>
-                                ))}
+                              <div className="space-y-1.5">
+                                {items.map((it, i) => {
+                                  const sku = it.Codigo || it.Sku || "";
+                                  const key = `${c.Id}_${sku}`;
+                                  const atribucion = ventasAtribuidas?.find((v) => v.id === key);
+                                  return (
+                                    <div key={i} className="text-xs">
+                                      <div className="flex items-center justify-between">
+                                        <span className="text-slate-700 dark:text-neutral-300">
+                                          {it.Concepto || it.Descripcion || "—"} <span className="text-slate-400">× {it.Cantidad ?? 0}</span>
+                                        </span>
+                                        <span className="text-slate-500 dark:text-neutral-400">
+                                          {money((it.Total ?? (Number(it.PrecioUnitario) || 0) * (Number(it.Cantidad) || 0)))}
+                                        </span>
+                                      </div>
+                                      {!soloLectura && vendedoresRedFactura && vendedoresRedFactura.length > 0 && (
+                                        <div className="mt-0.5 flex items-center gap-1.5">
+                                          {atribucion ? (
+                                            <span className="text-[11px] text-emerald-600 dark:text-emerald-400">
+                                              🏷️ Vendido por {atribucion.vendedorNombre}
+                                            </span>
+                                          ) : (
+                                            <span className="text-[11px] text-slate-400 dark:text-neutral-500">🏷️ Vendido por:</span>
+                                          )}
+                                          <select
+                                            value={atribucion?.vendedorId || ""}
+                                            disabled={atribuyendoKey === key}
+                                            onChange={(e) => {
+                                              const v = vendedoresRedFactura.find((x) => x.id === e.target.value);
+                                              if (v) handleAtribuirVenta(c, it, v);
+                                            }}
+                                            className="rounded border border-slate-200 bg-white px-1 py-0.5 text-[11px] dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+                                          >
+                                            <option value="" disabled>
+                                              {atribuyendoKey === key ? "Guardando…" : atribucion ? "Cambiar…" : "Elegir…"}
+                                            </option>
+                                            {vendedoresRedFactura.map((v) => (
+                                              <option key={v.id} value={v.id}>
+                                                {v.nombre}
+                                              </option>
+                                            ))}
+                                          </select>
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                                {atribuirError && <p className="text-[11px] text-rose-500">{atribuirError}</p>}
                               </div>
                             )}
-                            {c.Saldo > 0 && (
-                              <div className="mt-2 border-t border-slate-100 pt-2 dark:border-neutral-800">
-                                <button
-                                  onClick={() => setReciboAbierto(reciboAbierto === c.Id ? null : c.Id)}
-                                  className="text-xs font-semibold text-emerald-600 hover:underline dark:text-emerald-400"
-                                >
-                                  {reciboAbierto === c.Id ? "Cancelar recibo" : "💳 Hacer un recibo (cobrar sin facturar)"}
-                                </button>
-                                {reciboAbierto === c.Id && (
-                                  <ReciboForm
-                                    factura={c}
-                                    contabiliumId={cliente.contabiliumId}
-                                    clienteName={cliente.name}
-                                    onDone={() => { setReciboAbierto(null); recargarFacturas(); recargarCheques(); }}
-                                  />
+                            {(() => {
+                              const ventasQueLaGeneraron = (ventasReportadas || []).filter(
+                                (v) => v.facturaContabilium?.Id === c.Id
+                              );
+                              if (ventasQueLaGeneraron.length === 0) return null;
+                              return (
+                                <div className="mt-2 space-y-1 border-t border-slate-100 pt-2 dark:border-neutral-800">
+                                  {ventasQueLaGeneraron.map((v) => (
+                                    <p key={v.id} className="text-[11px] text-sky-700 dark:text-sky-400">
+                                      📦 Se generó automáticamente al reportar esta venta — {v.quantity} × {v.name || `SKU ${v.sku}`}
+                                      {v.createdAt?.toDate ? ` · ${formatFecha(v.createdAt.toDate().toISOString())}` : ""}
+                                    </p>
+                                  ))}
+                                </div>
+                              );
+                            })()}
+                            {(() => {
+                              const cobranzasQuePagan = (cliente.cobranzasList || []).filter((cob) =>
+                                (cob.detalle || []).some((d) => d.IDComprobante === c.Id)
+                              );
+                              if (cobranzasQuePagan.length === 0) return null;
+                              return (
+                                <div className="mt-2 space-y-1.5 border-t border-slate-100 pt-2 dark:border-neutral-800">
+                                  <p className="text-[11px] font-semibold text-slate-500 dark:text-neutral-400">
+                                    Recibos aplicados a esta factura:
+                                  </p>
+                                  {cobranzasQuePagan.map((cob) => {
+                                    const linea = (cob.detalle || []).find((d) => d.IDComprobante === c.Id);
+                                    return (
+                                      <div key={cob.id} className="text-[11px] text-slate-600 dark:text-neutral-300">
+                                        <span className="font-mono">Nº {cob.numero}</span> · {formatFecha(cob.fecha)} · aplicado {money(linea?.Importe)}
+                                        {(cob.formasDePago || []).length > 0 && (
+                                          <div className="mt-0.5 flex flex-wrap gap-1">
+                                            {cob.formasDePago.map((f, i) => (
+                                              <span
+                                                key={i}
+                                                className="inline-flex items-center rounded-lg border border-sky-200 bg-sky-50 px-1.5 py-0.5 text-[10px] text-sky-700 dark:border-sky-900 dark:bg-sky-950/20 dark:text-sky-400"
+                                              >
+                                                {f.FormaDePago}{nombreBanco(f.IdBanco) ? ` (${nombreBanco(f.IdBanco)})` : ""}{f.NroReferencia ? ` #${f.NroReferencia}` : ""} — {money(f.Importe)}
+                                              </span>
+                                            ))}
+                                          </div>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              );
+                            })()}
+                            {!soloLectura && (c.Saldo > 0 || Array.isArray(items)) && (
+                              <div className="mt-2 flex flex-wrap items-center gap-3 border-t border-slate-100 pt-2 dark:border-neutral-800">
+                                {c.Saldo > 0 && (
+                                  <button
+                                    onClick={() => setReciboAbierto(reciboAbierto === c.Id ? null : c.Id)}
+                                    className="text-xs font-semibold text-emerald-600 hover:underline dark:text-emerald-400"
+                                  >
+                                    {reciboAbierto === c.Id ? "Cancelar recibo" : "💳 Hacer un recibo (cobrar sin facturar)"}
+                                  </button>
+                                )}
+                                {Array.isArray(items) && items.length > 0 && (
+                                  <button
+                                    onClick={() =>
+                                      setRemitoDesdeFactura({
+                                        lines: items.map((it) => ({
+                                          sku: it.Codigo || it.Sku || null,
+                                          descripcion: it.Concepto || it.Descripcion || "",
+                                          cantidad: Number(it.Cantidad) || 1,
+                                          precioUnitario: Number(it.PrecioUnitario ?? (Number(it.Total || 0) / (Number(it.Cantidad) || 1))) || 0,
+                                        })),
+                                      })
+                                    }
+                                    className="text-xs font-semibold text-sky-600 hover:underline dark:text-sky-400"
+                                  >
+                                    📦 Hacer un remito de esta factura
+                                  </button>
                                 )}
                               </div>
+                            )}
+                            {reciboAbierto === c.Id && (
+                              <ReciboForm
+                                factura={c}
+                                contabiliumId={cliente.contabiliumId}
+                                clienteName={cliente.name}
+                                clienteId={cliente.id}
+                                vendedor={cliente.vendedor}
+                                realizadoPor={user?.email}
+                                notasCredito={(comprobantes || []).filter((nc) => nc.Tipo === "NCA" && Number(nc.Saldo || 0) < 0)}
+                                onDone={() => { setReciboAbierto(null); recargarFacturas(); recargarCheques(); }}
+                              />
                             )}
                           </div>
                         )}
@@ -1351,6 +2264,7 @@ function ClienteDetalle({ cliente, onClose }) {
                       key={ch.id}
                       cheque={ch}
                       facturasCliente={(comprobantes || []).filter((c) => Number(c.Saldo || 0) > 0)}
+                      otrosChequesCliente={cheques}
                       onChanged={() => { recargarCheques(); recargarFacturas(); }}
                     />
                   ))}
@@ -1386,7 +2300,7 @@ function ClienteDetalle({ cliente, onClose }) {
                           {p.nota && <p className="mt-1 text-xs text-slate-500 dark:text-neutral-400">{p.nota}</p>}
                           <div className="mt-1.5 flex items-center justify-between gap-2">
                             <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${badge.cls}`}>{badge.text}</span>
-                            {p.estado === "pendiente" && (
+                            {!soloLectura && p.estado === "pendiente" && (
                               <div className="flex gap-1.5">
                                 <button
                                   onClick={() => handleRevisarPago(p, true)}
@@ -1577,7 +2491,7 @@ function ClienteDetalle({ cliente, onClose }) {
                 </label>
                 <input
                   type="file"
-                  accept="image/*"
+                  accept="image/*,application/pdf"
                   multiple
                   disabled={!puedeEditarNotas}
                   onChange={(e) => setImagenesNota(Array.from(e.target.files || []))}
@@ -1627,6 +2541,42 @@ function ClienteDetalle({ cliente, onClose }) {
                   />
                 </div>
               )}
+
+              {(notasEntrega.length > 0 || !soloLectura) && (
+                <div className="mt-5 border-t border-slate-200 pt-4 dark:border-neutral-700">
+                  <p className="mb-3 text-sm font-semibold text-slate-900 dark:text-white">
+                    🚚 Notas de entrega (chofer) <span className="font-normal text-slate-400 dark:text-neutral-500">({notasEntrega.length})</span>
+                  </p>
+                  {!soloLectura && (
+                    <div className="mb-3">
+                      <textarea
+                        value={nuevaNotaChofer}
+                        onChange={(e) => setNuevaNotaChofer(e.target.value)}
+                        placeholder="Dejale una nota al chofer para este cliente…"
+                        rows={2}
+                        className="w-full resize-none rounded-xl border border-slate-200 px-3 py-2 text-xs outline-none focus:border-sky-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+                      />
+                      <button
+                        onClick={handleAgregarNotaChofer}
+                        disabled={guardandoNotaChofer || !nuevaNotaChofer.trim()}
+                        className="mt-1.5 rounded-xl bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-sky-700 disabled:opacity-50"
+                      >
+                        {guardandoNotaChofer ? "Guardando…" : "Agregar nota"}
+                      </button>
+                    </div>
+                  )}
+                  <div className="space-y-2">
+                    {notasEntrega.map((n) => (
+                      <div key={n.id} className="rounded-xl border border-slate-100 p-2.5 text-xs dark:border-neutral-800">
+                        <p className="text-slate-700 dark:text-neutral-300">{n.texto}</p>
+                        <p className="mt-1 text-slate-400 dark:text-neutral-500">
+                          {n.choferNombre} · {formatFechaHora(n.createdAt)}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           </>
         )}
@@ -1639,7 +2589,26 @@ function ClienteDetalle({ cliente, onClose }) {
           clienteName={cliente.name}
           condicionIva={cliente.condicionIva}
           cuit={cliente.cuit}
+          clienteId={cliente.id}
+          vendedor={cliente.vendedor}
+          realizadoPor={user?.email}
           onClose={() => setFacturarOpen(false)}
+        />
+      )}
+
+      {remitoDesdeFactura && (
+        <FacturarModal
+          contabiliumId={cliente.contabiliumId}
+          depositoId={cliente.contabiliumDepositoId}
+          clienteName={cliente.name}
+          condicionIva={cliente.condicionIva}
+          cuit={cliente.cuit}
+          clienteId={cliente.id}
+          vendedor={cliente.vendedor}
+          realizadoPor={user?.email}
+          initialTipoFc="REM"
+          initialLines={remitoDesdeFactura.lines}
+          onClose={() => setRemitoDesdeFactura(null)}
         />
       )}
 
@@ -1647,7 +2616,11 @@ function ClienteDetalle({ cliente, onClose }) {
         <ReciboModal
           contabiliumId={cliente.contabiliumId}
           clienteName={cliente.name}
+          clienteId={cliente.id}
+          vendedor={cliente.vendedor}
+          realizadoPor={user?.email}
           facturas={(comprobantes || []).filter((c) => Number(c.Saldo || 0) > 0)}
+          notasCredito={(comprobantes || []).filter((c) => c.Tipo === "NCA" && Number(c.Saldo || 0) < 0)}
           onClose={() => setReciboModalOpen(false)}
           onDone={() => { setReciboModalOpen(false); recargarFacturas(); recargarCheques(); }}
         />
@@ -1656,9 +2629,31 @@ function ClienteDetalle({ cliente, onClose }) {
   );
 }
 
+// Registra cualquier movimiento hecho sobre la ficha de un cliente (nota,
+// recibo, factura, remito) atribuido al vendedor que tenía asignado en ese
+// momento — así queda trazado qué se hizo en la cartera de cada vendedor,
+// sin importar quién del staff lo haya tipeado realmente.
+async function registrarActividadCliente({ clienteId, clienteNombre, vendedor, tipo, detalle, realizadoPor }) {
+  try {
+    await addDoc(collection(db, "actividadCliente"), {
+      clienteId: clienteId || null,
+      clienteNombre: clienteNombre || null,
+      vendedorAsignado: vendedor || null,
+      tipo,
+      detalle: detalle || null,
+      realizadoPor: realizadoPor || null,
+      fecha: serverTimestamp(),
+    });
+  } catch (e) {
+    console.error("[actividadCliente] no se pudo registrar:", e);
+  }
+}
+
 // Cheque, igual que Efectivo, no lleva banco/caja en Contabilium — solo el
 // número de cheque como referencia (confirmado contra cobranzas reales).
-const FORMAS_SIN_BANCO = ["Efectivo", "Cheque"];
+// Nota de crédito tampoco lleva banco — lo que la identifica es a qué nota
+// de crédito puntual se está aplicando (ver `idNotaCredito`).
+const FORMAS_SIN_BANCO = ["Efectivo", "Cheque", "Nota de crédito"];
 
 // Qué letra corresponde según la condición de IVA del cliente (el emisor,
 // Samurai, es Responsable Inscripto): a otro RI se le factura A, a
@@ -1678,7 +2673,7 @@ function sugerirTipoFc(condicionIva) {
 // — elegís a qué factura con saldo pendiente aplicarlo y después es el
 // mismo formulario (ReciboForm) que ya existe desplegado dentro de cada
 // factura, para no duplicar la lógica de cobrar contra Contabilium.
-function ReciboModal({ contabiliumId, clienteName, facturas, onClose, onDone }) {
+function ReciboModal({ contabiliumId, clienteName, clienteId, vendedor, realizadoPor, facturas, notasCredito, onClose, onDone }) {
   const [facturaId, setFacturaId] = useState(facturas[0]?.Id ?? "");
   const facturaSeleccionada = facturas.find((f) => f.Id === Number(facturaId));
 
@@ -1701,7 +2696,7 @@ function ReciboModal({ contabiliumId, clienteName, facturas, onClose, onDone }) 
               Este cliente no tiene facturas con saldo pendiente ahora mismo — solo se puede cargar un <strong>cheque a cuenta</strong> (queda guardado como saldo a favor para imputar más adelante). El resto de las formas de pago necesitan una factura para aplicarse.
             </p>
             <div className="mt-3">
-              <ReciboForm factura={null} contabiliumId={contabiliumId} clienteName={clienteName} onDone={onDone} soloCheque />
+              <ReciboForm factura={null} contabiliumId={contabiliumId} clienteName={clienteName} clienteId={clienteId} vendedor={vendedor} realizadoPor={realizadoPor} onDone={onDone} soloCheque />
             </div>
           </>
         ) : (
@@ -1723,7 +2718,7 @@ function ReciboModal({ contabiliumId, clienteName, facturas, onClose, onDone }) 
 
             {facturaSeleccionada && (
               <div className="mt-3">
-                <ReciboForm factura={facturaSeleccionada} contabiliumId={contabiliumId} clienteName={clienteName} onDone={onDone} />
+                <ReciboForm factura={facturaSeleccionada} contabiliumId={contabiliumId} clienteName={clienteName} clienteId={clienteId} vendedor={vendedor} realizadoPor={realizadoPor} notasCredito={notasCredito} onDone={onDone} />
               </div>
             )}
           </>
@@ -1733,26 +2728,70 @@ function ReciboModal({ contabiliumId, clienteName, facturas, onClose, onDone }) 
   );
 }
 
-function ReciboForm({ factura, contabiliumId, clienteName, onDone, soloCheque = false }) {
+function ReciboForm({ factura, contabiliumId, clienteName, clienteId, vendedor, realizadoPor, notasCredito, onDone, soloCheque = false }) {
   const saldoActual = Number(factura?.Saldo || 0);
+  // Notas de crédito de este cliente todavía con saldo disponible (Saldo
+  // negativo = crédito sin aplicar). Dejarlas imputables desde acá evita que
+  // queden "flotando" sin descontar ninguna factura puntual — cosa que
+  // infla el saldo agregado (Debe) mostrando un número raro cuando en
+  // realidad hay facturas concretas sin cobrar.
+  const disponiblesNotaCredito = notasCredito || [];
   // Líneas de pago ya agregadas al recibo (todo lo que NO sea Cheque). Van
   // todas juntas en un solo llamado a Contabilium porque su API reemplaza
   // el recibo entero del comprobante en cada llamada — no lo acumula — así
   // que cargar varias transferencias de a una pisaría a las anteriores.
   const [pagos, setPagos] = useState([]);
+  // Fecha del recibo (una sola, no por línea de pago — así lo guarda
+  // Contabilium: el campo "Fecha" vive en el recibo entero, no en cada
+  // forma de pago). Por defecto hoy, pero se puede cambiar para asentar un
+  // pago que en realidad se recibió otro día.
+  const [fecha, setFecha] = useState(() => new Date().toISOString().slice(0, 10));
   const [monto, setMonto] = useState(soloCheque ? "" : "");
   const [formaDePago, setFormaDePago] = useState(soloCheque ? "Cheque" : "Transferencia");
   const [idBanco, setIdBanco] = useState(listaBancos()[0]?.id || "");
   const [nroReferencia, setNroReferencia] = useState("");
+  const [idNotaCredito, setIdNotaCredito] = useState("");
+  const [valorChequeTotal, setValorChequeTotal] = useState("");
   const [fotoCheque, setFotoCheque] = useState(null);
   const [guardando, setGuardando] = useState(false);
   const [subiendoFoto, setSubiendoFoto] = useState(false);
   const [error, setError] = useState("");
+  const [leyendoComprobante, setLeyendoComprobante] = useState(false);
+  const [lecturaComprobante, setLecturaComprobante] = useState(null);
+  const [arrastrandoComprobante, setArrastrandoComprobante] = useState(false);
 
   const totalPagos = pagos.reduce((acc, p) => acc + Number(p.monto || 0), 0);
   const restante = Math.max(0, saldoActual - totalPagos);
 
-  function handleAgregarLinea() {
+  // Sube la foto/captura de un comprobante de pago y le pide a Claude que
+  // lea monto/banco/referencia para precargar el formulario — ahorra
+  // tipeo, pero el staff siempre revisa el resultado antes de aplicar el
+  // recibo real (nunca se aplica solo).
+  async function handleCargarComprobante(file) {
+    if (!file) return;
+    setError("");
+    setLecturaComprobante(null);
+    setLeyendoComprobante(true);
+    try {
+      const [url] = await subirImagenesNota(`comprobantesPago/${contabiliumId}`, [file]);
+      const { lectura } = await leerComprobantePagoAdmin(url);
+      if (!lectura) {
+        setLecturaComprobante({ confianza: "baja", vacio: true });
+        return;
+      }
+      setFormaDePago("Transferencia");
+      if (lectura.monto) setMonto(String(Math.min(lectura.monto, restante || lectura.monto)));
+      if (lectura.idBanco) setIdBanco(String(lectura.idBanco));
+      if (lectura.referencia) setNroReferencia(lectura.referencia);
+      setLecturaComprobante(lectura);
+    } catch (e) {
+      setError(e.message || "No se pudo leer el comprobante");
+    } finally {
+      setLeyendoComprobante(false);
+    }
+  }
+
+  async function handleAgregarLinea() {
     setError("");
     if (!(Number(monto) > 0)) {
       setError("Ingresá un monto mayor a 0");
@@ -1766,9 +2805,53 @@ function ReciboForm({ factura, contabiliumId, clienteName, onDone, soloCheque = 
       setError("Elegí un banco/cuenta");
       return;
     }
-    setPagos((prev) => [...prev, { formaDePago, monto: Number(monto), idBanco: FORMAS_SIN_BANCO.includes(formaDePago) ? null : Number(idBanco), nroReferencia }]);
+    if (formaDePago === "Nota de crédito") {
+      if (!idNotaCredito) {
+        setError("Elegí qué nota de crédito estás aplicando");
+        return;
+      }
+      const nc = disponiblesNotaCredito.find((x) => x.Id === Number(idNotaCredito));
+      if (nc && Number(monto) > Math.abs(Number(nc.Saldo))) {
+        setError(`Esa nota de crédito solo tiene ${money(Math.abs(Number(nc.Saldo)))} disponibles`);
+        return;
+      }
+    }
+    // Si el cheque vale más de lo que se está aplicando ahora, guardamos el
+    // valor total para que, al confirmar, el sobrante quede como saldo a
+    // favor disponible en "Cheques registrados" — así no se pierde de vista
+    // (mismo caso que la factura 0001-00000130: cheque de $2.275.000 del que
+    // solo se aplicaron $1.725.000).
+    const valorTotal = formaDePago === "Cheque" && Number(valorChequeTotal) > Number(monto)
+      ? Number(valorChequeTotal)
+      : Number(monto);
+
+    let fotoUrl = null;
+    if (formaDePago === "Cheque" && fotoCheque) {
+      setSubiendoFoto(true);
+      try {
+        [fotoUrl] = await subirImagenesNota(`cheques/${contabiliumId}`, [fotoCheque]);
+      } catch {
+        setError("No se pudo subir la foto del cheque, pero podés seguir sin ella");
+      }
+      setSubiendoFoto(false);
+    }
+
+    setPagos((prev) => [
+      ...prev,
+      {
+        formaDePago,
+        monto: Number(monto),
+        idBanco: FORMAS_SIN_BANCO.includes(formaDePago) ? null : Number(idBanco),
+        nroReferencia,
+        ...(formaDePago === "Cheque" ? { valorTotal, fotoUrl } : {}),
+        ...(formaDePago === "Nota de crédito" ? { idNotaCredito: Number(idNotaCredito) } : {}),
+      },
+    ]);
     setMonto("");
     setNroReferencia("");
+    setValorChequeTotal("");
+    setIdNotaCredito("");
+    setFotoCheque(null);
   }
 
   function quitarLinea(idx) {
@@ -1809,6 +2892,14 @@ function ReciboForm({ factura, contabiliumId, clienteName, onDone, soloCheque = 
         cargadoPor: auth.currentUser?.email || null,
         createdAt: serverTimestamp(),
       });
+      registrarActividadCliente({
+        clienteId,
+        clienteNombre: clienteName,
+        vendedor,
+        tipo: "cheque_sin_imputar",
+        detalle: `${money(Number(monto))} — cheque N° ${nroReferencia}`,
+        realizadoPor,
+      });
       onDone();
     } catch (e) {
       setError(e.message || "No se pudo guardar el cheque");
@@ -1827,7 +2918,7 @@ function ReciboForm({ factura, contabiliumId, clienteName, onDone, soloCheque = 
       .map((p) => `• ${p.formaDePago}${p.nroReferencia ? ` (${p.nroReferencia})` : ""} — ${money(p.monto)}`)
       .join("\n");
     const ok = confirm(
-      `Vas a registrar un RECIBO REAL en Contabilium por ${money(totalPagos)} contra la factura ${factura.Numero}:\n\n${detalle}\n\n¿Confirmás?`
+      `Vas a registrar un RECIBO REAL en Contabilium por ${money(totalPagos)} contra la factura ${factura.Numero}, con fecha ${fecha}:\n\n${detalle}\n\n¿Confirmás?`
     );
     if (!ok) return;
 
@@ -1837,7 +2928,67 @@ function ReciboForm({ factura, contabiliumId, clienteName, onDone, soloCheque = 
       await cobrarComprobante({
         idComprobante: factura.Id,
         importeTotalNeto: Number(factura.Total),
-        pagos: pagos.map((p) => ({ formaDePago: p.formaDePago, monto: p.monto, idBanco: p.idBanco, nroReferencia: p.nroReferencia })),
+        fecha,
+        pagos: pagos.map((p) => ({ formaDePago: p.formaDePago, monto: p.monto, idBanco: p.idBanco, nroReferencia: p.nroReferencia, idNotaCredito: p.idNotaCredito })),
+      });
+
+      // Deja registrado cada cheque usado en este recibo en "Cheques
+      // registrados" — si se aplicó por menos de su valor total, el
+      // remanente queda visible como saldo a favor disponible para imputar
+      // después (en vez de perderse de vista, como pasaba antes cuando este
+      // formulario mandaba el cheque a Contabilium sin dejar rastro acá).
+      for (const p of pagos) {
+        if (p.formaDePago !== "Cheque" || !p.nroReferencia) continue;
+        try {
+          const existente = await getDocs(
+            query(
+              collection(db, "chequesRegistrados"),
+              where("contabiliumId", "==", contabiliumId),
+              where("nroCheque", "==", p.nroReferencia)
+            )
+          );
+          if (!existente.empty) {
+            await updateDoc(existente.docs[0].ref, {
+              montoImputado: increment(p.monto),
+              imputaciones: arrayUnion({
+                facturaId: factura.Id,
+                facturaNumero: factura.Numero,
+                monto: p.monto,
+                por: auth.currentUser?.email || null,
+                fecha: new Date().toISOString(),
+              }),
+            });
+          } else {
+            await addDoc(collection(db, "chequesRegistrados"), {
+              contabiliumId: contabiliumId || null,
+              clienteName: clienteName || null,
+              nroCheque: p.nroReferencia,
+              monto: p.valorTotal || p.monto,
+              montoImputado: p.monto,
+              imputaciones: [{
+                facturaId: factura.Id,
+                facturaNumero: factura.Numero,
+                monto: p.monto,
+                por: auth.currentUser?.email || null,
+                fecha: new Date().toISOString(),
+              }],
+              fotoUrl: p.fotoUrl || null,
+              cargadoPor: auth.currentUser?.email || null,
+              createdAt: serverTimestamp(),
+            });
+          }
+        } catch (chequeErr) {
+          console.error("[recibo] no se pudo registrar el cheque en la cartera:", chequeErr);
+        }
+      }
+
+      registrarActividadCliente({
+        clienteId,
+        clienteNombre: clienteName,
+        vendedor,
+        tipo: "recibo",
+        detalle: `${money(totalPagos)} contra factura ${factura.Numero}`,
+        realizadoPor,
       });
       onDone();
     } catch (e) {
@@ -1874,7 +3025,7 @@ function ReciboForm({ factura, contabiliumId, clienteName, onDone, soloCheque = 
             Foto del cheque (opcional)
             <input
               type="file"
-              accept="image/*"
+              accept="image/*,application/pdf"
               onChange={(e) => setFotoCheque(e.target.files?.[0] || null)}
               className="ml-1.5 text-xs text-slate-600 file:mr-1.5 file:rounded-lg file:border-0 file:bg-slate-200 file:px-2 file:py-1 file:text-[11px] file:font-semibold file:text-slate-700 dark:text-neutral-400 dark:file:bg-neutral-700 dark:file:text-neutral-200"
             />
@@ -1886,7 +3037,7 @@ function ReciboForm({ factura, contabiliumId, clienteName, onDone, soloCheque = 
           disabled={guardando}
           className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-emerald-700 disabled:opacity-60"
         >
-          {subiendoFoto ? "Subiendo foto…" : guardando ? "Guardando…" : "📥 Guardar cheque (sin imputar)"}
+          {subiendoFoto ? "Subiendo foto…" : guardando ? "Guardando…" : "📥 Agregar cheque sin imputar"}
         </button>
       </div>
     );
@@ -1894,6 +3045,71 @@ function ReciboForm({ factura, contabiliumId, clienteName, onDone, soloCheque = 
 
   return (
     <div className="mt-2 space-y-2 rounded-xl border border-emerald-200 bg-emerald-50/40 p-3 dark:border-emerald-900 dark:bg-emerald-950/10">
+      <div
+        onDragOver={(e) => {
+          e.preventDefault();
+          if (!leyendoComprobante) setArrastrandoComprobante(true);
+        }}
+        onDragLeave={() => setArrastrandoComprobante(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setArrastrandoComprobante(false);
+          if (leyendoComprobante) return;
+          const file = e.dataTransfer.files?.[0];
+          if (file) handleCargarComprobante(file);
+        }}
+        className={`flex flex-wrap items-center gap-2 rounded-lg border border-dashed px-2.5 py-2 transition ${
+          arrastrandoComprobante
+            ? "border-emerald-500 bg-emerald-100 dark:border-emerald-500 dark:bg-emerald-950/40"
+            : "border-emerald-300 bg-white/60 dark:border-emerald-800 dark:bg-neutral-900/40"
+        }`}
+      >
+        <label className="text-xs font-semibold text-emerald-700 dark:text-emerald-400">
+          🤖{" "}
+          <span className="cursor-pointer underline decoration-dotted">
+            {leyendoComprobante ? "Leyendo comprobante…" : arrastrandoComprobante ? "Soltá la imagen acá" : "Cargar comprobante"}
+          </span>
+          <input
+            type="file"
+            accept="image/*"
+            disabled={leyendoComprobante}
+            onChange={(e) => handleCargarComprobante(e.target.files?.[0] || null)}
+            className="hidden"
+          />
+        </label>
+        <span className="text-[11px] text-slate-500 dark:text-neutral-400">
+          Subí o arrastrá la foto y precarga monto/banco/referencia solo — revisá antes de aplicar.
+        </span>
+        {lecturaComprobante && !lecturaComprobante.vacio && (
+          <span
+            className={`text-[11px] font-semibold ${
+              lecturaComprobante.confianza === "alta"
+                ? "text-emerald-600 dark:text-emerald-400"
+                : "text-amber-600 dark:text-amber-400"
+            }`}
+          >
+            {lecturaComprobante.confianza === "alta" ? "✓" : "⚠️"} Confianza {lecturaComprobante.confianza}
+            {lecturaComprobante.referencia ? ` · ref. ${lecturaComprobante.referencia}` : ""}
+            {!lecturaComprobante.idBanco && lecturaComprobante.banco ? ` · banco "${lecturaComprobante.banco}" no reconocido, elegilo a mano` : ""}
+          </span>
+        )}
+        {lecturaComprobante?.vacio && (
+          <span className="text-[11px] font-semibold text-rose-600 dark:text-rose-400">
+            No se pudo leer la imagen, cargá los datos a mano
+          </span>
+        )}
+      </div>
+
+      <label className="block text-xs text-slate-600 dark:text-neutral-300">
+        Fecha del recibo
+        <input
+          type="date"
+          value={fecha}
+          onChange={(e) => setFecha(e.target.value)}
+          className="ml-1.5 rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs dark:border-neutral-700 dark:bg-neutral-900 dark:text-white"
+        />
+      </label>
+
       {pagos.length > 0 && (
         <div className="space-y-1">
           {pagos.map((p, i) => (
@@ -1913,7 +3129,7 @@ function ReciboForm({ factura, contabiliumId, clienteName, onDone, soloCheque = 
 
       {formaDePago === "Cheque" ? (
         <p className="text-[11px] text-slate-500 dark:text-neutral-400">
-          El cheque se guarda aparte (no se imputa al momento) — cambiá a otra forma de pago para armar este recibo, o guardalo como cheque a cuenta.
+          "Agregar cheque imputado" lo suma a este recibo (descuenta la factura de arriba). "Agregar cheque sin imputar" lo guarda aparte, sin aplicarlo a ninguna factura todavía.
         </p>
       ) : null}
 
@@ -1941,8 +3157,28 @@ function ReciboForm({ factura, contabiliumId, clienteName, onDone, soloCheque = 
             <option value="Débito">Débito</option>
             <option value="Cheque">Cheque</option>
             <option value="Efectivo">Efectivo</option>
+            {disponiblesNotaCredito.length > 0 && <option value="Nota de crédito">Nota de crédito</option>}
           </select>
         </label>
+        {formaDePago === "Nota de crédito" && (
+          <label className="text-xs text-slate-600 dark:text-neutral-300">
+            Nota de crédito
+            <select
+              value={idNotaCredito}
+              onChange={(e) => {
+                setIdNotaCredito(e.target.value);
+                const nc = disponiblesNotaCredito.find((x) => x.Id === Number(e.target.value));
+                if (nc) setMonto(String(Math.min(Math.abs(Number(nc.Saldo)), restante)));
+              }}
+              className="ml-1.5 rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs dark:border-neutral-700 dark:bg-neutral-900 dark:text-white"
+            >
+              <option value="">Elegir…</option>
+              {disponiblesNotaCredito.map((nc) => (
+                <option key={nc.Id} value={nc.Id}>{nc.Numero} — disponible {money(Math.abs(Number(nc.Saldo)))}</option>
+              ))}
+            </select>
+          </label>
+        )}
         {!FORMAS_SIN_BANCO.includes(formaDePago) && (
           <label className="text-xs text-slate-600 dark:text-neutral-300">
             Banco
@@ -1968,22 +3204,44 @@ function ReciboForm({ factura, contabiliumId, clienteName, onDone, soloCheque = 
         </label>
         {formaDePago === "Cheque" && (
           <label className="text-xs text-slate-600 dark:text-neutral-300">
+            Valor total del cheque (si es mayor a lo que aplicás)
+            <input
+              type="number"
+              min="1"
+              placeholder={monto || "="}
+              value={valorChequeTotal}
+              onChange={(e) => setValorChequeTotal(e.target.value)}
+              className="ml-1.5 w-28 rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs dark:border-neutral-700 dark:bg-neutral-900 dark:text-white"
+            />
+          </label>
+        )}
+        {formaDePago === "Cheque" && (
+          <label className="text-xs text-slate-600 dark:text-neutral-300">
             Foto del cheque (opcional)
             <input
               type="file"
-              accept="image/*"
+              accept="image/*,application/pdf"
               onChange={(e) => setFotoCheque(e.target.files?.[0] || null)}
               className="ml-1.5 text-xs text-slate-600 file:mr-1.5 file:rounded-lg file:border-0 file:bg-slate-200 file:px-2 file:py-1 file:text-[11px] file:font-semibold file:text-slate-700 dark:text-neutral-400 dark:file:bg-neutral-700 dark:file:text-neutral-200"
             />
           </label>
         )}
         <button
-          onClick={formaDePago === "Cheque" ? handleGuardarCheque : handleAgregarLinea}
+          onClick={handleAgregarLinea}
           disabled={guardando}
           className="rounded-lg border border-emerald-400 bg-white px-3 py-1.5 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-50 disabled:opacity-60 dark:bg-neutral-900 dark:text-emerald-400"
         >
-          {subiendoFoto ? "Subiendo foto…" : formaDePago === "Cheque" ? "📥 Guardar cheque (sin imputar)" : "+ Agregar línea"}
+          {subiendoFoto ? "Subiendo foto…" : formaDePago === "Cheque" ? "✅ Agregar cheque imputado" : "+ Agregar línea"}
         </button>
+        {formaDePago === "Cheque" && (
+          <button
+            onClick={handleGuardarCheque}
+            disabled={guardando}
+            className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 disabled:opacity-60 dark:border-neutral-600 dark:bg-neutral-900 dark:text-neutral-300"
+          >
+            {guardando ? "Guardando…" : "📥 Agregar cheque sin imputar"}
+          </button>
+        )}
       </div>
       {error && <p className="text-xs text-rose-600 dark:text-rose-400">{error}</p>}
       {pagos.length > 0 && (
@@ -1999,16 +3257,87 @@ function ReciboForm({ factura, contabiliumId, clienteName, onDone, soloCheque = 
   );
 }
 
-function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, cuit, onClose }) {
+const TIPO_LABELS = { FCA: "factura A", FCB: "factura B", FCC: "factura C", COT: "cotización", REM: "remito" };
+
+function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, cuit, clienteId, vendedor, realizadoPor, onClose, initialTipoFc, initialLines }) {
   const [products, setProducts] = useState(null);
   const [stockPorSku, setStockPorSku] = useState(null); // Map sku -> stockDisponible, null = no aplica (sin depósito)
   const [search, setSearch] = useState("");
-  const [lines, setLines] = useState([]);
-  const [tipoFc, setTipoFc] = useState(() => sugerirTipoFc(condicionIva));
+  const [lines, setLines] = useState(() => initialLines || []);
+  const [tipoFc, setTipoFc] = useState(() => initialTipoFc || sugerirTipoFc(condicionIva));
+  const hoyISO = new Date().toISOString().slice(0, 10);
+  const [fechaEmision, setFechaEmision] = useState(hoyISO);
   const [emitting, setEmitting] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
   const [afipCheck, setAfipCheck] = useState(null); // null=no consultado, "loading", o { match, categoriaAfip }
+  const [descargando, setDescargando] = useState(false);
+  const [facturaParaRecibo, setFacturaParaRecibo] = useState(null); // null=cerrado, "loading", o el comprobante fresco
+  const [errorRecibo, setErrorRecibo] = useState("");
+
+  // Trae el comprobante recién emitido con Total/Saldo reales (el `result`
+  // crudo de crearComprobante no siempre los trae completos) para poder
+  // abrir el mismo ReciboForm que se usa desde la lista de facturas.
+  async function handleAbrirRecibo() {
+    if (!result?.Id) return;
+    setErrorRecibo("");
+    setFacturaParaRecibo("loading");
+    try {
+      const detalle = await adminGetComprobanteDetail(result.Id);
+      setFacturaParaRecibo(detalle);
+    } catch (e) {
+      setErrorRecibo(e.message || "No se pudo traer la factura recién emitida");
+      setFacturaParaRecibo(null);
+    }
+  }
+
+  async function handleDescargarComprobante() {
+    if (!result?.Id) return;
+    setDescargando(true);
+    try {
+      const detalle = await adminGetComprobanteDetail(result.Id);
+      printComprobante(detalle);
+    } catch (e) {
+      setError(e.message || "No se pudo descargar el comprobante");
+    } finally {
+      setDescargando(false);
+    }
+  }
+
+  // Destinatario del remito, cuando es distinto del cliente de la factura —
+  // igual que en Contabilium: se puede remitir a una empresa intermedia (ej.
+  // una empresa de flete/Credifin) y después otro remito de esa empresa al
+  // cliente final, encadenando varios remitos de la misma venta.
+  const [remitoDestinatario, setRemitoDestinatario] = useState(null); // null = mismo cliente de la factura
+  const [destQuery, setDestQuery] = useState("");
+  const [destResultados, setDestResultados] = useState([]);
+  const [destSearching, setDestSearching] = useState(false);
+
+  useEffect(() => {
+    const q = destQuery.trim();
+    if (q.length < 3) {
+      setDestResultados([]);
+      return;
+    }
+    let cancelled = false;
+    setDestSearching(true);
+    const timer = setTimeout(() => {
+      searchContabiliumClientes(q)
+        .then((r) => {
+          if (!cancelled) setDestResultados(r.resultados || []);
+        })
+        .catch(() => {
+          if (!cancelled) setDestResultados([]);
+        })
+        .finally(() => {
+          if (!cancelled) setDestSearching(false);
+        });
+    }, 350);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [destQuery]);
 
   // Verifica automáticamente contra el padrón real de AFIP que la condición
   // IVA cargada en Contabilium sea la real, para no depender de que alguien
@@ -2060,9 +3389,15 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
 
   const results = useMemo(() => {
     if (!products || !search.trim()) return [];
-    const q = search.trim().toLowerCase();
+    // Cada palabra escrita tiene que aparecer en alguna parte del nombre/SKU,
+    // sin importar el orden — así "negro xl" encuentra "...T.XL...NEGRO..."
+    // aunque en el nombre real el talle venga antes del color.
+    const tokens = search.trim().toLowerCase().split(/\s+/).filter(Boolean);
     return products
-      .filter((p) => (p.name || "").toLowerCase().includes(q) || (p.sku || "").toLowerCase().includes(q))
+      .filter((p) => {
+        const haystack = `${p.name || ""} ${p.sku || ""}`.toLowerCase();
+        return tokens.every((t) => haystack.includes(t));
+      })
       .slice(0, 12);
   }, [products, search]);
 
@@ -2093,12 +3428,18 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
 
   async function handleEmitir() {
     if (lines.length === 0) return;
+    const destinatarioId = remitoDestinatario ? remitoDestinatario.contabiliumId : contabiliumId;
+    const destinatarioNombre = remitoDestinatario ? remitoDestinatario.razonSocial : clienteName;
     const detalle = lines
       .map((l) => `• ${l.descripcion || "(sin descripción)"} x${l.cantidad} — ${money(Number(l.cantidad) * Number(l.precioUnitario))}`)
       .join("\n");
-    const letra = tipoFc.slice(-1);
+    const esFiscal = tipoFc === "FCA" || tipoFc === "FCB" || tipoFc === "FCC";
+    const tipoLabel = TIPO_LABELS[tipoFc] || tipoFc;
+    const fechaLabel = fechaEmision !== hoyISO ? ` con fecha ${fechaEmision}` : "";
     const ok = confirm(
-      `Vas a EMITIR UNA FACTURA ${letra} REAL en Contabilium (con CAE, irreversible) para ${clienteName}:\n\n${detalle}\n\nTotal: ${money(total)}\n\n¿Confirmás?`
+      esFiscal
+        ? `Vas a EMITIR UNA ${tipoLabel.toUpperCase()} REAL en Contabilium (con CAE, irreversible) para ${destinatarioNombre}${fechaLabel}:\n\n${detalle}\n\nTotal: ${money(total)}\n\n¿Confirmás?`
+        : `Vas a generar un(a) ${tipoLabel} real en Contabilium (sin AFIP, no factura) para ${destinatarioNombre}${fechaLabel}:\n\n${detalle}\n\nTotal: ${money(total)}\n\n¿Confirmás?`
     );
     if (!ok) return;
 
@@ -2111,7 +3452,15 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
         precioUnitario: Number(l.precioUnitario),
         sku: l.sku,
       }));
-      const res = await emitirFacturaManual(contabiliumId, items, tipoFc);
+      const res = await emitirFacturaManual(destinatarioId, items, tipoFc, fechaEmision !== hoyISO ? fechaEmision : undefined);
+      registrarActividadCliente({
+        clienteId,
+        clienteNombre: destinatarioNombre,
+        vendedor,
+        tipo: tipoFc === "REM" ? "remito" : "factura",
+        detalle: `${tipoLabel} por ${money(total)}`,
+        realizadoPor,
+      });
       setResult(res.comprobante);
     } catch (e) {
       setError(e.message || "No se pudo emitir la factura");
@@ -2135,14 +3484,58 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
 
         {result ? (
           <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400">
-            <p className="font-semibold">✓ Factura emitida{result?.Numero ? `: ${result.Numero}` : ""}</p>
+            <p className="font-semibold">✓ {TIPO_LABELS[tipoFc] || tipoFc} emitida{result?.Numero ? `: ${result.Numero}` : ""}</p>
             <p className="mt-1 text-xs">Revisala en Contabilium para confirmar el CAE y el descuento de stock.</p>
-            <button
-              onClick={onClose}
-              className="mt-3 rounded-xl bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-700"
-            >
-              Cerrar
-            </button>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                onClick={onClose}
+                className="rounded-xl border border-emerald-300 bg-white px-4 py-2 text-xs font-semibold text-emerald-700 hover:bg-emerald-50 dark:border-emerald-500/40 dark:bg-transparent dark:text-emerald-400"
+              >
+                Cerrar
+              </button>
+              <button
+                onClick={handleDescargarComprobante}
+                disabled={descargando}
+                className="rounded-xl border border-emerald-300 bg-white px-4 py-2 text-xs font-semibold text-emerald-700 hover:bg-emerald-50 disabled:opacity-50 dark:border-emerald-500/40 dark:bg-transparent dark:text-emerald-400"
+              >
+                {descargando ? "Generando…" : "📄 Descargar comprobante"}
+              </button>
+              <button
+                onClick={() => {
+                  setResult(null);
+                  setError("");
+                  setTipoFc("REM");
+                  setRemitoDestinatario(null);
+                }}
+                className="rounded-xl bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-700"
+              >
+                📦 {tipoFc === "REM" ? "Generar otro remito (otro destinatario)" : "Generar remito de esta venta"}
+              </button>
+              {tipoFc !== "REM" && !facturaParaRecibo && (
+                <button
+                  onClick={handleAbrirRecibo}
+                  className="rounded-xl border border-emerald-300 bg-white px-4 py-2 text-xs font-semibold text-emerald-700 hover:bg-emerald-50 dark:border-emerald-500/40 dark:bg-transparent dark:text-emerald-400"
+                >
+                  💳 Hacer un recibo
+                </button>
+              )}
+            </div>
+
+            {errorRecibo && <p className="mt-2 text-xs text-rose-600 dark:text-rose-400">{errorRecibo}</p>}
+            {facturaParaRecibo === "loading" && (
+              <p className="mt-2 text-xs text-emerald-700 dark:text-emerald-400">Cargando factura…</p>
+            )}
+            {facturaParaRecibo && facturaParaRecibo !== "loading" && (
+              <ReciboForm
+                factura={facturaParaRecibo}
+                contabiliumId={contabiliumId}
+                clienteName={clienteName}
+                clienteId={clienteId}
+                vendedor={vendedor}
+                realizadoPor={realizadoPor}
+                onDone={onClose}
+              />
+            )}
           </div>
         ) : (
           <>
@@ -2277,6 +3670,24 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
                 )}
 
                 <div className="mt-3">
+                  <label className="mb-1.5 block text-xs font-medium text-slate-500 dark:text-neutral-400">
+                    Fecha de emisión
+                  </label>
+                  <input
+                    type="date"
+                    value={fechaEmision}
+                    max={hoyISO}
+                    onChange={(e) => setFechaEmision(e.target.value)}
+                    className="mb-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm outline-none focus:border-sky-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+                  />
+                  {fechaEmision !== hoyISO && (tipoFc === "FCA" || tipoFc === "FCB" || tipoFc === "FCC") && (
+                    <p className="mb-2 text-[11px] text-amber-600 dark:text-amber-400">
+                      ⚠ Para facturas con CAE, AFIP puede rechazar fechas muy atrasadas (unos pocos días). Si falla, Contabilium va a devolver el motivo.
+                    </p>
+                  )}
+                </div>
+
+                <div className="mt-3">
                   <p className="mb-1.5 text-xs font-medium text-slate-500 dark:text-neutral-400">
                     Tipo de comprobante {condicionIva ? `(cliente: ${condicionIva})` : ""}
                   </p>
@@ -2296,7 +3707,77 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
                       </button>
                     ))}
                   </div>
+                  <p className="mb-1.5 mt-2 text-xs font-medium text-slate-500 dark:text-neutral-400">
+                    O sin AFIP (no llevan CAE, quedan igual con número real de Contabilium):
+                  </p>
+                  <div className="flex gap-2">
+                    {[
+                      { t: "COT", label: "Cotización" },
+                      { t: "REM", label: "Remito" },
+                    ].map(({ t, label }) => (
+                      <button
+                        key={t}
+                        type="button"
+                        onClick={() => setTipoFc(t)}
+                        className={`flex-1 rounded-xl border px-3 py-2 text-sm font-semibold transition ${
+                          tipoFc === t
+                            ? "border-emerald-500 bg-emerald-50 text-emerald-700 dark:border-emerald-500 dark:bg-emerald-950/40 dark:text-emerald-400"
+                            : "border-slate-200 bg-white text-slate-600 hover:border-slate-300 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300"
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
+
+                {tipoFc === "REM" && (
+                  <div className="mt-3 rounded-xl border border-slate-200 p-3 text-xs dark:border-neutral-700">
+                    <p className="font-semibold text-slate-700 dark:text-neutral-300">Destinatario del remito</p>
+                    {remitoDestinatario ? (
+                      <div className="mt-1 flex items-center justify-between gap-2">
+                        <span className="text-slate-600 dark:text-neutral-400">{remitoDestinatario.razonSocial}</span>
+                        <button
+                          type="button"
+                          onClick={() => setRemitoDestinatario(null)}
+                          className="whitespace-nowrap font-medium text-sky-600 hover:underline dark:text-sky-400"
+                        >
+                          Usar cliente de la factura
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        <p className="mt-1 text-slate-400 dark:text-neutral-500">Por defecto: {clienteName} (el cliente de esta factura)</p>
+                        <input
+                          type="text"
+                          placeholder="Buscar otro destinatario (ej: empresa de flete, Credifin)…"
+                          value={destQuery}
+                          onChange={(e) => setDestQuery(e.target.value)}
+                          className="mt-2 w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs outline-none focus:border-sky-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+                        />
+                        {destSearching && <p className="mt-1 text-slate-400 dark:text-neutral-500">Buscando…</p>}
+                        {destResultados.length > 0 && (
+                          <div className="mt-1 max-h-32 overflow-y-auto rounded-lg border border-slate-100 dark:border-neutral-800">
+                            {destResultados.map((r) => (
+                              <button
+                                key={r.contabiliumId}
+                                type="button"
+                                onClick={() => {
+                                  setRemitoDestinatario({ contabiliumId: r.contabiliumId, razonSocial: r.razonSocial });
+                                  setDestQuery("");
+                                  setDestResultados([]);
+                                }}
+                                className="block w-full px-2.5 py-1.5 text-left hover:bg-slate-50 dark:hover:bg-neutral-800"
+                              >
+                                {r.razonSocial} {r.cuit ? `— CUIT ${r.cuit}` : ""}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )}
               </>
             )}
 
@@ -2307,7 +3788,7 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
               disabled={emitting || lines.length === 0}
               className="mt-4 w-full rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-semibold text-white transition hover:bg-indigo-700 disabled:opacity-50"
             >
-              {emitting ? "Emitiendo…" : `🧾 Emitir factura ${tipoFc.slice(-1)}`}
+              {emitting ? "Emitiendo…" : `🧾 Emitir ${TIPO_LABELS[tipoFc] || tipoFc}`}
             </button>
           </>
         )}

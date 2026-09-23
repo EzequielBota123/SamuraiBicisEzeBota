@@ -7,12 +7,14 @@ import Calendario from "./Calendario";
 import Scripts from "./Scripts";
 import PanelAdmin from "./PanelAdmin";
 import ContactarVideos from "./ContactarVideos";
+import MapaClientes from "./MapaClientes";
 import useCrmData from "./useCrmData";
 import { ActiveVendorProvider, useActiveVendor } from "./ActiveVendorContext";
 
 const TABS = [
   { to: "/admin/crm/scripts", label: "📋 Scripts" },
   { to: "/admin/crm/videos", label: "📹 Videos de auditoría" },
+  { to: "/admin/crm/mapa", label: "🗺️ Mapa de clientes" },
   { to: "/admin/crm/asignar", label: "🎯 Asignar Clientes" },
   { to: "/admin/crm/telemarketers", label: "📊 CRM Telemarketers" },
   { to: "/admin/crm/vendedores", label: "🤝 CRM Vendedores" },
@@ -58,6 +60,7 @@ export default function CrmLayout() {
           </Route>
           <Route path="/admin/crm/scripts" render={() => <Scripts />} />
           <Route path="/admin/crm/videos" render={() => <ContactarVideos />} />
+          <Route path="/admin/crm/mapa" render={() => <MapaClientes crm={crm} />} />
           <Route path="/admin/crm/asignar" render={() => <AsignarClientes crm={crm} />} />
           <Route path="/admin/crm/telemarketers" render={() => <Telemarketers crm={crm} />} />
           <Route path="/admin/crm/vendedores" render={() => <VendedoresTab crm={crm} />} />

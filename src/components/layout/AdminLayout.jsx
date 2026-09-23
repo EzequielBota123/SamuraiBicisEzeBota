@@ -23,7 +23,7 @@ export default function AdminLayout({ children }) {
         )}
 
         <aside
-          className={`fixed inset-y-0 left-0 z-40 w-[280px] max-w-[85vw] transform border-r border-slate-200/80 bg-white shadow-2xl transition-transform duration-300 lg:sticky lg:top-0 lg:z-auto lg:min-h-screen lg:w-auto lg:max-w-none lg:translate-x-0 lg:bg-white/80 lg:shadow-none lg:backdrop-blur-xl dark:border-neutral-800/80 dark:bg-black dark:lg:bg-neutral-950/80 ${
+          className={`fixed inset-y-0 left-0 z-40 w-[280px] max-w-[85vw] transform overflow-y-auto border-r border-slate-200/80 bg-white shadow-2xl transition-transform duration-300 lg:sticky lg:top-0 lg:z-auto lg:min-h-screen lg:w-auto lg:max-w-none lg:translate-x-0 lg:bg-white/80 lg:shadow-none lg:backdrop-blur-xl dark:border-neutral-800/80 dark:bg-black dark:lg:bg-neutral-950/80 ${
             mobileOpen ? "translate-x-0" : "-translate-x-full"
           }`}
         >

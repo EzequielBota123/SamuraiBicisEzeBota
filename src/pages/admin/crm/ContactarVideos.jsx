@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import * as XLSX from "xlsx";
-import { arrayUnion, collection, doc, getDocs, query, serverTimestamp, Timestamp, updateDoc, where } from "firebase/firestore";
+import { arrayUnion, collection, doc, getDoc, getDocs, query, serverTimestamp, Timestamp, updateDoc, where } from "firebase/firestore";
 import { db, auth } from "../../../firebase";
 import { useAuth } from "../../../auth/AuthContext";
 import { adminGetClientPhone, getDepositoStockAdmin } from "../../../services/comprobantes";
@@ -14,7 +14,12 @@ import {
   isAuditOverdue,
   isAuditDueSoon,
   contarVistas,
+  ultimaVista,
 } from "../../../services/stockAudits";
+
+function money(n) {
+  return Number(n || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 });
+}
 
 function formatFechaHora(d) {
   if (!d) return "-";
@@ -187,6 +192,8 @@ const FILTROS = [
   { key: "vencidoConVideo", label: "🔴 Vencida · con video subido" },
   { key: "vencidoSinVideo", label: "🔴 Vencida · sin video subido" },
   { key: "noCoincide", label: "✕ No coincide" },
+  { key: "coincideDeben", label: "✓ Coincide · deben" },
+  { key: "coincideNoDeben", label: "✓ Coincide · no deben" },
 ];
 
 export default function ContactarVideos() {
@@ -198,9 +205,12 @@ export default function ContactarVideos() {
   const [copiadoId, setCopiadoId] = useState(null);
   const [busqueda, setBusqueda] = useState("");
   const [filtro, setFiltro] = useState("sinVideoSinContactar");
+  const [localidadPorUid, setLocalidadPorUid] = useState({}); // uid -> ciudad (Contabilium)
+  const [localidadElegida, setLocalidadElegida] = useState("");
   const [stockPorUid, setStockPorUid] = useState({});
   const [ordenStock, setOrdenStock] = useState("none"); // "none" | "asc" | "desc"
   const [ordenChequeo, setOrdenChequeo] = useState("none"); // "none" | "recent" | "old"
+  const [ordenVisto, setOrdenVisto] = useState("none"); // "none" | "recent" | "old" — por vistoPor (cuándo se abrió el video), no por el veredicto manual
   const [notaAbierta, setNotaAbierta] = useState(null);
   const [historialAbierto, setHistorialAbierto] = useState(null);
   const [editandoEntry, setEditandoEntry] = useState(null);
@@ -210,11 +220,13 @@ export default function ContactarVideos() {
     let cancelled = false;
 
     async function cargar() {
-      const [usersSnap, auditsSnap, programStart] = await Promise.all([
+      const [usersSnap, auditsSnap, programStart, reportSnap] = await Promise.all([
         getDocs(query(collection(db, "users"), where("kind", "==", "client"))),
         getDocs(collection(db, "stockAudits")),
         getAuditProgramStart(),
+        getDoc(doc(db, "meta", "clientesReportDetail")),
       ]);
+      const saldoPorUid = new Map((reportSnap.data()?.rows || []).map((r) => [r.uid, r.saldoDeudor || 0]));
 
       const conDeposito = usersSnap.docs
         .map((d) => ({ id: d.id, ...d.data() }))
@@ -238,7 +250,10 @@ export default function ContactarVideos() {
           const vencido = isAuditOverdue(ultimoAudit?.createdAt || null, programStart, u.auditIntervalDays);
           const porVencer = isAuditDueSoon(ultimoAudit?.createdAt || null, programStart, u.auditIntervalDays);
           const visto = tieneVideo && (contarVistas(ultimoAudit) > 0 || !!ultimoAudit.revisadoManual);
-          const noCoincide = tieneVideo && ultimoAudit?.revisadoManual?.resultado === "no_coincide";
+          const resultadoManual = ultimoAudit?.revisadoManual?.resultado || null;
+          const noCoincide = tieneVideo && resultadoManual === "no_coincide";
+          const coincide = tieneVideo && resultadoManual === "coincide";
+          const saldoDeudor = saldoPorUid.get(u.id) || 0;
           return {
             uid: u.id,
             nombre: u.contabiliumDepositoNombre || u.name || "(sin nombre)",
@@ -252,6 +267,8 @@ export default function ContactarVideos() {
             porVencer,
             visto,
             noCoincide,
+            coincide,
+            saldoDeudor,
           };
         })
         .sort((a, b) => a.nombre.localeCompare(b.nombre));
@@ -273,6 +290,7 @@ export default function ContactarVideos() {
           const r = await adminGetClientPhone(c.contabiliumId);
           if (cancelled) return;
           setTelefonos((prev) => ({ ...prev, [c.uid]: r.telefono || null }));
+          setLocalidadPorUid((prev) => ({ ...prev, [c.uid]: r.ciudad || null }));
         } catch {
           if (cancelled) return;
           setTelefonos((prev) => ({ ...prev, [c.uid]: "error" }));
@@ -315,6 +333,8 @@ export default function ContactarVideos() {
       vencidoConVideo: 0,
       vencidoSinVideo: 0,
       noCoincide: 0,
+      coincideDeben: 0,
+      coincideNoDeben: 0,
     };
     for (const c of clientes || []) {
       const contactado = !!c.seguimiento?.contactado;
@@ -322,9 +342,22 @@ export default function ContactarVideos() {
       else base[c.visto ? "conVideoRevisado" : "conVideoSinRevisar"]++;
       if (c.vencido) base[c.tieneVideo ? "vencidoConVideo" : "vencidoSinVideo"]++;
       if (c.noCoincide) base.noCoincide++;
+      if (c.coincide) base[c.saldoDeudor > 0 ? "coincideDeben" : "coincideNoDeben"]++;
     }
     return base;
   }, [clientes]);
+
+  // Localidades disponibles para el selector — se arma con lo que ya se fue
+  // trayendo de Contabilium (mismo pedido que ya hace el teléfono, no pega
+  // una llamada extra), por eso se completa de a poco mientras carga.
+  const localidadesDisponibles = useMemo(() => {
+    const set = new Set();
+    for (const c of clientes || []) {
+      const loc = localidadPorUid[c.uid];
+      if (loc) set.add(loc);
+    }
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [clientes, localidadPorUid]);
 
   const filtrados = useMemo(() => {
     if (!clientes) return [];
@@ -338,6 +371,8 @@ export default function ContactarVideos() {
         case "vencidoConVideo": return c.vencido && c.tieneVideo;
         case "vencidoSinVideo": return c.vencido && !c.tieneVideo;
         case "noCoincide": return c.noCoincide;
+        case "coincideDeben": return c.coincide && c.saldoDeudor > 0;
+        case "coincideNoDeben": return c.coincide && !(c.saldoDeudor > 0);
         default: return true;
       }
     });
@@ -345,7 +380,19 @@ export default function ContactarVideos() {
       const q = busqueda.trim().toLowerCase();
       base = base.filter((c) => `${c.nombre} ${c.cuit}`.toLowerCase().includes(q));
     }
-    if (ordenChequeo !== "none") {
+    if (localidadElegida) {
+      base = base.filter((c) => localidadPorUid[c.uid] === localidadElegida);
+    }
+    if (ordenVisto !== "none") {
+      base = [...base].sort((a, b) => {
+        const fa = ultimaVista(a.ultimoAudit || {})?.fecha?.getTime?.() ?? null;
+        const fb = ultimaVista(b.ultimoAudit || {})?.fecha?.getTime?.() ?? null;
+        if (fa == null && fb == null) return 0;
+        if (fa == null) return 1; // nunca vistos van al final
+        if (fb == null) return -1;
+        return ordenVisto === "recent" ? fb - fa : fa - fb;
+      });
+    } else if (ordenChequeo !== "none") {
       base = [...base].sort((a, b) => {
         const fa = a.ultimoAudit?.revisadoManual?.fecha?.getTime?.() ?? null;
         const fb = b.ultimoAudit?.revisadoManual?.fecha?.getTime?.() ?? null;
@@ -365,7 +412,7 @@ export default function ContactarVideos() {
       });
     }
     return base;
-  }, [clientes, busqueda, filtro, ordenStock, ordenChequeo, stockPorUid]);
+  }, [clientes, busqueda, filtro, localidadElegida, localidadPorUid, ordenStock, ordenChequeo, ordenVisto, stockPorUid]);
 
   // Exporta a Excel exactamente lo que se está viendo — la pestaña activa,
   // ya filtrada por búsqueda y orden, no toda la lista completa.
@@ -494,6 +541,21 @@ export default function ContactarVideos() {
               className="w-full max-w-sm rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none focus:border-sky-400 dark:border-neutral-700 dark:bg-neutral-900 dark:text-white"
             />
             <div className="flex items-center gap-1.5 text-xs">
+              <span className="text-slate-500 dark:text-neutral-400">Localidad:</span>
+              <select
+                value={localidadElegida}
+                onChange={(e) => setLocalidadElegida(e.target.value)}
+                className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-600 outline-none focus:border-sky-400 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300"
+              >
+                <option value="">Todas ({localidadesDisponibles.length})</option>
+                {localidadesDisponibles.map((loc) => (
+                  <option key={loc} value={loc}>
+                    {loc}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="flex items-center gap-1.5 text-xs">
               <span className="text-slate-500 dark:text-neutral-400">Ordenar por bicis consignadas:</span>
               <button
                 onClick={() => setOrdenStock(ordenStock === "asc" ? "none" : "asc")}
@@ -539,6 +601,29 @@ export default function ContactarVideos() {
                 Más antiguo
               </button>
             </div>
+            <div className="flex items-center gap-1.5 text-xs">
+              <span className="text-slate-500 dark:text-neutral-400">Ordenar por video visto:</span>
+              <button
+                onClick={() => setOrdenVisto(ordenVisto === "recent" ? "none" : "recent")}
+                className={`rounded-lg border px-2.5 py-1.5 font-semibold transition ${
+                  ordenVisto === "recent"
+                    ? "border-sky-500 bg-sky-50 text-sky-700 dark:border-sky-500 dark:bg-sky-950/40 dark:text-sky-400"
+                    : "border-slate-200 bg-white text-slate-600 hover:border-sky-300 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300"
+                }`}
+              >
+                Más reciente
+              </button>
+              <button
+                onClick={() => setOrdenVisto(ordenVisto === "old" ? "none" : "old")}
+                className={`rounded-lg border px-2.5 py-1.5 font-semibold transition ${
+                  ordenVisto === "old"
+                    ? "border-sky-500 bg-sky-50 text-sky-700 dark:border-sky-500 dark:bg-sky-950/40 dark:text-sky-400"
+                    : "border-slate-200 bg-white text-slate-600 hover:border-sky-300 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300"
+                }`}
+              >
+                Más antiguo
+              </button>
+            </div>
           </div>
         </>
       )}
@@ -569,6 +654,7 @@ export default function ContactarVideos() {
                     <p className="text-xs text-slate-400 dark:text-neutral-500">
                       CUIT {c.cuit || "—"} ·{" "}
                       {tel === undefined ? "buscando teléfono…" : tel === "error" ? "error al buscar teléfono" : tel === null ? "sin teléfono cargado" : tel}
+                      {localidadPorUid[c.uid] ? ` · 📍 ${localidadPorUid[c.uid]}` : ""}
                     </p>
                     <p className={`mt-0.5 text-xs font-medium ${contactado ? "text-emerald-700 dark:text-emerald-400" : "text-slate-400 dark:text-neutral-500"}`}>
                       {contactado ? "✓ Contactado" : "Sin contactar"}
@@ -580,6 +666,21 @@ export default function ContactarVideos() {
                         ? `${estadoVideo} · último video: ${formatFechaHora(c.ultimoAudit.createdAt)}`
                         : "Nunca subió un video"}
                     </p>
+                    {c.tieneVideo && (() => {
+                      const vista = ultimaVista(c.ultimoAudit || {});
+                      return (
+                        <p className="mt-0.5 text-xs text-slate-400 dark:text-neutral-500">
+                          {vista
+                            ? `👁️ Visto por ${vista.nombre || vista.uid} · ${formatFechaHora(vista.fecha)}`
+                            : "👁️ Todavía nadie lo abrió"}
+                        </p>
+                      );
+                    })()}
+                    {(filtro === "coincideDeben" || filtro === "coincideNoDeben") && (
+                      <p className={`mt-0.5 text-xs font-semibold ${c.saldoDeudor > 0 ? "text-rose-600 dark:text-rose-400" : "text-emerald-600 dark:text-emerald-400"}`}>
+                        {c.saldoDeudor > 0 ? `💰 Debe ${money(c.saldoDeudor)}` : "✓ Al día"}
+                      </p>
+                    )}
                     {seg.notas && (
                       <p className="mt-1 max-w-md text-xs italic text-slate-500 dark:text-neutral-400">"{seg.notas}"</p>
                     )}

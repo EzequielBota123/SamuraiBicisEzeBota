@@ -38,7 +38,7 @@ export const CHEQUE_ESTADO_BADGE = ESTADO_BADGE;
 // ya cargadas para no repetir el pedido) y la pantalla global de Cheques
 // (sin ese contexto — ChequeRow trae las facturas del cliente al vuelo
 // recién cuando aprietan "Imputar").
-export default function ChequeRow({ cheque: ch, facturasCliente, onChanged, mostrarCliente = false }) {
+export default function ChequeRow({ cheque: ch, facturasCliente, otrosChequesCliente, onChanged, mostrarCliente = false }) {
   const [procesando, setProcesando] = useState(false);
   const [error, setError] = useState("");
   const [imputando, setImputando] = useState(false);
@@ -48,10 +48,22 @@ export default function ChequeRow({ cheque: ch, facturasCliente, onChanged, most
   const [facturas, setFacturas] = useState(facturasCliente?.length ? facturasCliente : null);
   const [facturaId, setFacturaId] = useState("");
   const [montoImputar, setMontoImputar] = useState("");
+  // IDs de otros cheques pendientes del mismo cliente que el usuario eligió
+  // sumar a ESTE MISMO recibo. Es necesario porque la API de Contabilium
+  // reemplaza el recibo entero del comprobante en cada llamada a
+  // /comprobantes/cobrar (no lo acumula) — si imputáramos dos cheques con
+  // dos llamadas separadas, la segunda pisaría a la primera y solo quedaría
+  // registrado el último cheque. Por eso hay que mandarlos juntos, en un
+  // solo llamado, igual que hace el selector nativo de Contabilium.
+  const [otrosSeleccionados, setOtrosSeleccionados] = useState(new Set());
 
   const estado = calcularEstadoCheque(ch);
   const badge = ESTADO_BADGE[estado];
   const disponible = Number(ch.monto || 0) - Number(ch.montoImputado || 0);
+
+  const otrosPendientes = (otrosChequesCliente || []).filter(
+    (o) => o.id !== ch.id && calcularEstadoCheque(o) === "pendiente"
+  );
 
   async function abrirImputar() {
     setImputando(true);
@@ -73,6 +85,15 @@ export default function ChequeRow({ cheque: ch, facturasCliente, onChanged, most
     }
   }
 
+  function toggleOtroSeleccionado(id) {
+    setOtrosSeleccionados((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
   async function handleConfirmarImputacion() {
     const factura = (facturas || []).find((f) => String(f.Id) === String(facturaId));
     if (!factura) {
@@ -92,8 +113,24 @@ export default function ChequeRow({ cheque: ch, facturasCliente, onChanged, most
       setError("No podés imputar más de lo que debe esa factura");
       return;
     }
+
+    // Arma las líneas de este cheque + los otros cheques que el usuario
+    // sumó al mismo recibo, sin pasarse del saldo que le queda a la factura.
+    const lineas = [{ cheque: ch, monto }];
+    let restanteFactura = Number(factura.Saldo) - monto;
+    for (const other of otrosPendientes) {
+      if (!otrosSeleccionados.has(other.id) || restanteFactura <= 0) continue;
+      const dispOther = Number(other.monto || 0) - Number(other.montoImputado || 0);
+      const montoOther = Math.min(dispOther, restanteFactura);
+      if (montoOther > 0) {
+        lineas.push({ cheque: other, monto: montoOther });
+        restanteFactura -= montoOther;
+      }
+    }
+
+    const detalle = lineas.map((l) => `• Cheque N° ${l.cheque.nroCheque} — ${money(l.monto)}`).join("\n");
     const ok = confirm(
-      `Vas a imputar ${money(monto)} del cheque N° ${ch.nroCheque} contra la factura ${factura.Numero} en Contabilium.\n\n¿Confirmás?`
+      `Vas a registrar un RECIBO REAL en Contabilium contra la factura ${factura.Numero}:\n\n${detalle}\n\n¿Confirmás?`
     );
     if (!ok) return;
 
@@ -103,22 +140,29 @@ export default function ChequeRow({ cheque: ch, facturasCliente, onChanged, most
       await cobrarComprobante({
         idComprobante: factura.Id,
         importeTotalNeto: Number(factura.Total),
-        monto,
-        formaDePago: "Cheque",
-        idBanco: null,
-        nroReferencia: ch.nroCheque,
+        pagos: lineas.map((l) => ({
+          formaDePago: "Cheque",
+          monto: l.monto,
+          idBanco: null,
+          nroReferencia: l.cheque.nroCheque,
+        })),
       });
-      await updateDoc(doc(db, "chequesRegistrados", ch.id), {
-        montoImputado: increment(monto),
-        imputaciones: arrayUnion({
-          facturaId: factura.Id,
-          facturaNumero: factura.Numero,
-          monto,
-          por: auth.currentUser?.email || null,
-          fecha: new Date().toISOString(),
-        }),
-      });
+      await Promise.all(
+        lineas.map((l) =>
+          updateDoc(doc(db, "chequesRegistrados", l.cheque.id), {
+            montoImputado: increment(l.monto),
+            imputaciones: arrayUnion({
+              facturaId: factura.Id,
+              facturaNumero: factura.Numero,
+              monto: l.monto,
+              por: auth.currentUser?.email || null,
+              fecha: new Date().toISOString(),
+            }),
+          })
+        )
+      );
       setImputando(false);
+      setOtrosSeleccionados(new Set());
       onChanged?.();
     } catch (e) {
       setError(e.message || "No se pudo imputar el cheque");
@@ -284,6 +328,26 @@ export default function ChequeRow({ cheque: ch, facturasCliente, onChanged, most
               >
                 Cancelar
               </button>
+            </div>
+          )}
+          {facturas && facturas.length > 0 && otrosPendientes.length > 0 && (
+            <div className="mt-1.5 space-y-1 border-t border-emerald-200/60 pt-1.5 dark:border-emerald-900/60">
+              <p className="text-[11px] text-slate-500 dark:text-neutral-400">
+                Sumar también otros cheques pendientes a este mismo recibo (para que no se pisen entre sí):
+              </p>
+              {otrosPendientes.map((other) => {
+                const dispOther = Number(other.monto || 0) - Number(other.montoImputado || 0);
+                return (
+                  <label key={other.id} className="flex items-center gap-1.5 text-[11px] text-slate-600 dark:text-neutral-300">
+                    <input
+                      type="checkbox"
+                      checked={otrosSeleccionados.has(other.id)}
+                      onChange={() => toggleOtroSeleccionado(other.id)}
+                    />
+                    N° {other.nroCheque || "—"} — disponible {money(dispOther)}
+                  </label>
+                );
+              })}
             </div>
           )}
         </div>

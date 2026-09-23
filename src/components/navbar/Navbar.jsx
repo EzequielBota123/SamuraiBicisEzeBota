@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, NavLink, useHistory } from "react-router-dom";
 import { useAuth } from "../../auth/AuthContext";
 import ThemeToggle from "../ui/ThemeToggle";
+import { activarNotificacionesPush, permisoNotificacionesEstado } from "../../utils/pushNotifications";
 
 const ADMIN_ROLES = ["admin"];
 
@@ -32,8 +33,10 @@ export default function Navbar({
   };
 
   const isAdminUser = !authLoading && ADMIN_ROLES.includes(profile?.role);
-  const isClient = !authLoading && !!user && !isAdminUser;
+  const isChofer = !authLoading && profile?.role === "chofer";
+  const isClient = !authLoading && !!user && !isAdminUser && !isChofer;
   const hasStock = !authLoading && !!user && !!profile?.contabiliumDepositoId;
+  const hasVendedores = !authLoading && !!user && !!profile?.vendedoresAsignados?.length;
   const isTransparentNow = transparentOnTop && !scrolled && !open;
 
   const headerBg = isTransparentNow
@@ -109,12 +112,12 @@ export default function Navbar({
                   />
                   <span
                     className="pointer-events-none absolute rounded-full bg-red-600/70 blur-[3px] animate-logo-dot-pulse dark:hidden"
-                    style={{ left: "49.6%", top: "20.8%", width: "10%", aspectRatio: "1 / 1", transform: "translate(-50%, -50%)" }}
+                    style={{ left: "49.6%", top: "20.8%", width: "4.7%", aspectRatio: "1 / 1", transform: "translate(-50%, -50%)" }}
                     aria-hidden="true"
                   />
                   <span
                     className="pointer-events-none absolute hidden rounded-full bg-red-600/70 blur-[3px] animate-logo-dot-pulse dark:block"
-                    style={{ left: "49.9%", top: "12.2%", width: "6%", aspectRatio: "1 / 1", transform: "translate(-50%, -50%)" }}
+                    style={{ left: "49.9%", top: "12.2%", width: "2.8%", aspectRatio: "1 / 1", transform: "translate(-50%, -50%)" }}
                     aria-hidden="true"
                   />
                 </span>
@@ -130,8 +133,10 @@ export default function Navbar({
               linkActive={linkActive}
               ringClass={ringColor}
               isAdminUser={isAdminUser}
+              isChofer={isChofer}
               isClient={isClient}
               hasStock={hasStock}
+              hasVendedores={hasVendedores}
               authLoading={authLoading}
               profile={profile}
             />
@@ -148,7 +153,9 @@ export default function Navbar({
                 outlineBtn={outlineBtn}
                 isTransparentNow={isTransparentNow}
                 isAdminUser={isAdminUser}
+                isChofer={isChofer}
                 hasStock={hasStock}
+                hasVendedores={hasVendedores}
               />
             ) : (
               <>
@@ -200,17 +207,42 @@ export default function Navbar({
                 Mi stock
               </MobileLink>
             )}
+            {hasVendedores && (
+              <MobileLink to="/deposito" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
+                Depósito
+              </MobileLink>
+            )}
+            {hasVendedores && (
+              <MobileLink to="/mis-vendedores" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
+                Mis clientes
+              </MobileLink>
+            )}
+            {hasVendedores && (
+              <MobileLink to="/mapa-vendedores" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
+                Mapa
+              </MobileLink>
+            )}
+            {hasVendedores && (
+              <MobileLink to="/transferir-stock" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
+                Mover stock
+              </MobileLink>
+            )}
+            {(isChofer || profile?.esChofer === true) && (
+              <MobileLink to="/chofer" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
+                🚚 Sector chofer
+              </MobileLink>
+            )}
             {isClient && (
               <>
                 <MobileLink to="/mis-pedidos" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
-                  Mis comprobantes
+                  Mis pedidos
                 </MobileLink>
                 <MobileLink to="/mi-cuenta" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
                   Mi cuenta
                 </MobileLink>
               </>
             )}
-            {!authLoading && !isClient && !isAdminUser && (
+            {!authLoading && !isClient && !isAdminUser && !isChofer && (
               <>
                 <MobileLink to="/estado-de-pedido" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
                   Estado de pedido
@@ -239,6 +271,11 @@ export default function Navbar({
                       Generar usuario
                     </MobileLink>
                   </>
+                )}
+                {(isChofer || profile?.esChofer === true) && (
+                  <MobileLink to="/chofer" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
+                    🚚 Sector chofer
+                  </MobileLink>
                 )}
                 <button
                   onClick={handleLogout}
@@ -271,13 +308,36 @@ export default function Navbar({
   );
 }
 
-function UserMenu({ user, profile, onLogout, outlineBtn, isTransparentNow, isAdminUser, hasStock }) {
+function UserMenu({ user, profile, onLogout, outlineBtn, isTransparentNow, isAdminUser, isChofer, hasStock, hasVendedores }) {
   const [dropOpen, setDropOpen] = useState(false);
   const displayName = profile?.name || user.displayName || user.email?.split("@")[0] || "Usuario";
   const showMiStock = hasStock;
   const itemClass = `flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm font-medium transition ${
     isTransparentNow ? "hover:bg-white/10" : "hover:bg-slate-100"
   }`;
+
+  // Notificaciones push: cualquier cuenta (admin o cliente) puede activarlas
+  // para su propio celular — cada uno recibe solo los avisos que le
+  // corresponden a su cuenta, no los de otros.
+  const [notifPermiso, setNotifPermiso] = useState(null);
+  const [notifBusy, setNotifBusy] = useState(false);
+  const [notifError, setNotifError] = useState("");
+  useEffect(() => {
+    permisoNotificacionesEstado().then(setNotifPermiso);
+  }, []);
+
+  async function handleActivarNotificaciones() {
+    setNotifBusy(true);
+    setNotifError("");
+    try {
+      await activarNotificacionesPush(user.uid);
+      setNotifPermiso("granted");
+    } catch (e) {
+      setNotifError(e.message || "No se pudo activar");
+    } finally {
+      setNotifBusy(false);
+    }
+  }
 
   return (
     <div className="relative">
@@ -304,13 +364,42 @@ function UserMenu({ user, profile, onLogout, outlineBtn, isTransparentNow, isAdm
             <div className={`px-3 py-2 text-xs ${isTransparentNow ? "text-white/60" : "text-slate-500"}`}>
               {user.email}
             </div>
-            {(showMiStock || isAdminUser) && (
+            {(showMiStock || hasVendedores || isAdminUser || isChofer) && (
               <hr className={isTransparentNow ? "border-white/15 my-1" : "border-slate-100 my-1"} />
             )}
             {showMiStock && (
               <Link to="/mi-stock" onClick={() => setDropOpen(false)} className={itemClass}>
                 <BikeIcon />
                 Mi stock
+              </Link>
+            )}
+            {hasVendedores && (
+              <Link to="/deposito" onClick={() => setDropOpen(false)} className={itemClass}>
+                <BikeIcon />
+                Depósito
+              </Link>
+            )}
+            {hasVendedores && (
+              <Link to="/mis-vendedores" onClick={() => setDropOpen(false)} className={itemClass}>
+                <BikeIcon />
+                Mis clientes
+              </Link>
+            )}
+            {hasVendedores && (
+              <Link to="/mapa-vendedores" onClick={() => setDropOpen(false)} className={itemClass}>
+                <BikeIcon />
+                Mapa
+              </Link>
+            )}
+            {hasVendedores && (
+              <Link to="/transferir-stock" onClick={() => setDropOpen(false)} className={itemClass}>
+                <BikeIcon />
+                Mover stock
+              </Link>
+            )}
+            {(isChofer || profile?.esChofer === true) && (
+              <Link to="/chofer" onClick={() => setDropOpen(false)} className={itemClass}>
+                🚚 Sector chofer
               </Link>
             )}
             {isAdminUser && (
@@ -325,6 +414,15 @@ function UserMenu({ user, profile, onLogout, outlineBtn, isTransparentNow, isAdm
                 </Link>
               </>
             )}
+            <hr className={isTransparentNow ? "border-white/15 my-1" : "border-slate-100 my-1"} />
+            {notifPermiso === "granted" ? (
+              <div className={`${itemClass} cursor-default opacity-60`}>🔔 Notificaciones activadas</div>
+            ) : notifPermiso === "unsupported" ? null : (
+              <button onClick={handleActivarNotificaciones} disabled={notifBusy} className={itemClass}>
+                🔔 {notifBusy ? "Activando…" : "Activar notificaciones"}
+              </button>
+            )}
+            {notifError && <p className="px-3 pb-1 text-[11px] text-rose-500">{notifError}</p>}
             <hr className={isTransparentNow ? "border-white/15 my-1" : "border-slate-100 my-1"} />
             <button onClick={onLogout} className={itemClass}>
               <LogoutIcon />
@@ -373,7 +471,7 @@ function LogoutIcon() {
   );
 }
 
-function PrimaryLinks({ onNavigate, linkInactive, linkActive, ringClass, isAdminUser, isClient, hasStock, authLoading, profile }) {
+function PrimaryLinks({ onNavigate, linkInactive, linkActive, ringClass, isAdminUser, isChofer, isClient, hasStock, hasVendedores, authLoading, profile }) {
   const base =
     `text-sm font-medium transition rounded-lg px-3 py-2 focus:outline-none focus-visible:ring-2 ${ringClass}`;
   return (
@@ -389,17 +487,42 @@ function PrimaryLinks({ onNavigate, linkInactive, linkActive, ringClass, isAdmin
           Mi stock
         </NavLink>
       )}
+      {hasVendedores && (
+        <NavLink to="/deposito" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
+          Depósito
+        </NavLink>
+      )}
+      {hasVendedores && (
+        <NavLink to="/mis-vendedores" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
+          Mis clientes
+        </NavLink>
+      )}
+      {hasVendedores && (
+        <NavLink to="/mapa-vendedores" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
+          Mapa
+        </NavLink>
+      )}
+      {hasVendedores && (
+        <NavLink to="/transferir-stock" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
+          Mover stock
+        </NavLink>
+      )}
+      {isChofer && (
+        <NavLink to="/chofer" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
+          🚚 Sector chofer
+        </NavLink>
+      )}
       {isClient && (
         <>
           <NavLink to="/mis-pedidos" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
-            Mis comprobantes
+            Mis pedidos
           </NavLink>
           <NavLink to="/mi-cuenta" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
             Mi cuenta
           </NavLink>
         </>
       )}
-      {!authLoading && !isClient && !isAdminUser && (
+      {!authLoading && !isClient && !isAdminUser && !isChofer && (
         <>
           <NavLink to="/estado-de-pedido" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
             Estado de pedido

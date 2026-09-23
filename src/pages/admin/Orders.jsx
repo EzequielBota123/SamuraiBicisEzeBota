@@ -583,10 +583,38 @@ function buildOrderText(order) {
   return lines.join("\n");
 }
 
+const WHATSAPP_EMPRESA = "5491149166234";
+
+function soloDigitos(s) {
+  return String(s || "").replace(/\D/g, "");
+}
+
+// Mensaje listo para el cliente que hizo una "solicitud" desde el catálogo
+// público sin tener cuenta de distribuidor — le pide que se registre antes
+// de poder comprar.
+function mensajeParaClienteSinCuenta(order) {
+  const nombre = (order.customer?.name || "").split(" ")[0] || "";
+  return [
+    `Hola ${nombre}! Vimos tu pedido de ${order.items?.[0]?.name || "una bici"} en nuestro catálogo.`,
+    "",
+    "Para poder comprar necesitás una cuenta de distribuidor aprobada en nuestro sistema — es rápido, completá este formulario y te damos de alta: https://samurai.ar/quiero-ser-cliente",
+    "",
+    "Una vez aprobado, ya podés hacer el pedido directo desde tu cuenta. ¡Cualquier duda, contame!",
+  ].join("\n");
+}
+
+function mensajeParaEmpresaSobreLead(order) {
+  return [
+    `Te paso un lead nuevo: ${order.customer?.name || "(sin nombre)"} (${order.customer?.email || "sin email"}, ${order.customer?.phone || "sin teléfono"}) pidió comprar "${order.items?.[0]?.name || "-"}" desde el catálogo público, pero no tiene cuenta de distribuidor.`,
+    "Le mandé el link para que se registre en \"Quiero ser distribuidor\" — seguilo para cerrar la venta una vez que complete el alta.",
+  ].join("\n");
+}
+
 function OrderDetailModal({ order, onClose, onMarkPaid, onCancel, onReactivate, authLoading }) {
   const [copied, setCopied] = useState(false);
   if (!order) return null;
   const items = order.items || [];
+  const esSolicitudSinCuenta = order.status === "solicitud" && !order.customer?.uid;
 
   function handleCopy() {
     navigator.clipboard.writeText(buildOrderText(order));
@@ -631,6 +659,32 @@ function OrderDetailModal({ order, onClose, onMarkPaid, onCancel, onReactivate, 
             <p><span className="text-slate-500 dark:text-neutral-400">Comprobante:</span> {order.contabiliumComprobanteNumero}</p>
           )}
         </div>
+
+        {esSolicitudSinCuenta && (
+          <div className="mt-4 flex flex-wrap gap-2 rounded-2xl border border-sky-200 bg-sky-50 p-3 dark:border-sky-900 dark:bg-sky-950/20">
+            <p className="w-full text-xs text-sky-800 dark:text-sky-400">
+              Pidió comprar sin tener cuenta de distribuidor — avisale a él y a Contacto Empresa por WhatsApp:
+            </p>
+            {order.customer?.phone && (
+              <a
+                href={`https://wa.me/54${soloDigitos(order.customer.phone)}?text=${encodeURIComponent(mensajeParaClienteSinCuenta(order))}`}
+                target="_blank"
+                rel="noreferrer"
+                className="rounded-xl bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-700"
+              >
+                💬 Escribirle a {order.customer.name || "cliente"}
+              </a>
+            )}
+            <a
+              href={`https://wa.me/${WHATSAPP_EMPRESA}?text=${encodeURIComponent(mensajeParaEmpresaSobreLead(order))}`}
+              target="_blank"
+              rel="noreferrer"
+              className="rounded-xl border border-sky-300 bg-white px-3 py-2 text-xs font-semibold text-sky-700 hover:bg-sky-100 dark:border-sky-800 dark:bg-neutral-900"
+            >
+              💬 Avisar a Contacto Empresa
+            </a>
+          </div>
+        )}
 
         <div className="mt-5">
           <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-neutral-500">Items pedidos</p>

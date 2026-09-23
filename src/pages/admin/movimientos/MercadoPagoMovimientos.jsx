@@ -10,6 +10,16 @@ function onlyDigits(s) {
   return String(s || "").replace(/\D/g, "");
 }
 
+// Cuentas propias de la empresa (no son clientes) — movimientos entre
+// cuentas de ustedes mismos. Se muestran igual con todos los datos (nombre
+// incluido), pero marcados como "interno" en vez de "sin identificar".
+const NOMBRES_INTERNOS = { "fepatop25@gmail.com": "FEPA TOP SAS (cuenta propia)" };
+
+// En una transferencia saliente Mercado Pago no manda el nombre del
+// destinatario, solo su ID interno de MP — acá se guarda a mano una vez
+// identificado, para no tener que adivinarlo cada vez que aparece.
+const NOMBRES_DESTINATARIOS = {};
+
 const RANGOS = [
   { id: 7, label: "7 días" },
   { id: 15, label: "15 días" },
@@ -58,7 +68,13 @@ export default function MercadoPagoMovimientos({ clientesPorCuit, clientesPorEma
       const porCuit = digitos.length >= 10 ? clientesPorCuit?.get(digitos) : null;
       const porEmail = m.pagador && m.pagador.includes("@") ? clientesPorEmail?.get(m.pagador.toLowerCase()) : null;
       const cliente = porCuit || porEmail || null;
-      return { ...m, cliente };
+      const nombreInterno = m.pagador ? NOMBRES_INTERNOS[m.pagador.toLowerCase()] : null;
+      const esInterno = !!nombreInterno;
+      const destinatario =
+        m.tipoOperacion === "money_transfer"
+          ? m.destinatarioNombre || (m.destinatarioId ? NOMBRES_DESTINATARIOS[m.destinatarioId] : null) || null
+          : null;
+      return { ...m, cliente, esInterno, nombreInterno, destinatario };
     });
   }, [movimientos, clientesPorCuit, clientesPorEmail]);
 
@@ -148,24 +164,37 @@ export default function MercadoPagoMovimientos({ clientesPorCuit, clientesPorEma
             className={`rounded-2xl border p-3 ${
               r.cliente
                 ? "border-emerald-200 bg-emerald-50 dark:border-emerald-900 dark:bg-emerald-950/30"
+                : r.esInterno
+                ? "border-slate-200 bg-slate-50 dark:border-neutral-800 dark:bg-neutral-900"
                 : "border-amber-200 bg-amber-50 dark:border-amber-900 dark:bg-amber-950/30"
             }`}
           >
             <div className="flex flex-wrap items-start justify-between gap-2">
               <div className="min-w-0">
                 <p className="truncate text-sm font-medium text-slate-900 dark:text-white">{r.descripcion || "Cobro Mercado Pago"}</p>
-                <p className="truncate text-xs text-slate-500 dark:text-neutral-400">{r.pagador || "(sin identificar remitente)"}</p>
+                <p className="truncate text-xs text-slate-500 dark:text-neutral-400">
+                  {r.nombreInterno || r.pagador || "(sin identificar remitente)"}
+                </p>
                 <p className="mt-1 text-xs text-slate-400 dark:text-neutral-500">
                   {new Date(r.fecha).toLocaleString("es-AR")} · {r.metodo}
                   {r.tipoOperacion === "money_transfer" && " · 📤 transferencia saliente"}
                   {r.tipoOperacion === "regular_payment" && " · 🛒 venta"}
                 </p>
+                {r.tipoOperacion === "money_transfer" && (
+                  <p className="mt-0.5 text-xs text-slate-500 dark:text-neutral-400">
+                    Para: {r.destinatario || `(sin nombre — ID MP ${r.destinatarioId || "?"})`}
+                  </p>
+                )}
               </div>
               <p className="shrink-0 font-semibold text-slate-900 dark:text-white">{money(r.monto)}</p>
             </div>
             <p
               className={`mt-2 text-xs font-medium ${
-                r.cliente ? "text-emerald-700 dark:text-emerald-400" : "text-amber-700 dark:text-amber-400"
+                r.cliente
+                  ? "text-emerald-700 dark:text-emerald-400"
+                  : r.esInterno
+                  ? "text-slate-500 dark:text-neutral-400"
+                  : "text-amber-700 dark:text-amber-400"
               }`}
             >
               {r.cliente ? (
@@ -175,6 +204,8 @@ export default function MercadoPagoMovimientos({ clientesPorCuit, clientesPorEma
                     {r.cliente.name}
                   </Link>
                 </>
+              ) : r.esInterno ? (
+                "🔁 Movimiento interno (cuenta propia FEPA TOP) — no es un cliente"
               ) : (
                 "⚠️ No se pudo identificar por CUIT ni mail — revisar a mano"
               )}

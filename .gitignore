@@ -32,3 +32,7 @@ serviceAccountKey.json
 # Variables de entorno con claves/API keys
 .env
 .env.*
+
+# Scripts sueltos de debug/investigación (a veces con credenciales hardcodeadas)
+_tmp_*.mjs
+_tmp_*.js
