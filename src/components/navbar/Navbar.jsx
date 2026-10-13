@@ -37,6 +37,10 @@ export default function Navbar({
   const isClient = !authLoading && !!user && !isAdminUser && !isChofer;
   const hasStock = !authLoading && !!user && !!profile?.contabiliumDepositoId;
   const hasVendedores = !authLoading && !!user && !!profile?.vendedoresAsignados?.length;
+  // La "App simple" (/app) es solo para las cuentas que Samurai habilitó a
+  // mano (hoy: Julián y Cuchi) — no todo distribuidor con depósito propio,
+  // aunque todos puedan ver "Depósito"/"Mover stock" en el menú normal.
+  const appSimpleHabilitada = !authLoading && !!user && !!profile?.appSimpleHabilitada;
   const isTransparentNow = transparentOnTop && !scrolled && !open;
 
   const headerBg = isTransparentNow
@@ -207,7 +211,12 @@ export default function Navbar({
                 Mi stock
               </MobileLink>
             )}
-            {hasVendedores && (
+            {appSimpleHabilitada && (
+              <MobileLink to="/app" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
+                📱 App simple
+              </MobileLink>
+            )}
+            {appSimpleHabilitada && (
               <MobileLink to="/deposito" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
                 Depósito
               </MobileLink>
@@ -222,7 +231,7 @@ export default function Navbar({
                 Mapa
               </MobileLink>
             )}
-            {hasVendedores && (
+            {appSimpleHabilitada && (
               <MobileLink to="/transferir-stock" onClick={close} isTransparent={isTransparentNow} ringClass={ringColor}>
                 Mover stock
               </MobileLink>
@@ -373,7 +382,13 @@ function UserMenu({ user, profile, onLogout, outlineBtn, isTransparentNow, isAdm
                 Mi stock
               </Link>
             )}
-            {hasVendedores && (
+            {profile?.appSimpleHabilitada && (
+              <Link to="/app" onClick={() => setDropOpen(false)} className={itemClass}>
+                <BikeIcon />
+                📱 App simple
+              </Link>
+            )}
+            {profile?.appSimpleHabilitada && (
               <Link to="/deposito" onClick={() => setDropOpen(false)} className={itemClass}>
                 <BikeIcon />
                 Depósito
@@ -391,7 +406,7 @@ function UserMenu({ user, profile, onLogout, outlineBtn, isTransparentNow, isAdm
                 Mapa
               </Link>
             )}
-            {hasVendedores && (
+            {profile?.appSimpleHabilitada && (
               <Link to="/transferir-stock" onClick={() => setDropOpen(false)} className={itemClass}>
                 <BikeIcon />
                 Mover stock
@@ -487,7 +502,12 @@ function PrimaryLinks({ onNavigate, linkInactive, linkActive, ringClass, isAdmin
           Mi stock
         </NavLink>
       )}
-      {hasVendedores && (
+      {profile?.appSimpleHabilitada && (
+        <NavLink to="/app" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
+          📱 App simple
+        </NavLink>
+      )}
+      {profile?.appSimpleHabilitada && (
         <NavLink to="/deposito" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
           Depósito
         </NavLink>
@@ -502,7 +522,7 @@ function PrimaryLinks({ onNavigate, linkInactive, linkActive, ringClass, isAdmin
           Mapa
         </NavLink>
       )}
-      {hasVendedores && (
+      {profile?.appSimpleHabilitada && (
         <NavLink to="/transferir-stock" onClick={onNavigate} className={base + " " + linkInactive} activeClassName={linkActive} role="menuitem">
           Mover stock
         </NavLink>

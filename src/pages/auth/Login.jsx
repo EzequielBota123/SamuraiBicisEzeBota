@@ -34,12 +34,14 @@ export default function Login() {
       let role = null;
       let status = null;
       let displayName = user.displayName || id;
+      let appSimpleHabilitada = false;
       try {
         const snap = await getDoc(doc(db, "users", user.uid));
         if (snap.exists()) {
           role = snap.data()?.role || null;
           status = snap.data()?.status || null;
           displayName = snap.data()?.name || displayName;
+          appSimpleHabilitada = snap.data()?.appSimpleHabilitada === true;
         }
       } catch {
         // If profile fetch fails, default redirect
@@ -61,7 +63,18 @@ export default function Login() {
 
       updateDoc(doc(db, "users", user.uid), { lastLoginAt: serverTimestamp() }).catch(() => {});
 
-      const dest = ADMIN_ROLES.includes(role) ? "/" : role === "chofer" ? "/chofer" : "/catalogo";
+      // Solo las cuentas habilitadas a mano (hoy: Julián y Cuchi) entran
+      // directo a la app simplificada de "en la calle" — pocos botones
+      // grandes para mover stock o ver su depósito, en vez del catálogo
+      // completo. El resto de los distribuidores sigue entrando al catálogo
+      // como siempre.
+      const dest = ADMIN_ROLES.includes(role)
+        ? "/"
+        : role === "chofer"
+        ? "/chofer"
+        : appSimpleHabilitada
+        ? "/app"
+        : "/catalogo";
       setWelcome(`¡Bienvenido, ${displayName}!`);
       // Brief delay so the user sees the welcome message
       setTimeout(() => history.push(dest), 800);
