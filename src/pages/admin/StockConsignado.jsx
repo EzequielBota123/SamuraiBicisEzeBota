@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useLocation } from "react-router-dom";
 // "query" se importa como fsQuery porque el componente ya usa una variable
 // de estado local llamada `query` (el texto de búsqueda de bicis) — con el
 // mismo nombre, esa variable tapa la función de Firestore adentro de ese
@@ -6,7 +7,7 @@ import { useEffect, useMemo, useState } from "react";
 import { collection, getDocs, query as fsQuery, where } from "firebase/firestore";
 import { db } from "../../firebase";
 import { getContabiliumDepositos, labelDeposito, matchDeposito } from "../../services/contabiliumDepositos";
-import { getDepositoStockAdmin, ajustarStockManual, transferirStockManual, generarRemitoRealManual, debugProbeIdCC, searchContabiliumClientes } from "../../services/comprobantes";
+import { getDepositoStockAdmin, ajustarStockManual, transferirStockManual, generarRemitoRealManual, debugProbeIdCC, searchContabiliumClientes, crearDepositoManual, pedirProvinciaYCiudad } from "../../services/comprobantes";
 import { LoadingOverlay } from "../../components/ui/LoadingIndicators";
 import { filterBySearch } from "../../utils/colorSearch";
 import { StatsBanner, BikeCard, ItemModal } from "../../components/stock/ConsignedStockUI";
@@ -17,6 +18,34 @@ import { useAuth } from "../../auth/AuthContext";
 import CargarViajeCampos, { viajeCfgInicial } from "../../components/logistica/CargarViajeCampos";
 import { crearViajeDesdeTransferencia, numeroDeRemito } from "../../utils/viajeDesdeTransferencia";
 import { actualizarRemitoViaje } from "../../services/logisticaViajes";
+import DepositosFepaPanel from "../../components/stock/DepositosFepaPanel";
+import { extraerModelo, extraerTalle } from "../../utils/bikeName";
+
+const MODELOS_FILTRO = [
+  { id: "todos", label: "Todos" },
+  { id: "BOWIE", label: "Bowie" },
+  { id: "SHONEN", label: "Shonen" },
+  { id: "GOZEN", label: "Gozen" },
+  { id: "3.0", label: "Samurai 3.0" },
+  { id: "2.0", label: "Samurai 2.0" },
+];
+const ORDEN_MODELO_FILTRO = ["BOWIE", "SHONEN", "GOZEN", "3.0", "2.0"];
+const ORDEN_TALLE_FILTRO = ["XXS", "XS", "S", "M", "L", "XL", "XXL"];
+function ordenarPorModeloYTalle(items) {
+  return [...items].sort((a, b) => {
+    const ma = extraerModelo(a.name);
+    const mb = extraerModelo(b.name);
+    const ia = ma ? ORDEN_MODELO_FILTRO.indexOf(ma) : 99;
+    const ib = mb ? ORDEN_MODELO_FILTRO.indexOf(mb) : 99;
+    if (ia !== ib) return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+    const ta = extraerTalle(a.name);
+    const tb = extraerTalle(b.name);
+    const ja = ta ? ORDEN_TALLE_FILTRO.indexOf(ta) : 99;
+    const jb = tb ? ORDEN_TALLE_FILTRO.indexOf(tb) : 99;
+    if (ja !== jb) return (ja === -1 ? 99 : ja) - (jb === -1 ? 99 : jb);
+    return (a.name || "").localeCompare(b.name || "", "es");
+  });
+}
 
 const money = (n) =>
   Number(n || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 });
@@ -47,6 +76,24 @@ export default function StockConsignado() {
   const [distributorUid, setDistributorUid] = useState(null);
   const [distributorName, setDistributorName] = useState(null);
   const [recorderOpen, setRecorderOpen] = useState(false);
+  const [creandoDeposito, setCreandoDeposito] = useState(false);
+
+  async function handleCrearDeposito() {
+    const nombre = prompt("Nombre del depósito nuevo (ej. el nombre del cliente/distribuidor):");
+    if (!nombre || !nombre.trim()) return;
+    const direccion = prompt("Dirección (opcional, dejalo vacío si no hace falta):") || "";
+    const telefono = prompt("Teléfono (opcional):") || "";
+    setCreandoDeposito(true);
+    try {
+      const ubicacion = await pedirProvinciaYCiudad();
+      const result = await crearDepositoManual({ nombre: nombre.trim(), direccion, telefono, ...(ubicacion || {}) });
+      alert(result.aviso || "Depósito creado en Contabilium.");
+    } catch (e) {
+      alert(e.message || "No se pudo crear el depósito");
+    } finally {
+      setCreandoDeposito(false);
+    }
+  }
 
   useEffect(() => {
     getAuditProgramStart().then(setAuditProgramStart).catch(() => {});
@@ -66,12 +113,30 @@ export default function StockConsignado() {
     }
   }
 
+  const [fepaPanelAbierto, setFepaPanelAbierto] = useState(false);
+
+  const location = useLocation();
+
   useEffect(() => {
     getContabiliumDepositos()
       .then(setDepositos)
       .catch((e) => console.error("Error cargando depósitos:", e))
       .finally(() => setLoadingDepositos(false));
   }, []);
+
+  // Si llegamos acá desde una notificación (ej. "subió el video de
+  // auditoría", que trae ?depositoId=X), abrimos directo el depósito de ese
+  // distribuidor en vez de dejar la pantalla vacía esperando que alguien lo
+  // busque a mano en la lista.
+  useEffect(() => {
+    if (!depositos.length) return;
+    const params = new URLSearchParams(location.search);
+    const depositoIdParam = params.get("depositoId");
+    if (!depositoIdParam) return;
+    const match = depositos.find((d) => String(d.id) === depositoIdParam);
+    if (match) selectDeposito(match);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [depositos, location.search]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -189,6 +254,20 @@ export default function StockConsignado() {
         </p>
       </div>
 
+      <div>
+        <button
+          onClick={() => setFepaPanelAbierto((v) => !v)}
+          className="rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-2 text-sm font-semibold text-indigo-700 transition hover:bg-indigo-100 dark:border-indigo-900/50 dark:bg-indigo-950/20 dark:text-indigo-400"
+        >
+          🏢 Depósitos propios de Fepa {fepaPanelAbierto ? "▲" : "▼"}
+        </button>
+        {fepaPanelAbierto && (
+          <div className="mt-3">
+            <DepositosFepaPanel />
+          </div>
+        )}
+      </div>
+
       <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 dark:border-amber-500/30 dark:bg-amber-500/10">
         <p className="text-sm font-bold text-amber-800 dark:text-amber-300">[Uso único] Aviso de auditoría por mail</p>
         <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">Manda el mail de "se implementó la auditoría de stock" a todos los distribuidores con email cargado.</p>
@@ -228,6 +307,13 @@ export default function StockConsignado() {
             onChange={(e) => setSearch(e.target.value)}
             className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40 sm:py-2.5"
           />
+          <button
+            onClick={handleCrearDeposito}
+            disabled={creandoDeposito}
+            className="mt-2 w-full rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-2 text-xs font-semibold text-emerald-700 transition hover:border-emerald-300 hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400"
+          >
+            {creandoDeposito ? "Creando…" : "+ Crear depósito nuevo"}
+          </button>
           <div className="relative mt-3 max-h-[40vh] space-y-1 overflow-y-auto lg:max-h-[65vh]">
             {loadingDepositos && (
               <p className="px-2 py-4 text-xs text-slate-500 dark:text-neutral-400">Cargando depósitos…</p>
@@ -442,6 +528,7 @@ export default function StockConsignado() {
 // grilla principal (esa solo muestra lo disponible).
 function AjusteStockPanel({ depositoId, items, onAjustado }) {
   const [query, setQuery] = useState("");
+  const [filtroModeloBusqueda, setFiltroModeloBusqueda] = useState("todos");
   const [producto, setProducto] = useState(null);
   const [cantidad, setCantidad] = useState(1);
   const [tipo, setTipo] = useState("M");
@@ -469,15 +556,28 @@ function AjusteStockPanel({ depositoId, items, onAjustado }) {
 
   const resultados = useMemo(() => {
     const q = query.trim().toLowerCase();
+    // Con un modelo elegido (Bowie/Shonen/Gozen/3.0/2.0) se muestran TODAS
+    // sus variantes (talle/color) ordenadas por talle, sin el tope de 8 — es
+    // justo lo que hace falta para elegir rápido una talla puntual sin tener
+    // que escribir nada. El texto libre, si hay, sigue acotando adentro de
+    // ese modelo.
+    if (filtroModeloBusqueda !== "todos") {
+      const delModelo = items.filter((it) => extraerModelo(it.name) === filtroModeloBusqueda);
+      const filtradas = q
+        ? delModelo.filter((it) => (it.name || "").toLowerCase().includes(q) || (it.sku || "").toLowerCase().includes(q))
+        : delModelo;
+      return ordenarPorModeloYTalle(filtradas);
+    }
     if (!q) return [];
     return items
       .filter((it) => (it.name || "").toLowerCase().includes(q) || (it.sku || "").toLowerCase().includes(q))
       .slice(0, 8);
-  }, [items, query]);
+  }, [items, query, filtroModeloBusqueda]);
 
   function elegir(item) {
     setProducto(item);
     setQuery("");
+    setFiltroModeloBusqueda("todos");
     setCantidad(1);
     setTipo("M");
     setObservacion("");
@@ -522,15 +622,35 @@ function AjusteStockPanel({ depositoId, items, onAjustado }) {
       {!producto ? (
         <div className="relative mt-4">
           <p className="mb-1.5 text-xs font-bold uppercase tracking-wide text-amber-700 dark:text-amber-400">Paso 1 · Buscá la bici</p>
+
+          {/* Filtro por modelo — elegir uno (ej. "Samurai 2.0") muestra todas
+              sus variantes ordenadas por talle, sin tener que escribir nada. */}
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {MODELOS_FILTRO.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                onClick={() => setFiltroModeloBusqueda(m.id)}
+                className={`rounded-full px-3 py-1 text-xs font-semibold transition ${
+                  filtroModeloBusqueda === m.id
+                    ? "bg-amber-600 text-white"
+                    : "border border-amber-200 bg-white text-amber-700 hover:border-amber-400 dark:border-amber-900/50 dark:bg-neutral-900 dark:text-amber-300"
+                }`}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+
           <input
             type="search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Escribí el nombre o el código…"
+            placeholder={filtroModeloBusqueda === "todos" ? "Escribí el nombre o el código…" : "Filtrar adentro de este modelo (opcional)…"}
             className="w-full rounded-xl border border-amber-200 bg-white px-4 py-3 text-base text-slate-700 outline-none focus:border-amber-500 focus:ring-2 focus:ring-amber-500/40 dark:border-amber-900/50 dark:bg-neutral-900 dark:text-white"
           />
           {resultados.length > 0 && (
-            <ul className="absolute z-10 mt-1 w-full overflow-hidden rounded-xl border border-amber-200 bg-white shadow-lg dark:border-amber-900/50 dark:bg-neutral-900">
+            <ul className="absolute z-10 mt-1 max-h-80 w-full overflow-y-auto rounded-xl border border-amber-200 bg-white shadow-lg dark:border-amber-900/50 dark:bg-neutral-900">
               {resultados.map((it) => (
                 <li key={it.id || it.sku}>
                   <button
@@ -539,6 +659,11 @@ function AjusteStockPanel({ depositoId, items, onAjustado }) {
                     className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-xs hover:bg-amber-50 dark:hover:bg-amber-950/30"
                   >
                     <span className="text-slate-700 dark:text-neutral-200">
+                      {filtroModeloBusqueda !== "todos" && (
+                        <span className="mr-1.5 inline-block rounded bg-amber-100 px-1.5 py-0.5 font-semibold text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">
+                          {extraerTalle(it.name) || "—"}
+                        </span>
+                      )}
                       {it.name} <span className="text-slate-400">· SKU {it.sku}</span>
                     </span>
                     <span className={Number(it.stockActual || 0) > 0 ? "font-semibold text-emerald-600" : "font-semibold text-rose-500"}>
@@ -714,6 +839,7 @@ function TransferirStockPanel({ depositoOrigenId, depositoOrigenNombre, items, d
   const [remitoRealNumero, setRemitoRealNumero] = useState(null);
   const [remitoRealArchivo, setRemitoRealArchivo] = useState(null);
   const [remitoRealPdfBase64, setRemitoRealPdfBase64] = useState(null);
+  const [incluirMercaderiaConsig, setIncluirMercaderiaConsig] = useState(false);
 
   // Proveedor del remito: por defecto se detecta solo (el cliente
   // vinculado al depósito destino), pero se puede buscar y elegir otro a
@@ -960,6 +1086,7 @@ function TransferirStockPanel({ depositoOrigenId, depositoOrigenNombre, items, d
         remitoArchivo: archivo,
         proveedorContabiliumId: proveedor.contabiliumId,
         observaciones: observacion.trim() || undefined,
+        incluirMercaderiaConsignacion: incluirMercaderiaConsig,
       });
       setRemitoRealNumero(result.numero);
       setRemitoRealArchivo(result.remitoArchivo);
@@ -1135,6 +1262,15 @@ function TransferirStockPanel({ depositoOrigenId, depositoOrigenNombre, items, d
                   onChange={(e) => setObservacion(e.target.value)}
                   className="mt-1 w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs outline-none focus:border-sky-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
                 />
+
+                <label className="mt-3 flex items-center gap-2 text-slate-600 dark:text-neutral-400">
+                  <input
+                    type="checkbox"
+                    checked={incluirMercaderiaConsig}
+                    onChange={(e) => setIncluirMercaderiaConsig(e.target.checked)}
+                  />
+                  Incluir "MERCADERÍA EN CONSIGNACIÓN" en la observación
+                </label>
 
                 <button
                   type="button"

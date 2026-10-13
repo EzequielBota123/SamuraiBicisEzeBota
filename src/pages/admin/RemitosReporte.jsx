@@ -11,6 +11,11 @@ import {
   adminEditarObservacionRemito,
 } from "../../services/comprobantes";
 import { subscribeCobranzas } from "../../services/cobranzas";
+import { movimientosPorChofer, salidasPorDeposito, detectarChoferesEnTexto } from "../../utils/movimientosChofer";
+import CalendarioRemitos from "../../components/remitos/CalendarioRemitos";
+import MovimientosStockPanel from "../../components/remitos/MovimientosStockPanel";
+import SectorMovimientoStock from "../../components/remitos/SectorMovimientoStock";
+import SectorRemitosPersonalizados from "../../components/remitos/SectorRemitosPersonalizados";
 
 const money = (n) =>
   Number(n || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 });
@@ -169,6 +174,15 @@ export default function RemitosReporte() {
   const [syncError, setSyncError] = useState("");
   const [syncResult, setSyncResult] = useState(null);
   const [mostrarImportManual, setMostrarImportManual] = useState(false);
+  const [calendarioAbierto, setCalendarioAbierto] = useState(false);
+  const [resumenMovAbierto, setResumenMovAbierto] = useState(false);
+  const [remitosPersonalizadosAbierto, setRemitosPersonalizadosAbierto] = useState(false);
+  const [vistaSector, setVistaSector] = useState("stock"); // "stock" | "remitos"
+  // Apagado a propósito (contenido viejo del Sector 2, todavía no
+  // rearmado) — queda referenciado más abajo así el linter no se queja de
+  // variables sin usar, pero nunca se renderiza.
+  const sector2LegacyApagado = false;
+  const [movimientosAbierto, setMovimientosAbierto] = useState(false);
 
   // Modal "ver / editar remito real en Contabilium" — idAbierto es el id
   // de Contabilium (no el de nuestra caché), detalle es lo que devuelve
@@ -180,12 +194,21 @@ export default function RemitosReporte() {
   const [obsEditada, setObsEditada] = useState("");
   const [guardandoObs, setGuardandoObs] = useState(false);
   const [obsGuardadaOk, setObsGuardadaOk] = useState(false);
+  // Contexto de atribución de la FILA desde la que se abrió el modal — el
+  // detalle en sí (remitoDetalle) viene siempre crudo de Contabilium, donde
+  // un remito interno FEPA→FEPA sigue figurando a nombre de la propia
+  // empresa aunque el reporte ya haya detectado a qué cliente real
+  // corresponde por el texto de la observación. Sin esto el modal no puede
+  // distinguir "proveedor asignado de verdad" de "nombre adivinado por
+  // observación".
+  const [remitoAtribucionAbierta, setRemitoAtribucionAbierta] = useState(null);
 
-  async function abrirRemito(idRemito) {
+  async function abrirRemito(idRemito, atribucion = null) {
     setRemitoIdAbierto(idRemito);
     setRemitoDetalle(null);
     setRemitoError("");
     setObsGuardadaOk(false);
+    setRemitoAtribucionAbierta(atribucion);
     setRemitoCargando(true);
     try {
       const detalle = await adminObtenerRemitoDetalle(idRemito);
@@ -298,6 +321,16 @@ export default function RemitosReporte() {
     return [...set];
   }, [businessDetail, cobranzas]);
 
+  // CUIT/documento por clave de cliente (misma clave que porCliente/claveDeCobranza),
+  // para poder buscar por CUIT además de por nombre.
+  const cuitPorClave = useMemo(() => {
+    const map = new Map();
+    (cobranzas || []).forEach((c) => {
+      if (c.idPersona != null && c.nroDocumento) map.set(`id:${c.idPersona}`, c.nroDocumento);
+    });
+    return map;
+  }, [cobranzas]);
+
   // Nombre exacto (tal como lo devuelve matchNombreConocido) -> ID real de
   // Contabilium de ESE cliente. Hace falta para los remitos internos
   // atribuidos por observación: el remito en sí sigue teniendo el idPersona
@@ -401,6 +434,82 @@ export default function RemitosReporte() {
     () => (businessDetail?.porFactura || []).filter((f) => dentroDeRango(f.fecha)),
     [businessDetail, desde, hasta]
   );
+
+  // Todo lo que movió cada chofer/vendedor con reparto propio (Julián,
+  // Alfredo "Cuchi", Pablo) en el rango — cruza el texto de la observación,
+  // no depende de que el remito tenga un cliente bien atribuido, así
+  // aparecen incluso los movimientos que nunca se pudieron etiquetar.
+  const movimientosChofer = useMemo(
+    () => movimientosPorChofer(remitosDetail?.porRemito || [], desde, hasta),
+    [remitosDetail, desde, hasta]
+  );
+
+  // Cuántas bicis salieron de cada uno de los 3 depósitos propios en el
+  // rango — detectado por texto, cuenten o no con un cliente bien
+  // atribuido ("con remito o sin remito").
+  const salidasDeposito = useMemo(
+    () => salidasPorDeposito(remitosDetail?.porRemito || [], desde, hasta),
+    [remitosDetail, desde, hasta]
+  );
+
+  // Resumen mensual de TODO el historial (no depende de "Desde"/"Hasta"):
+  // cuántas bicis se movieron en total (todo remito, interno o no), cuántas
+  // de esas fueron entregas reales a un cliente, y cuántas las entregó
+  // Julián. "Entregadas a cliente" fusiona el caso típico de un mismo envío
+  // documentado en DOS remitos (el interno "movimiento de depósito" + el
+  // remito real a nombre del cliente, mismo cliente/fecha/bicis) — sin esto
+  // se cuenta la misma entrega dos veces.
+  const resumenMensualMovimientos = useMemo(() => {
+    const todos = (remitosDetail?.porRemito || []).filter((r) => r.fecha);
+    const directos = todos.filter((r) => !r.esInterno);
+    const internos = todos.filter((r) => r.esInterno);
+    const directosUsados = new Set();
+
+    const entregas = [];
+    for (const i of internos) {
+      const detectado = extraerClienteDeObservacion(i.observaciones);
+      const match = detectado ? matchNombreConocido(detectado) : null;
+      if (!match || match.confianza === "dudosa") continue;
+      const idx = directos.findIndex(
+        (d, k) =>
+          !directosUsados.has(k) &&
+          normalizarNombre(d.cliente) === normalizarNombre(match.nombre) &&
+          d.fecha === i.fecha &&
+          d.bicis === i.bicis
+      );
+      if (idx >= 0) {
+        directosUsados.add(idx);
+        const real = directos[idx];
+        entregas.push({
+          fecha: real.fecha,
+          bicis: real.bicis,
+          julian: detectarChoferesEnTexto(i.observaciones).includes("julian") || detectarChoferesEnTexto(real.observaciones).includes("julian"),
+        });
+      } else {
+        entregas.push({ fecha: i.fecha, bicis: i.bicis, julian: detectarChoferesEnTexto(i.observaciones).includes("julian") });
+      }
+    }
+    directos.forEach((d, k) => {
+      if (directosUsados.has(k)) return;
+      entregas.push({ fecha: d.fecha, bicis: d.bicis, julian: detectarChoferesEnTexto(d.observaciones).includes("julian") });
+    });
+
+    const porMes = new Map();
+    function getMes(ym) {
+      if (!porMes.has(ym)) porMes.set(ym, { totalMovidas: 0, entregadasCliente: 0, entregoJulian: 0 });
+      return porMes.get(ym);
+    }
+    for (const r of todos) {
+      getMes(r.fecha.slice(0, 7)).totalMovidas += r.bicis || 0;
+    }
+    for (const e of entregas) {
+      const m = getMes(e.fecha.slice(0, 7));
+      m.entregadasCliente += e.bicis;
+      if (e.julian) m.entregoJulian += e.bicis;
+    }
+
+    return [...porMes.entries()].map(([ym, d]) => ({ ym, ...d })).sort((a, b) => b.ym.localeCompare(a.ym));
+  }, [remitosDetail, nombresConocidos, idPorNombreConocido]);
 
   // Remitos reales a clientes de TODO el historial, sin recortar por fecha
   // — es la base para el SALDO en consignación, que es un stock acumulado
@@ -718,15 +827,21 @@ export default function RemitosReporte() {
     }));
     rows = rows.map((r) => {
       const s = saldoConsignacionPorCliente.get(r.clave);
-      return { ...r, saldoConsignacion: s ? s.entregado - s.facturado : 0 };
+      const cuit = cuitPorClave.get(r.clave) || "";
+      return { ...r, saldoConsignacion: s ? s.entregado - s.facturado : 0, cuit };
     });
     rows.sort((a, b) => b.bicisConsignadas - a.bicisConsignadas);
     if (search.trim()) {
       const q = search.trim().toLowerCase();
-      rows = rows.filter((r) => r.nombre.toLowerCase().includes(q));
+      const qDigits = q.replace(/\D/g, "");
+      rows = rows.filter((r) => {
+        if (r.nombre.toLowerCase().includes(q)) return true;
+        if (qDigits && r.cuit && r.cuit.replace(/\D/g, "").includes(qDigits)) return true;
+        return false;
+      });
     }
     return rows;
-  }, [seguimientoRealDelPeriodo, saldoConsignacionPorCliente, search]);
+  }, [seguimientoRealDelPeriodo, saldoConsignacionPorCliente, cuitPorClave, search]);
 
   const [clienteAbierto, setClienteAbierto] = useState(null); // clave de fila (id: o nombre:)
 
@@ -771,6 +886,29 @@ export default function RemitosReporte() {
       )}
       {syncError && <p className="text-xs font-medium text-rose-600 dark:text-rose-400">{syncError}</p>}
 
+      <div className="flex gap-2 rounded-2xl border border-slate-200 bg-white p-1.5 dark:border-neutral-800 dark:bg-neutral-900">
+        <button
+          onClick={() => setVistaSector("stock")}
+          className={`flex-1 rounded-xl px-4 py-2.5 text-sm font-bold transition ${
+            vistaSector === "stock"
+              ? "bg-emerald-600 text-white shadow"
+              : "text-slate-500 hover:bg-slate-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
+          }`}
+        >
+          🚚 Sector 1 — Movimiento de stock
+        </button>
+        <button
+          onClick={() => setVistaSector("remitos")}
+          className={`flex-1 rounded-xl px-4 py-2.5 text-sm font-bold transition ${
+            vistaSector === "remitos"
+              ? "bg-sky-600 text-white shadow"
+              : "text-slate-500 hover:bg-slate-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
+          }`}
+        >
+          📋 Sector 2 — Remitos personalizados
+        </button>
+      </div>
+
       <button
         type="button"
         onClick={() => setMostrarImportManual((v) => !v)}
@@ -807,6 +945,95 @@ export default function RemitosReporte() {
           {importError && <p className="mt-2 text-xs font-medium text-rose-600 dark:text-rose-400">{importError}</p>}
         </div>
       )}
+
+      {vistaSector === "stock" && <SectorMovimientoStock />}
+
+      {vistaSector === "remitos" && <SectorRemitosPersonalizados />}
+
+      {/* El contenido viejo de Sector 2 queda guardado acá abajo (apagado con
+          `false &&`, nunca se renderiza) hasta que lo rearmemos de cero. */}
+      {sector2LegacyApagado && (
+      <>
+      <div>
+        <button
+          onClick={() => setCalendarioAbierto((v) => !v)}
+          className="rounded-xl border border-indigo-200 bg-indigo-50 px-4 py-2 text-sm font-semibold text-indigo-700 transition hover:bg-indigo-100 dark:border-indigo-900/50 dark:bg-indigo-950/20 dark:text-indigo-400"
+        >
+          📅 Calendario de movimientos {calendarioAbierto ? "▲" : "▼"}
+        </button>
+        {calendarioAbierto && !loading && (
+          <div className="mt-3">
+            <CalendarioRemitos facturas={businessDetail?.porFactura || []} remitos={remitosDetail?.porRemito || []} />
+          </div>
+        )}
+      </div>
+
+      <div>
+        <button
+          onClick={() => setResumenMovAbierto((v) => !v)}
+          className="rounded-xl border border-fuchsia-200 bg-fuchsia-50 px-4 py-2 text-sm font-semibold text-fuchsia-700 transition hover:bg-fuchsia-100 dark:border-fuchsia-900/50 dark:bg-fuchsia-950/20 dark:text-fuchsia-400"
+        >
+          📆 Resumen mensual de movimientos {resumenMovAbierto ? "▲" : "▼"}
+        </button>
+        {resumenMovAbierto && !loading && (
+          <div className="mt-3 overflow-hidden rounded-2xl border border-slate-200 dark:border-neutral-800">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-slate-100 text-xs uppercase text-slate-500 dark:bg-neutral-800 dark:text-neutral-400">
+                <tr>
+                  <th className="px-4 py-2.5">Mes</th>
+                  <th className="px-4 py-2.5 text-right">Total movidas (interno + real)</th>
+                  <th className="px-4 py-2.5 text-right">Entregadas a cliente</th>
+                  <th className="px-4 py-2.5 text-right">Entregó Julián</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 dark:divide-neutral-800">
+                {resumenMensualMovimientos.map((m) => (
+                  <tr key={m.ym}>
+                    <td className="px-4 py-2 font-semibold capitalize text-slate-900 dark:text-white">
+                      {new Date(Number(m.ym.slice(0, 4)), Number(m.ym.slice(5, 7)) - 1, 1).toLocaleDateString("es-AR", {
+                        month: "long",
+                        year: "numeric",
+                      })}
+                    </td>
+                    <td className="px-4 py-2 text-right text-slate-600 dark:text-neutral-300">{m.totalMovidas}</td>
+                    <td className="px-4 py-2 text-right font-semibold text-indigo-600 dark:text-indigo-400">{m.entregadasCliente}</td>
+                    <td className="px-4 py-2 text-right text-amber-600 dark:text-amber-400">{m.entregoJulian}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="bg-slate-50 px-4 py-2 text-[11px] text-slate-400 dark:bg-neutral-900 dark:text-neutral-500">
+              "Total movidas" cuenta cualquier remito (interno entre depósitos propios o real a cliente). "Entregadas a cliente" son
+              entregas reales únicas — si un mismo envío quedó documentado en dos remitos (el interno de transferencia + el real a
+              nombre del cliente), se cuenta una sola vez. "Entregó Julián" es cuánto de esas entregas reales las llevó él, según lo que
+              dice la observación.
+            </p>
+          </div>
+        )}
+      </div>
+
+      <div>
+        <button
+          onClick={() => setMovimientosAbierto((v) => !v)}
+          className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm font-semibold text-emerald-700 transition hover:bg-emerald-100 dark:border-emerald-900/50 dark:bg-emerald-950/20 dark:text-emerald-400"
+        >
+          🔀 Movimientos entre depósitos {movimientosAbierto ? "▲" : "▼"}
+        </button>
+        {movimientosAbierto && (
+          <div className="mt-3">
+            <MovimientosStockPanel />
+          </div>
+        )}
+      </div>
+
+      <div>
+        <button
+          onClick={() => setRemitosPersonalizadosAbierto((v) => !v)}
+          className="rounded-xl border border-sky-200 bg-sky-50 px-4 py-2 text-sm font-semibold text-sky-700 transition hover:bg-sky-100 dark:border-sky-900/50 dark:bg-sky-950/20 dark:text-sky-400"
+        >
+          📦 Remitos personalizados (por depósito / chofer) {remitosPersonalizadosAbierto ? "▲" : "▼"}
+        </button>
+      </div>
 
       <div className="flex flex-wrap items-end gap-3 rounded-2xl border border-slate-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900">
         <div>
@@ -987,7 +1214,9 @@ export default function RemitosReporte() {
                                           </div>
                                           <p className="text-slate-600 dark:text-neutral-300">
                                             {r.esInterno ? "Interno FEPA→FEPA" : r.cliente}
-                                            {r.atribuidoDesdeObservacion ? " (detectado)" : ""}
+                                            {r.atribuidoDesdeObservacion
+                                              ? ` (detectado por observación · confianza ${r.confianzaAtribucion || "?"}, no es el proveedor real del remito en Contabilium)`
+                                              : ""}
                                           </p>
                                           {r.observaciones && <p className="text-[11px] text-slate-400 dark:text-neutral-500">💬 {r.observaciones}</p>}
                                         </div>
@@ -1062,7 +1291,7 @@ export default function RemitosReporte() {
                 type="search"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                placeholder="Buscar cliente…"
+                placeholder="Buscar cliente o CUIT…"
                 className="w-full max-w-xs rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm dark:border-neutral-700 dark:bg-neutral-900 dark:text-white"
               />
             </div>
@@ -1073,7 +1302,11 @@ export default function RemitosReporte() {
               afuera sin facturar a día de hoy. Tocá una fila para el detalle.
             </p>
             {porCliente.length === 0 ? (
-              <p className="text-sm text-slate-400 dark:text-neutral-500">Sin datos en este rango.</p>
+              <p className="text-sm text-slate-400 dark:text-neutral-500">
+                {search.trim()
+                  ? `No hay ningún cliente que coincida con "${search.trim()}" en el rango ${desde} a ${hasta}.`
+                  : `No hay ningún cliente con movimientos en el rango ${desde} a ${hasta}.`}
+              </p>
             ) : (
               <div className="max-h-[600px] overflow-y-auto overflow-x-auto">
                 <table className="w-full min-w-[760px] text-sm">
@@ -1209,7 +1442,14 @@ export default function RemitosReporte() {
                                       remCli.map((r) => (
                                         <div
                                           key={r.id}
-                                          onClick={() => abrirRemito(r.id)}
+                                          onClick={() =>
+                                            abrirRemito(
+                                              r.id,
+                                              r.esInterno
+                                                ? { tipo: "observacion", nombreCompleto: r.cliente, confianza: r.confianzaAtribucion }
+                                                : { tipo: "directo" }
+                                            )
+                                          }
                                           className="cursor-pointer border-b border-slate-100 py-1 text-xs hover:bg-white dark:border-neutral-800 dark:hover:bg-neutral-800/60"
                                         >
                                           <div className="flex justify-between gap-2">
@@ -1221,7 +1461,7 @@ export default function RemitosReporte() {
                                           </div>
                                           {r.esInterno && (
                                             <p className="text-[11px] text-amber-600 dark:text-amber-400">
-                                              detectado por observación · confianza {r.confianzaAtribucion || "?"}
+                                              detectado por observación · confianza {r.confianzaAtribucion || "?"} — nombre completo: {r.cliente}
                                             </p>
                                           )}
                                           {r.observaciones && (
@@ -1282,6 +1522,8 @@ export default function RemitosReporte() {
             )}
           </div>
 
+          {remitosPersonalizadosAbierto && (
+          <>
           {candidatosDudosos.length > 0 && (
             <div className="rounded-2xl border border-amber-300 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-950/20">
               <h2 className="text-sm font-semibold text-amber-900 dark:text-amber-300">
@@ -1296,7 +1538,13 @@ export default function RemitosReporte() {
                 {candidatosDudosos.map((r) => (
                   <div
                     key={r.id}
-                    onClick={() => abrirRemito(r.id)}
+                    onClick={() =>
+                      abrirRemito(r.id, {
+                        tipo: "dudoso",
+                        detectado: r.candidatoDudoso.detectado,
+                        sugerido: r.candidatoDudoso.sugerido,
+                      })
+                    }
                     className="cursor-pointer rounded-lg border border-amber-200 bg-white px-2.5 py-1.5 text-xs hover:border-amber-400 dark:border-amber-900 dark:bg-neutral-900"
                   >
                     <div className="flex flex-wrap items-center justify-between gap-1">
@@ -1312,6 +1560,159 @@ export default function RemitosReporte() {
                 ))}
               </div>
             </div>
+          )}
+
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900">
+            <h2 className="text-sm font-semibold text-slate-800 dark:text-neutral-200">
+              🏭 Salidas por depósito (sector), en el rango {desde} a {hasta}
+            </h2>
+            <p className="mt-1 text-xs text-slate-400 dark:text-neutral-500">
+              Cuántas bicis salieron de cada uno de los 3 depósitos propios — cuenta cualquier remito que mencione el
+              depósito de origen en la observación, tenga o no un cliente bien atribuido (con remito o sin remito).
+            </p>
+            <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
+              {salidasDeposito.sectores.map((s) => (
+                <div key={s.id} className="rounded-xl border border-slate-100 p-3 dark:border-neutral-800">
+                  <p className="text-sm font-semibold text-slate-800 dark:text-neutral-200">{s.nombre}</p>
+                  {s.movimientos.length === 0 ? (
+                    <p className="mt-1 text-sm text-slate-400 dark:text-neutral-500">Sin movimientos en este rango de fechas.</p>
+                  ) : (
+                    <>
+                      <p className="mt-1 text-2xl font-bold text-sky-700 dark:text-sky-400">{s.totalBicis}</p>
+                      <p className="text-xs text-slate-400 dark:text-neutral-500">bicis en {s.movimientos.length} movimiento(s)</p>
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+            {salidasDeposito.sectores.every((s) => s.movimientos.length === 0) && salidasDeposito.sinDetectar.movimientos === 0 && (
+              <p className="mt-2 text-xs text-slate-400 dark:text-neutral-500">
+                No hay ningún movimiento con depósito de origen detectable en este rango de fechas.
+              </p>
+            )}
+            {salidasDeposito.sinDetectar.movimientos > 0 && (
+              <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
+                ⚠️ {salidasDeposito.sinDetectar.movimientos} movimiento(s) más ({salidasDeposito.sinDetectar.bicis} bicis) no
+                mencionan ningún depósito en la observación, así que no se pudieron sumar a ningún sector.
+              </p>
+            )}
+            <details className="mt-3">
+              <summary className="cursor-pointer text-xs font-medium text-sky-700 hover:underline dark:text-sky-400">
+                Ver el detalle de cada sector
+              </summary>
+              <div className="mt-2 space-y-3">
+                {salidasDeposito.sectores.map((s) => (
+                  <div key={s.id} className="rounded-xl border border-slate-100 dark:border-neutral-800">
+                    <p className="border-b border-slate-100 bg-slate-50 px-3 py-1.5 text-xs font-semibold text-slate-700 dark:border-neutral-800 dark:bg-neutral-800/50 dark:text-neutral-300">
+                      {s.nombre}
+                    </p>
+                    {s.movimientos.length === 0 ? (
+                      <p className="px-3 py-2 text-xs text-slate-400 dark:text-neutral-500">Sin movimientos en este rango.</p>
+                    ) : (
+                      <div className="max-h-56 overflow-y-auto">
+                        <table className="w-full min-w-[600px] text-xs">
+                          <thead className="sticky top-0 bg-white text-left text-slate-400 dark:bg-neutral-900 dark:text-neutral-500">
+                            <tr>
+                              <th className="px-3 py-1">Fecha</th>
+                              <th className="px-3 py-1">Número</th>
+                              <th className="px-3 py-1">Bicis</th>
+                              <th className="px-3 py-1">A quién / tipo</th>
+                              <th className="px-3 py-1">Observación</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {s.movimientos.map((m, i) => (
+                              <tr
+                                key={i}
+                                onClick={() => abrirRemito(m.id, m.destino ? { tipo: "directo" } : { tipo: "sin_detectar" })}
+                                className="cursor-pointer border-t border-slate-50 hover:bg-sky-50 dark:border-neutral-800 dark:hover:bg-sky-500/10"
+                              >
+                                <td className="px-3 py-1 text-slate-500 dark:text-neutral-400">{m.fecha}</td>
+                                <td className="px-3 py-1 font-mono text-sky-700 underline decoration-dotted dark:text-sky-400">{m.numero}</td>
+                                <td className="px-3 py-1">{m.bicis}</td>
+                                <td className="px-3 py-1">
+                                  {m.destino ? (
+                                    <span className="text-emerald-600 dark:text-emerald-400">{m.destino}</span>
+                                  ) : (
+                                    <span className="text-slate-400 dark:text-neutral-500">movimiento interno</span>
+                                  )}
+                                </td>
+                                <td className="max-w-[260px] truncate px-3 py-1 text-slate-400 dark:text-neutral-500" title={m.observaciones}>
+                                  {m.observaciones}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </details>
+          </div>
+
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900">
+            <h2 className="text-sm font-semibold text-slate-800 dark:text-neutral-200">🚚 Movimientos por chofer, en el rango {desde} a {hasta}</h2>
+            <p className="mt-1 text-xs text-slate-400 dark:text-neutral-500">
+              Todo lo que movió cada chofer/vendedor con reparto propio, sea entrega a un cliente o traslado entre
+              depósitos — se detecta por lo que dice la observación del remito, así que aparece aunque el remito no
+              tenga un cliente bien atribuido.
+            </p>
+            <div className="mt-3 space-y-3">
+              {movimientosChofer.map((c) => (
+                <div key={c.id} className="rounded-xl border border-slate-100 dark:border-neutral-800">
+                  <div className="flex items-center justify-between gap-2 border-b border-slate-100 bg-slate-50 px-3 py-2 dark:border-neutral-800 dark:bg-neutral-800/50">
+                    <p className="text-sm font-semibold text-slate-800 dark:text-neutral-200">{c.nombre}</p>
+                    <p className="text-xs text-slate-500 dark:text-neutral-400">
+                      {c.movimientos.length} movimiento(s) · {c.totalBicis} bici(s) en total
+                    </p>
+                  </div>
+                  {c.movimientos.length === 0 ? (
+                    <p className="px-3 py-2 text-xs text-slate-400 dark:text-neutral-500">Sin movimientos en este rango.</p>
+                  ) : (
+                    <div className="max-h-56 overflow-y-auto">
+                      <table className="w-full min-w-[600px] text-xs">
+                        <thead className="sticky top-0 bg-white text-left text-slate-400 dark:bg-neutral-900 dark:text-neutral-500">
+                          <tr>
+                            <th className="px-3 py-1">Fecha</th>
+                            <th className="px-3 py-1">Número</th>
+                            <th className="px-3 py-1">Bicis</th>
+                            <th className="px-3 py-1">A quién / tipo</th>
+                            <th className="px-3 py-1">Observación</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {c.movimientos.map((m, i) => (
+                            <tr
+                              key={i}
+                              onClick={() => abrirRemito(m.id, m.destino ? { tipo: "directo" } : { tipo: "sin_detectar" })}
+                              className="cursor-pointer border-t border-slate-50 hover:bg-sky-50 dark:border-neutral-800 dark:hover:bg-sky-500/10"
+                            >
+                              <td className="px-3 py-1 text-slate-500 dark:text-neutral-400">{m.fecha}</td>
+                              <td className="px-3 py-1 font-mono text-sky-700 underline decoration-dotted dark:text-sky-400">{m.numero}</td>
+                              <td className="px-3 py-1">{m.bicis}</td>
+                              <td className="px-3 py-1">
+                                {m.destino ? (
+                                  <span className="text-emerald-600 dark:text-emerald-400">{m.destino}</span>
+                                ) : (
+                                  <span className="text-slate-400 dark:text-neutral-500">movimiento interno</span>
+                                )}
+                              </td>
+                              <td className="max-w-[260px] truncate px-3 py-1 text-slate-400 dark:text-neutral-500" title={m.observaciones}>
+                                {m.observaciones}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+          </>
           )}
 
           <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900">
@@ -1337,7 +1738,11 @@ export default function RemitosReporte() {
                   </thead>
                   <tbody className="divide-y divide-slate-100 dark:divide-neutral-800">
                     {remitosInternos.map((r) => (
-                      <tr key={r.id} onClick={() => abrirRemito(r.id)} className="cursor-pointer hover:bg-slate-50 dark:hover:bg-neutral-800/50">
+                      <tr
+                        key={r.id}
+                        onClick={() => abrirRemito(r.id, { tipo: "sin_detectar" })}
+                        className="cursor-pointer hover:bg-slate-50 dark:hover:bg-neutral-800/50"
+                      >
                         <td className="py-1.5 pr-3 whitespace-nowrap text-slate-500 dark:text-neutral-400">{r.fecha}</td>
                         <td className="py-1.5 pr-3 whitespace-nowrap font-mono text-sky-700 underline decoration-dotted dark:text-sky-400">{r.numero}</td>
                         <td className="py-1.5 pr-3 text-right">{r.bicis}</td>
@@ -1352,6 +1757,8 @@ export default function RemitosReporte() {
             )}
           </div>
         </>
+      )}
+      </>
       )}
 
       {remitoIdAbierto && (
@@ -1387,12 +1794,62 @@ export default function RemitosReporte() {
                     <p className="font-semibold text-slate-800 dark:text-white">{remitoDetalle.fecha || "—"}</p>
                   </div>
                   <div className="rounded-xl border border-slate-200 p-2.5 dark:border-neutral-800">
-                    <p className="text-[11px] text-slate-400 dark:text-neutral-500">A nombre de (idPersona)</p>
+                    <p className="text-[11px] text-slate-400 dark:text-neutral-500">A nombre de en Contabilium (idPersona)</p>
                     <p className="font-semibold text-slate-800 dark:text-white">
                       {remitoDetalle.razonSocialLista || "—"} <span className="font-normal text-slate-400">({remitoDetalle.idPersona ?? "?"})</span>
                     </p>
                   </div>
                 </div>
+
+                {/* Origen del dato: de dónde sale el nombre/id de arriba —
+                    asignado de verdad como proveedor del remito, adivinado
+                    por el texto de la observación (con su nivel de
+                    confianza), o todavía sin ninguna atribución. */}
+                {remitoAtribucionAbierta?.tipo === "observacion" && (
+                  <div className="mt-2 rounded-xl border border-amber-300 bg-amber-50 p-2.5 text-xs dark:border-amber-800 dark:bg-amber-950/20">
+                    <p className="font-semibold text-amber-900 dark:text-amber-300">
+                      ⚠️ No es un proveedor asignado — es un movimiento interno (FEPA→FEPA) atribuido por observación
+                    </p>
+                    <p className="mt-1 text-amber-700/90 dark:text-amber-400/80">
+                      En Contabilium este remito sigue a nombre de FEPA TOP (id {remitoDetalle.idPersona ?? "?"}) — nadie le asignó
+                      un proveedor real. El nombre completo de abajo salió de interpretar el texto de la observación, no de un
+                      campo de proveedor puesto a mano:
+                    </p>
+                    <p className="mt-1 font-semibold text-amber-900 dark:text-amber-300">
+                      {remitoAtribucionAbierta.nombreCompleto || "—"}{" "}
+                      <span className="font-normal">(confianza: {remitoAtribucionAbierta.confianza || "?"})</span>
+                    </p>
+                  </div>
+                )}
+                {remitoAtribucionAbierta?.tipo === "dudoso" && (
+                  <div className="mt-2 rounded-xl border border-amber-300 bg-amber-50 p-2.5 text-xs dark:border-amber-800 dark:bg-amber-950/20">
+                    <p className="font-semibold text-amber-900 dark:text-amber-300">
+                      🤔 Candidato sin confirmar — no está asignado a nadie todavía
+                    </p>
+                    <p className="mt-1 text-amber-700/90 dark:text-amber-400/80">
+                      La observación menciona "{remitoAtribucionAbierta.detectado}", que se parece a{" "}
+                      <strong>{remitoAtribucionAbierta.sugerido}</strong>, pero no lo suficiente como para atribuírselo solo.
+                      Sigue a nombre de FEPA TOP en Contabilium (id {remitoDetalle.idPersona ?? "?"}) hasta que alguien confirme a
+                      mano quién es de verdad.
+                    </p>
+                  </div>
+                )}
+                {remitoAtribucionAbierta?.tipo === "sin_detectar" && (
+                  <div className="mt-2 rounded-xl border border-slate-200 bg-slate-50 p-2.5 text-xs dark:border-neutral-800 dark:bg-neutral-800/40">
+                    <p className="text-slate-600 dark:text-neutral-300">
+                      Movimiento interno (FEPA→FEPA) sin ningún cliente detectable en la observación — el id de arriba es FEPA TOP,
+                      la propia empresa, no un cliente real.
+                    </p>
+                  </div>
+                )}
+                {remitoAtribucionAbierta?.tipo === "directo" && (
+                  <div className="mt-2 rounded-xl border border-emerald-300 bg-emerald-50 p-2.5 text-xs dark:border-emerald-800 dark:bg-emerald-950/20">
+                    <p className="text-emerald-800 dark:text-emerald-300">
+                      ✅ Proveedor asignado directamente en el remito (no es una detección por observación) — el nombre e id de
+                      arriba son el dato real cargado en Contabilium.
+                    </p>
+                  </div>
+                )}
 
                 <div className="mt-4">
                   <h3 className="text-sm font-semibold text-slate-800 dark:text-neutral-200">📦 Ítems</h3>
