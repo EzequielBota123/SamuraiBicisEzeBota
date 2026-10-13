@@ -19,6 +19,7 @@ import MisVendedoresPage from "./pages/mistock/MisVendedoresPage";
 import DepositoPage from "./pages/mistock/DepositoPage";
 import MapaVendedoresPage from "./pages/mistock/MapaVendedoresPage";
 import TransferirStockPage from "./pages/mistock/TransferirStockPage";
+import StreetHome from "./pages/mistock/StreetHome";
 import MiCuentaPage from "./pages/micuenta/MiCuentaPage";
 import Login from "./pages/auth/Login";
 import ResetPassword from "./pages/auth/ResetPassword";
@@ -33,7 +34,9 @@ import MovimientosBancarios from './pages/admin/MovimientosBancarios'
 import Clientes360 from './pages/admin/Clientes360'
 import ClientesReporte from './pages/admin/ClientesReporte'
 import DashboardNegocio from './pages/admin/DashboardNegocio'
+import ContadorDiario from './pages/admin/ContadorDiario'
 import RemitosReporte from './pages/admin/RemitosReporte'
+import PedidosPendientes from './pages/admin/PedidosPendientes'
 import Vendedores from './pages/admin/Vendedores'
 import Products from './pages/admin/Products'
 import Orders from './pages/admin/Orders'
@@ -78,7 +81,9 @@ export default function App() {
               <Route path="/admin/clientes-360" component={Clientes360} />
               <Route path="/admin/reporte-clientes" component={ClientesReporte} />
               <Route path="/admin/dashboard-negocio" component={DashboardNegocio} />
+              <Route path="/admin/contador-diario" component={ContadorDiario} />
               <Route path="/admin/remitos-reporte" component={RemitosReporte} />
+              <Route path="/admin/pedidos-pendientes" component={PedidosPendientes} />
               <Route path="/admin/vendedores" component={Vendedores} />
               <Route path="/admin/products" component={Products} />
               <Route path="/admin/orders" component={Orders} />
@@ -131,6 +136,7 @@ export default function App() {
               <Route path="/deposito" component={DepositoPage} />
               <Route path="/mapa-vendedores" component={MapaVendedoresPage} />
               <Route path="/transferir-stock" component={TransferirStockPage} />
+              <Route path="/app" component={StreetHome} />
               <Route path="/mi-cuenta" component={MiCuentaPage} />
               <Route path="/login" component={Login} />
               <Route path="/reset-password" component={ResetPassword} />

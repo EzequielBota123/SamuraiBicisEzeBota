@@ -27,7 +27,8 @@
       "Bash(firebase functions:secrets:access CONTABILIUM_API_KEY)",
       "Bash(node /private/tmp/claude-501/-Users-ezequielbota-SamuraiBicis/1a45bd5d-7f50-4660-9b73-cd197b1247c5/scratchpad/check_blanco.js)",
       "Bash(node -e ' *)",
-      "Bash(node -e \"console.log\\(new Date\\(1787952100*1000\\).toISOString\\(\\)\\)\")"
+      "Bash(node -e \"console.log\\(new Date\\(1787952100*1000\\).toISOString\\(\\)\\)\")",
+      "Bash(git fetch *)"
     ]
   }
 }

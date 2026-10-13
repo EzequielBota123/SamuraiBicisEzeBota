@@ -7,11 +7,12 @@ export default defineConfig({
   plugins: [
     react(),
     VitePWA({
-      // 'prompt' en vez de 'autoUpdate': con autoUpdate, cada deploy nuevo
-      // recargaba la pestaña sola apenas el usuario volvía a ella (sin
-      // avisar, cortando lo que estuviera escribiendo) — ahora se le
-      // muestra un aviso y decide cuándo actualizar (ver UpdateToast).
-      registerType: 'prompt',
+      // 'autoUpdate': cada deploy nuevo se activa y recarga solo, sin
+      // avisar — pedido explícito (30/9/2026) para que el celular siempre
+      // tenga la última versión. Antes era 'prompt' (con un cartel y botón
+      // "Actualizar", ver UpdateToast) para no cortar a alguien mientras
+      // escribía algo; ese resguardo se sacó a propósito.
+      registerType: 'autoUpdate',
       includeAssets: ['favicon.svg', 'icons/apple-touch-icon.png'],
       manifest: {
         name: 'Samurai Bicis',
