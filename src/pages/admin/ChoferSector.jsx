@@ -7,6 +7,8 @@ import { subscribeViajesRango } from "../../services/logisticaViajes";
 import { subscribeUbicacionesChoferes } from "../../services/ubicacionChofer";
 import { hoyISO, subscribeChequeosRecientes } from "../../services/chequeosVehiculo";
 import { subscribeChoferes } from "../../services/choferes";
+import { subscribeRemitosDespachosDetail } from "../../services/comprobantes";
+import { movimientosPorChofer } from "../../utils/movimientosChofer";
 
 const TABS = [
   { to: "/admin/chofer/grilla", label: "📅 Grilla y viajes" },
@@ -82,13 +84,24 @@ export default function ChoferSector() {
   const [ubicaciones, setUbicaciones] = useState(null);
   const [chequeos, setChequeos] = useState(null);
   const [choferes, setChoferes] = useState(null);
+  const [remitosDetail, setRemitosDetail] = useState(null);
 
   useEffect(() => subscribeViajesRango(hoy, hoy, setViajesHoy), [hoy]);
   useEffect(() => subscribeUbicacionesChoferes(setUbicaciones), []);
   useEffect(() => subscribeChequeosRecientes(setChequeos, 30), []);
   useEffect(() => subscribeChoferes(setChoferes), []);
+  useEffect(() => subscribeRemitosDespachosDetail(setRemitosDetail), []);
 
   const sinAsignar = (viajesHoy || []).filter((v) => !v.choferUid && v.estado !== "cancelado").length;
+
+  // Movimientos reales del mes (de los remitos, cruzando la observación) —
+  // esto sí trae historial completo, a diferencia de los viajes de la
+  // grilla que recién se empezaron a cargar y hoy tienen pocos registros.
+  const mesActual = hoy.slice(0, 7);
+  const movimientosDelMes = useMemo(
+    () => movimientosPorChofer(remitosDetail?.porRemito || [], `${mesActual}-01`, `${mesActual}-31`),
+    [remitosDetail, mesActual]
+  );
 
   return (
     <div className="space-y-4">
@@ -119,6 +132,25 @@ export default function ChoferSector() {
             ⚠️ Hay {sinAsignar} viaje(s) de hoy sin chofer asignado — los ve cualquier chofer.
           </p>
         )}
+      </div>
+
+      <div className="rounded-2xl border border-slate-200 bg-white p-3 dark:border-neutral-800 dark:bg-neutral-900">
+        <p className="text-sm font-bold text-slate-900 dark:text-white">📦 Movimientos reales del mes ({mesActual})</p>
+        <p className="mt-0.5 text-[11px] text-slate-500 dark:text-neutral-400">
+          De los remitos reales de Contabilium, no de esta grilla — así se ve lo que movió cada uno aunque no haya
+          cargado el viaje acá.
+        </p>
+        <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+          {movimientosDelMes.map((c) => (
+            <Tarjeta
+              key={c.id}
+              titulo={c.nombre}
+              valor={`${c.totalBicis} bici(s)`}
+              detalle={`${c.movimientos.length} movimiento(s) este mes`}
+              tono={c.movimientos.length > 0 ? "ok" : "neutral"}
+            />
+          ))}
+        </div>
       </div>
 
       <nav className="flex gap-1 overflow-x-auto border-b border-slate-200 dark:border-neutral-800">

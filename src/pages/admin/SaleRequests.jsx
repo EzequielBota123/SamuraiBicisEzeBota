@@ -1,6 +1,6 @@
 import { useEffect, useState, useMemo, useRef } from "react";
 import { useLocation } from "react-router-dom";
-import { listSaleRequests, resolveSaleRequest, deleteSaleRequest, reviewComprobantePago, emitirFacturaVenta } from "../../services/comprobantes";
+import { listSaleRequests, resolveSaleRequest, deleteSaleRequest, reviewComprobantePago, emitirFacturaVenta, listVentasFacturadasSinCobrar } from "../../services/comprobantes";
 import { LoadingOverlay } from "../../components/ui/LoadingIndicators";
 import Cobranzas from "./Cobranzas";
 
@@ -50,6 +50,17 @@ export default function SaleRequests() {
   // arriba de todo) — para cuando lo que importa es ver qué entró último,
   // sin importar de qué distribuidor es.
   const [ordenPorFecha, setOrdenPorFecha] = useState(false);
+  // Ventas ya facturadas de verdad en Contabilium pero sin ninguna cobranza
+  // cargada contra esa factura — se carga aparte del listado normal (cruza
+  // contra la colección de cobranzas) y se mantiene actualizado para poder
+  // mostrar el aviso (el número en la solapa) sin que haga falta entrar.
+  const [sinCobrar, setSinCobrar] = useState(null);
+
+  function loadSinCobrar() {
+    listVentasFacturadasSinCobrar()
+      .then((r) => setSinCobrar(r.items))
+      .catch(() => setSinCobrar([]));
+  }
 
   function toggleGroup(name) {
     setCollapsed((prev) => ({ ...prev, [name]: !prev[name] }));
@@ -90,6 +101,7 @@ export default function SaleRequests() {
 
   useEffect(() => {
     load();
+    loadSinCobrar();
   }, []);
 
   const comprobantesPendientes = useMemo(
@@ -133,10 +145,29 @@ export default function SaleRequests() {
   }, [items]);
 
   async function handleResolve(id) {
-    if (!confirm("¿Marcar esta venta como facturada en Contabilium?")) return;
+    const facturaNumero = prompt(
+      "Número de la factura real en Contabilium (obligatorio — se verifica contra Contabilium antes de marcarla):"
+    );
+    if (!facturaNumero) return;
+    if (
+      !confirm(
+        "Al marcarla, el sistema va a verificar que esa factura exista de verdad en Contabilium y va a intentar descontar el stock real del depósito automáticamente. ¿Confirmás?"
+      )
+    )
+      return;
     setResolvingId(id);
     try {
-      await resolveSaleRequest(id);
+      const result = await resolveSaleRequest(id, facturaNumero);
+      const avisos = [];
+      if (!result.montoCoincide) {
+        avisos.push(
+          `El monto de la factura ($${result.montoReal.toLocaleString("es-AR")}) no coincide exacto con lo reportado ($${result.montoEsperado.toLocaleString("es-AR")}) — revisá que sea la factura correcta.`
+        );
+      }
+      if (result.stockAjusteError) {
+        avisos.push(`El stock NO se pudo descontar automáticamente: ${result.stockAjusteError}\n\nAjustalo a mano desde Stock consignado.`);
+      }
+      if (avisos.length > 0) alert(`Se marcó como facturada, pero:\n\n${avisos.join("\n\n")}`);
       load();
     } catch (e) {
       alert(e.message || "No se pudo actualizar");
@@ -230,7 +261,7 @@ export default function SaleRequests() {
         </p>
       </div>
 
-      {tab !== "cobranzas" && (
+      {tab !== "cobranzas" && tab !== "sin_cobrar" && (
       <div className="min-w-0 overflow-hidden rounded-3xl border border-amber-200 bg-amber-50 p-5 dark:border-amber-500/30 dark:bg-amber-500/10 sm:p-6">
         <p className="text-xs font-semibold uppercase tracking-wider text-amber-700 dark:text-amber-400">Pendiente de facturar</p>
         <p className="mt-1 truncate text-2xl font-black text-amber-700 dark:text-amber-400 sm:text-4xl" title={money(totalPendiente)}>
@@ -278,8 +309,21 @@ export default function SaleRequests() {
           >
             💰 Cobranzas
           </button>
+          <button
+            onClick={() => setTab("sin_cobrar")}
+            className={`relative rounded-2xl px-4 py-2 text-sm font-semibold transition ${
+              tab === "sin_cobrar" ? "bg-slate-900 text-white dark:bg-white dark:text-neutral-900" : "border border-slate-200 text-slate-600 hover:bg-slate-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+            }`}
+          >
+            ⚠️ Facturadas sin cobrar
+            {sinCobrar && sinCobrar.length > 0 && (
+              <span className="ml-2 rounded-full bg-rose-500 px-2 py-0.5 text-[11px] font-bold text-white">
+                {sinCobrar.length}
+              </span>
+            )}
+          </button>
         </div>
-        {tab !== "cobranzas" && (
+        {tab !== "cobranzas" && tab !== "sin_cobrar" && (
           <button
             onClick={() => setOrdenPorFecha((v) => !v)}
             title="Todas las ventas reportadas en una sola lista, sin agrupar por distribuidor"
@@ -305,7 +349,48 @@ export default function SaleRequests() {
 
       {tab === "cobranzas" && <Cobranzas initialSearch={cobranzasSearch} />}
 
-      {tab !== "cobranzas" && ordenPorFecha && (
+      {tab === "sin_cobrar" && (
+        <div className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm dark:border-neutral-800 dark:bg-neutral-900 dark:shadow-none">
+          {sinCobrar === null && (
+            <LoadingOverlay label="Cargando…" className="rounded-[inherit] border border-slate-200 bg-white text-slate-600" />
+          )}
+          {sinCobrar !== null && sinCobrar.length === 0 && (
+            <div className="p-10 text-center text-sm text-slate-500 dark:text-neutral-400">
+              No hay facturas sin cobrar — todas las ventas facturadas tienen su cobranza cargada. 🎉
+            </div>
+          )}
+          {sinCobrar !== null && sinCobrar.length > 0 && (
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-slate-100 text-sm text-slate-600 dark:divide-neutral-800 dark:text-neutral-300">
+                <tbody className="divide-y divide-slate-100 dark:divide-neutral-800">
+                  {sinCobrar.map((it) => (
+                    <tr key={it.id}>
+                      <td className="w-40 px-4 py-4 text-slate-500 dark:text-neutral-400 sm:px-6">{formatDate(it.resolvedAt)}</td>
+                      <td className="px-4 py-4">
+                        <button
+                          onClick={() => verCobranzasDe(it.distributorName)}
+                          className="text-left font-semibold text-sky-700 hover:underline dark:text-sky-400"
+                        >
+                          {it.distributorName || "Sin nombre"}
+                        </button>
+                        <p className="text-xs text-slate-400 dark:text-neutral-500">
+                          {it.name} · SKU: {it.sku} · Factura {it.facturaNumero || "?"}
+                        </p>
+                      </td>
+                      <td className="px-4 py-4 text-right text-xs text-slate-500 dark:text-neutral-400">{it.quantity} u.</td>
+                      <td className="px-4 py-4 text-right font-semibold text-rose-600 dark:text-rose-400">
+                        {money(Number(it.unitPrice || 0) * Number(it.quantity || 0))}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab !== "cobranzas" && tab !== "sin_cobrar" && ordenPorFecha && (
         <div className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm dark:border-neutral-800 dark:bg-neutral-900 dark:shadow-none">
           {loading && (
             <LoadingOverlay label="Cargando…" className="rounded-[inherit] border border-slate-200 bg-white text-slate-600" />
@@ -353,7 +438,7 @@ export default function SaleRequests() {
         </div>
       )}
 
-      {tab !== "cobranzas" && !ordenPorFecha && (
+      {tab !== "cobranzas" && tab !== "sin_cobrar" && !ordenPorFecha && (
       <div className="relative overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm dark:border-neutral-800 dark:bg-neutral-900 dark:shadow-none">
         {loading && (
           <LoadingOverlay label="Cargando…" className="rounded-[inherit] border border-slate-200 bg-white text-slate-600" />

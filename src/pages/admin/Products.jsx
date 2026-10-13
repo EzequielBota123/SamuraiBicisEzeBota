@@ -13,6 +13,9 @@ import {
 import { LoadingOverlay } from "../../components/ui/LoadingIndicators";
 import { subscribeProductTypes } from "../../services/productTypes";
 import { ensureSheetJs } from "../../utils/sheetjs";
+import { adminProbarPrecioProducto, adminSincronizarPreciosCatalogo } from "../../services/comprobantes";
+import StockPorDepositoPanel from "../../components/admin/StockPorDepositoPanel";
+import PrecioDolaresPanel from "../../components/admin/PrecioDolaresPanel";
 
 const statusStyles = {
   true: "border border-emerald-200 bg-emerald-50 text-emerald-600 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400",
@@ -58,6 +61,66 @@ export default function Products() {
   const [syncMessage, setSyncMessage] = useState("");
   const [bowieUploading, setBowieUploading] = useState(false);
   const [bowieMessage, setBowieMessage] = useState("");
+
+  // Herramienta de un solo uso: probar si Contabilium deja escribir el
+  // precio de un producto por API (nunca se hizo acá) antes de armar la
+  // sincronización masiva de precios con IVA incluido.
+  const [precioSku, setPrecioSku] = useState("");
+  const [precioValor, setPrecioValor] = useState("");
+  const [precioProbando, setPrecioProbando] = useState(false);
+  const [precioResultado, setPrecioResultado] = useState(null);
+  async function handleProbarPrecio(dryRun) {
+    if (!precioSku.trim()) return;
+    setPrecioProbando(true);
+    setPrecioResultado(null);
+    try {
+      const r = await adminProbarPrecioProducto({
+        sku: precioSku.trim(),
+        precioConIva: precioValor ? Number(precioValor) : undefined,
+        dryRun,
+      });
+      setPrecioResultado(r);
+    } catch (e) {
+      setPrecioResultado({ error: e.message || String(e) });
+    } finally {
+      setPrecioProbando(false);
+    }
+  }
+
+  // Sincronización de precios con IVA para TODO el catálogo — ya
+  // confirmado que Contabilium acepta el PUT (adminProbarPrecioProducto).
+  // Primero reporte de diferencias (dryRun), después aplicar solo a los
+  // que hoy están sin precio cargado.
+  const [catalogoReporte, setCatalogoReporte] = useState(null);
+  const [catalogoCargando, setCatalogoCargando] = useState(false);
+  const [catalogoAplicando, setCatalogoAplicando] = useState(false);
+  const [catalogoResultadoAplicar, setCatalogoResultadoAplicar] = useState(null);
+  async function handleVerDiferenciasCatalogo() {
+    setCatalogoCargando(true);
+    setCatalogoResultadoAplicar(null);
+    try {
+      const r = await adminSincronizarPreciosCatalogo(false);
+      setCatalogoReporte(r);
+    } catch (e) {
+      setCatalogoReporte({ error: e.message || String(e) });
+    } finally {
+      setCatalogoCargando(false);
+    }
+  }
+  async function handleAplicarSinCargar() {
+    setCatalogoAplicando(true);
+    try {
+      const r = await adminSincronizarPreciosCatalogo(true);
+      setCatalogoResultadoAplicar(r);
+      // Refresca el reporte para reflejar lo que quedó aplicado.
+      const r2 = await adminSincronizarPreciosCatalogo(false);
+      setCatalogoReporte(r2);
+    } catch (e) {
+      setCatalogoResultadoAplicar({ error: e.message || String(e) });
+    } finally {
+      setCatalogoAplicando(false);
+    }
+  }
 
   // Herramienta de un solo uso: reparte 3 fotos (una por color) a los 9
   // productos Bowie segun el color mencionado en el nombre de cada uno.
@@ -262,6 +325,10 @@ export default function Products() {
         </div>
       </section>
 
+      <StockPorDepositoPanel />
+
+      <PrecioDolaresPanel />
+
       <div className="rounded-3xl border border-emerald-200 bg-emerald-50 px-6 py-4 shadow-sm dark:border-emerald-500/30 dark:bg-emerald-500/10">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
@@ -285,6 +352,129 @@ export default function Products() {
           >
             {syncing ? "Sincronizando…" : "Sincronizar ahora"}
           </button>
+        </div>
+      </div>
+
+      <div className="rounded-3xl border border-amber-200 bg-amber-50 px-6 py-4 shadow-sm dark:border-amber-500/30 dark:bg-amber-500/10">
+        <div className="text-sm font-semibold text-amber-800 dark:text-amber-300">🧪 Probar precio en Contabilium (SKU puntual)</div>
+        <div className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+          Paso previo a sincronizar precios en masa: primero "Ver crudo" para confirmar qué campos trae el producto en Contabilium, después "Escribir precio" en UN solo SKU para confirmar que el guardado funciona antes de aplicarlo a todo el catálogo.
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <input
+            value={precioSku}
+            onChange={(e) => setPrecioSku(e.target.value)}
+            placeholder="SKU (ej: 200046)"
+            className="w-40 rounded-xl border border-amber-300 bg-white px-3 py-2 text-sm outline-none focus:border-amber-500 dark:border-amber-700 dark:bg-neutral-900"
+          />
+          <input
+            value={precioValor}
+            onChange={(e) => setPrecioValor(e.target.value)}
+            placeholder="Precio con IVA (ej: 305000)"
+            type="number"
+            className="w-52 rounded-xl border border-amber-300 bg-white px-3 py-2 text-sm outline-none focus:border-amber-500 dark:border-amber-700 dark:bg-neutral-900"
+          />
+          <button
+            onClick={() => handleProbarPrecio(true)}
+            disabled={precioProbando || !precioSku.trim()}
+            className="rounded-xl border border-amber-300 bg-white px-4 py-2 text-sm font-medium text-amber-700 disabled:opacity-60 dark:border-amber-700 dark:bg-neutral-900"
+          >
+            Ver crudo (no cambia nada)
+          </button>
+          <button
+            onClick={() => handleProbarPrecio(false)}
+            disabled={precioProbando || !precioSku.trim() || !precioValor}
+            className="rounded-xl bg-amber-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-60"
+          >
+            {precioProbando ? "Probando…" : "Escribir precio (¡esto SÍ cambia Contabilium!)"}
+          </button>
+        </div>
+        {precioResultado && (
+          <pre className="mt-3 max-h-80 overflow-auto rounded-xl bg-white p-3 text-[11px] text-slate-700 dark:bg-neutral-950 dark:text-neutral-300">
+            {JSON.stringify(precioResultado, null, 2)}
+          </pre>
+        )}
+
+        <div className="mt-5 border-t border-amber-200 pt-4 dark:border-amber-700">
+          <div className="text-sm font-semibold text-amber-800 dark:text-amber-300">Catálogo completo</div>
+          <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+            Compara el precio con IVA de Contabilium contra el precio de Samurai, y que el % de IVA de cada producto esté en 21, para TODOS los productos. "Aplicar" corrige en Contabilium tanto el precio como el IVA de todo lo que esté mal — Samurai es la fuente de verdad del precio final con IVA incluido.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              onClick={handleVerDiferenciasCatalogo}
+              disabled={catalogoCargando}
+              className="rounded-xl border border-amber-300 bg-white px-4 py-2 text-sm font-medium text-amber-700 disabled:opacity-60 dark:border-amber-700 dark:bg-neutral-900"
+            >
+              {catalogoCargando ? "Comparando…" : "Ver diferencias de TODO el catálogo (no cambia nada)"}
+            </button>
+            {(catalogoReporte?.sinCargar > 0 || catalogoReporte?.conDiferenciaManual > 0 || catalogoReporte?.conIvaMal > 0) && (
+              <button
+                onClick={handleAplicarSinCargar}
+                disabled={catalogoAplicando}
+                className="rounded-xl bg-amber-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-60"
+              >
+                {catalogoAplicando
+                  ? "Aplicando…"
+                  : `Corregir los ${catalogoReporte.filas.filter((f) => f.seAplicaAutomatico).length} que están mal`}
+              </button>
+            )}
+          </div>
+
+          {catalogoReporte?.error && (
+            <p className="mt-3 text-sm text-rose-600">{catalogoReporte.error}</p>
+          )}
+          {catalogoReporte && !catalogoReporte.error && (
+            <div className="mt-3 space-y-2 text-xs text-amber-800 dark:text-amber-300">
+              <p>
+                Revisados: <strong>{catalogoReporte.totalRevisados}</strong> · Sin precio cargado:{" "}
+                <strong>{catalogoReporte.sinCargar}</strong> · Con precio distinto ya cargado:{" "}
+                <strong>{catalogoReporte.conDiferenciaManual}</strong> · Con IVA distinto de 21%:{" "}
+                <strong>{catalogoReporte.conIvaMal}</strong>
+              </p>
+              <div className="max-h-96 overflow-auto rounded-xl border border-amber-200 bg-white dark:border-amber-700 dark:bg-neutral-950">
+                <table className="w-full text-left text-[11px]">
+                  <thead className="sticky top-0 bg-amber-100 dark:bg-amber-500/20">
+                    <tr>
+                      <th className="px-2 py-1">SKU</th>
+                      <th className="px-2 py-1">Producto</th>
+                      <th className="px-2 py-1">En Contabilium</th>
+                      <th className="px-2 py-1">Precio Samurai</th>
+                      <th className="px-2 py-1">Diferencia</th>
+                      <th className="px-2 py-1">IVA %</th>
+                      <th className="px-2 py-1">Estado</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {catalogoReporte.filas
+                      ?.filter((f) => f.seAplicaAutomatico)
+                      .map((f) => (
+                        <tr key={f.sku} className="border-t border-amber-100 dark:border-amber-800">
+                          <td className="px-2 py-1">{f.sku}</td>
+                          <td className="px-2 py-1">{f.nombre}</td>
+                          <td className="px-2 py-1">{moneyArs(f.precioActualContabilium)}</td>
+                          <td className="px-2 py-1">{moneyArs(f.precioObjetivoSamurai)}</td>
+                          <td className="px-2 py-1">{moneyArs(f.diferencia)}</td>
+                          <td className="px-2 py-1">
+                            {f.ivaOk ? <span className="text-emerald-600">21%</span> : <span className="text-rose-600">{f.ivaActual}%</span>}
+                          </td>
+                          <td className="px-2 py-1">
+                            {f.sinCargar && <span className="text-sky-600">sin precio → se carga</span>}
+                            {!f.sinCargar && f.diferencia !== 0 && <span className="text-amber-600">precio distinto → se corrige</span>}
+                            {!f.ivaOk && <span className="text-rose-600"> · IVA mal → se corrige a 21%</span>}
+                          </td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+          {catalogoResultadoAplicar && (
+            <pre className="mt-3 max-h-60 overflow-auto rounded-xl bg-white p-3 text-[11px] text-slate-700 dark:bg-neutral-950 dark:text-neutral-300">
+              {JSON.stringify(catalogoResultadoAplicar, null, 2)}
+            </pre>
+          )}
         </div>
       </div>
 

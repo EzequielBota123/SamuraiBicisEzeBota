@@ -21,9 +21,11 @@ export function extraerModelo(nombre) {
   if (!nombre) return null;
   const m = /\bSAMURAI\s+([A-Z0-9]+(?:\.[0-9]+)?)/i.exec(nombre);
   if (m) return m[1].toUpperCase();
-  // SHONEN es el único modelo que no lleva "SAMURAI" en el nombre del
-  // producto (ej: "BIC MTB SHONEN R24 COLOR CORAL").
+  // SHONEN y BOWIE son los dos modelos que no llevan "SAMURAI" en el nombre
+  // del producto (ej: "BIC MTB SHONEN R24 COLOR CORAL", "BIC MTB BOWIE
+  // TALLE M 2026 GRIS-CELESTE").
   if (/\bSHONEN\b/i.test(nombre)) return "SHONEN";
+  if (/\bBOWIE\b/i.test(nombre)) return "BOWIE";
   return null;
 }
 

@@ -9,7 +9,7 @@ import {
 import { BusyButtonContent, LoadingOverlay } from "../../components/ui/LoadingIndicators";
 import { subscribeCustomerTypes } from "../../services/customerTypes";
 import { getContabiliumDepositos, labelDeposito, matchDeposito } from "../../services/contabiliumDepositos";
-import { getDepositoStockAdmin, createUserWithPassword, adminSetUserPassword, auditLegacyUsers, adminRenameUsername, adminDeleteUser, adminLinkDepositoClientes } from "../../services/comprobantes";
+import { getDepositoStockAdmin, createUserWithPassword, adminSetUserPassword, auditLegacyUsers, adminRenameUsername, adminDeleteUser, adminLinkDepositoClientes, crearDepositoManual, pedirProvinciaYCiudad, consultarDatosAfip } from "../../services/comprobantes";
 
 const statusStyles = {
   activo: "border border-emerald-200 bg-emerald-50 text-emerald-600 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400",
@@ -127,7 +127,12 @@ export default function Users() {
           await adminRenameUsername(editing.id, newUsername);
         }
       } else {
-        await createUserWithPassword(data.name, data.password, { cuit: data.cuit, telefono: data.telefono });
+        await createUserWithPassword(data.name, data.password, {
+          cuit: data.cuit,
+          telefono: data.telefono,
+          depositoId: data.depositoId,
+          depositoNombre: data.depositoNombre,
+        });
       }
       setModalOpen(false);
       setEditing(null);
@@ -425,6 +430,29 @@ function UserModal({ open, onClose, onSubmit, initial, customerTypes }) {
   const [password, setPassword]       = useState("");
   const [cuitNuevo, setCuitNuevo]     = useState("");
   const [telefonoNuevo, setTelefonoNuevo] = useState("");
+  // Vista previa en vivo del padrón de AFIP para el CUIT tipeado — lo mismo
+  // que Contabilium muestra apenas completás el CUIT, para que el staff vea
+  // a quién le está creando la cuenta antes de confirmar (null = todavía no
+  // se consultó o el CUIT no tiene 11 dígitos, "loading", "error" o los datos).
+  const [afipPreview, setAfipPreview] = useState(null);
+  useEffect(() => {
+    const digitos = cuitNuevo.replace(/\D/g, "");
+    if (digitos.length !== 11) {
+      setAfipPreview(null);
+      return;
+    }
+    let cancelado = false;
+    setAfipPreview("loading");
+    const timer = setTimeout(() => {
+      consultarDatosAfip(digitos)
+        .then((r) => !cancelado && setAfipPreview(r))
+        .catch((e) => !cancelado && setAfipPreview({ error: e.message || "No se encontró ese CUIT en AFIP" }));
+    }, 500);
+    return () => {
+      cancelado = true;
+      clearTimeout(timer);
+    };
+  }, [cuitNuevo]);
   const [newPassword, setNewPassword] = useState("");
   const [username, setUsername] = useState(initial?.username || "");
   const [role, setRole]               = useState(initial?.role || "viewer");
@@ -449,6 +477,42 @@ function UserModal({ open, onClose, onSubmit, initial, customerTypes }) {
   const [depositoSearch, setDepositoSearch] = useState("");
   const [depositoPickerOpen, setDepositoPickerOpen] = useState(false);
   const depositoPickerRef = useRef(null);
+  const [creandoDeposito, setCreandoDeposito] = useState(false);
+
+  // Crea el depósito real en Contabilium sin salir del modal. Contabilium no
+  // devuelve el ID del depósito recién creado, así que después de crearlo
+  // hay que pedirle al staff que lo busque por nombre en Contabilium y
+  // pegue el ID acá para completar el vínculo — un paso manual, pero solo
+  // uno, en vez de tener que abrir Contabilium, crearlo, volver y buscarlo
+  // de nuevo en el picker (que además es un caché que no se actualiza al
+  // toque).
+  async function handleCrearDepositoInline() {
+    if (!confirm(`¿Querés crear un depósito nuevo en Contabilium para "${name || "este cliente"}"?`)) return;
+    const nombreDeposito = prompt("Nombre del depósito:", name || "") ;
+    if (!nombreDeposito || !nombreDeposito.trim()) return;
+    const direccionDeposito = prompt("Dirección (opcional, dejalo vacío si no hace falta):") || "";
+    const telefonoDeposito = prompt("Teléfono (opcional):", telefonoNuevo || "") || "";
+    setCreandoDeposito(true);
+    try {
+      const ubicacion = await pedirProvinciaYCiudad();
+      await crearDepositoManual({
+        nombre: nombreDeposito.trim(),
+        direccion: direccionDeposito,
+        telefono: telefonoDeposito,
+        ...(ubicacion || {}),
+      });
+      const idNuevo = prompt(
+        "Depósito creado en Contabilium. Andá a Depósitos, buscalo por nombre, copiá el ID de la URL (inventariose.aspx?ID=x) y pegalo acá para vincularlo:"
+      );
+      if (idNuevo && idNuevo.trim() && !Number.isNaN(Number(idNuevo.trim()))) {
+        setDepositoId(idNuevo.trim());
+      }
+    } catch (e) {
+      alert(e.message || "No se pudo crear el depósito");
+    } finally {
+      setCreandoDeposito(false);
+    }
+  }
 
   useEffect(() => {
     function onClickOutside(e) {
@@ -551,7 +615,14 @@ function UserModal({ open, onClose, onSubmit, initial, customerTypes }) {
             e.preventDefault();
             setSaving(true);
             if (isNew) {
-              await onSubmit({ name, password, cuit: cuitNuevo.trim() || null, telefono: telefonoNuevo.trim() || null });
+              await onSubmit({
+                name,
+                password,
+                cuit: cuitNuevo.trim() || null,
+                telefono: telefonoNuevo.trim() || null,
+                depositoId: depositoId ? Number(depositoId) : null,
+                depositoNombre: (depositos.find((d) => String(d.id) === depositoId)?.nombre) || null,
+              });
             } else {
               await onSubmit({
                 name,
@@ -610,6 +681,25 @@ function UserModal({ open, onClose, onSubmit, initial, customerTypes }) {
                 value={cuitNuevo}
                 onChange={(e) => setCuitNuevo(e.target.value)}
               />
+              {afipPreview === "loading" && (
+                <p className="text-xs text-slate-500">Buscando en AFIP…</p>
+              )}
+              {afipPreview && afipPreview !== "loading" && afipPreview.error && (
+                <p className="text-xs font-medium text-rose-600">{afipPreview.error}</p>
+              )}
+              {afipPreview && afipPreview !== "loading" && !afipPreview.error && (
+                <div className="space-y-0.5 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
+                  <p className="font-semibold">{afipPreview.razonSocial}</p>
+                  <p>{afipPreview.condicionIva}{afipPreview.categoriaMonotributo ? ` (${afipPreview.categoriaMonotributo})` : ""}</p>
+                  {(afipPreview.domicilio || afipPreview.ciudad || afipPreview.provincia) && (
+                    <p>
+                      {[afipPreview.domicilio, afipPreview.pisoDepto, afipPreview.ciudad, afipPreview.provincia, afipPreview.cp]
+                        .filter(Boolean)
+                        .join(", ")}
+                    </p>
+                  )}
+                </div>
+              )}
               <input
                 placeholder="Teléfono (opcional)"
                 className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40"
@@ -618,7 +708,98 @@ function UserModal({ open, onClose, onSubmit, initial, customerTypes }) {
               />
               <p className="text-[11px] text-slate-500">
                 Si completás el CUIT, se busca al padrón de AFIP y se crea la ficha de Cliente en Contabilium sola, ya vinculada
-                a esta cuenta. El depósito de consignación todavía hay que crearlo a mano en Contabilium.
+                a esta cuenta.
+              </p>
+            </div>
+          )}
+
+          {isNew && (
+            <div className="space-y-1">
+              <label className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Depósito consignado (opcional)
+              </label>
+              <div className="relative" ref={depositoPickerRef}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDepositoPickerOpen((v) => !v);
+                    setDepositoSearch("");
+                  }}
+                  className="flex w-full items-center justify-between rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-left text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40"
+                >
+                  <span className={selectedDeposito ? "text-slate-900" : "text-slate-400"}>
+                    {selectedDeposito ? labelDeposito(selectedDeposito) : "Sin depósito asignado"}
+                  </span>
+                  <svg viewBox="0 0 20 20" fill="currentColor" className="h-4 w-4 shrink-0 text-slate-400">
+                    <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clipRule="evenodd" />
+                  </svg>
+                </button>
+
+                {depositoPickerOpen && (
+                  <div className="absolute z-20 mt-1 w-full overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-[0_25px_50px_-20px_rgba(15,23,42,0.35)]">
+                    <div className="border-b border-slate-100 p-2">
+                      <input
+                        autoFocus
+                        value={depositoSearch}
+                        onChange={(e) => setDepositoSearch(e.target.value)}
+                        placeholder="Buscar depósito por nombre, número propio o ID de Contabilium…"
+                        className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 outline-none focus:border-sky-400"
+                      />
+                    </div>
+                    <ul className="max-h-64 overflow-y-auto py-1 text-sm">
+                      <li>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDepositoId("");
+                            setDepositoPickerOpen(false);
+                          }}
+                          className={`block w-full px-4 py-2 text-left transition hover:bg-slate-50 ${
+                            !depositoId ? "font-semibold text-sky-600" : "text-slate-500"
+                          }`}
+                        >
+                          Sin depósito asignado
+                        </button>
+                      </li>
+                      {filteredDepositos.map((d) => (
+                        <li key={d.id}>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setDepositoId(String(d.id));
+                              setDepositoPickerOpen(false);
+                            }}
+                            className={`block w-full truncate px-4 py-2 text-left transition hover:bg-slate-50 ${
+                              String(d.id) === depositoId ? "font-semibold text-sky-600" : "text-slate-700"
+                            }`}
+                          >
+                            {labelDeposito(d)}
+                          </button>
+                        </li>
+                      ))}
+                      {filteredDepositos.length === 0 && (
+                        <li className="px-4 py-6 text-center text-xs text-slate-400">Sin resultados.</li>
+                      )}
+                      <li className="border-t border-slate-100">
+                        <button
+                          type="button"
+                          disabled={creandoDeposito}
+                          onClick={() => {
+                            setDepositoPickerOpen(false);
+                            handleCrearDepositoInline();
+                          }}
+                          className="block w-full px-4 py-2 text-left text-emerald-600 transition hover:bg-emerald-50 disabled:opacity-60"
+                        >
+                          {creandoDeposito ? "Creando…" : "+ Crear depósito nuevo"}
+                        </button>
+                      </li>
+                    </ul>
+                  </div>
+                )}
+              </div>
+              <p className="text-[11px] text-slate-500">
+                Si le asignás un depósito que ya existe en Contabilium, este usuario ya arranca pudiendo ver su stock
+                consignado. Si el depósito todavía no existe, tocá "+ Crear depósito nuevo" de la lista.
               </p>
             </div>
           )}
@@ -808,6 +989,19 @@ function UserModal({ open, onClose, onSubmit, initial, customerTypes }) {
                       {filteredDepositos.length === 0 && (
                         <li className="px-4 py-6 text-center text-xs text-slate-400">Sin resultados.</li>
                       )}
+                      <li className="border-t border-slate-100">
+                        <button
+                          type="button"
+                          disabled={creandoDeposito}
+                          onClick={() => {
+                            setDepositoPickerOpen(false);
+                            handleCrearDepositoInline();
+                          }}
+                          className="block w-full px-4 py-2 text-left text-emerald-600 transition hover:bg-emerald-50 disabled:opacity-60"
+                        >
+                          {creandoDeposito ? "Creando…" : "+ Crear depósito nuevo"}
+                        </button>
+                      </li>
                     </ul>
                   </div>
                 )}

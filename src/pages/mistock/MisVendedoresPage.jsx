@@ -1,6 +1,13 @@
 import { useEffect, useState, useCallback } from "react";
 import { useAuth } from "../../auth/AuthContext";
-import { getMisVendedores, getVendedorResumen, getResumenComisionVendedor, setViajesVendedorMes } from "../../services/comprobantes";
+import {
+  getMisVendedores,
+  getVendedorResumen,
+  getResumenComisionVendedor,
+  setViajesVendedorMes,
+  distribuidorCrearCliente,
+  distribuidorCrearDepositoCliente,
+} from "../../services/comprobantes";
 
 const money = (n) =>
   n == null ? "—" : Number(n).toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 });
@@ -164,6 +171,207 @@ function ResumenComision() {
   );
 }
 
+// Alta de un cliente propio, en 2 pasos bien separados (nunca uno solo que
+// mezcle todo): primero se crea el cliente (Samurai + Contabilium, ya
+// vinculado como cliente de este distribuidor); recién cuando eso confirma
+// aparece el paso 2 para crearle su depósito y vincularlo.
+function GenerarClientePanel({ onCreado }) {
+  const [abierto, setAbierto] = useState(false);
+  const [paso, setPaso] = useState(1); // 1 = crear cliente, 2 = crear depósito
+  const [form1, setForm1] = useState({ name: "", cuit: "", telefono: "", password: "" });
+  const [form2, setForm2] = useState({ nombreDeposito: "", direccion: "", telefono: "" });
+  const [cargando, setCargando] = useState(false);
+  const [error, setError] = useState("");
+  const [clienteCreado, setClienteCreado] = useState(null); // {uid, username, razonSocial}
+  const [depositoCreado, setDepositoCreado] = useState(null); // {depositoId, depositoNombre}
+
+  function reiniciar() {
+    setPaso(1);
+    setForm1({ name: "", cuit: "", telefono: "", password: "" });
+    setForm2({ nombreDeposito: "", direccion: "", telefono: "" });
+    setError("");
+    setClienteCreado(null);
+    setDepositoCreado(null);
+  }
+
+  async function crearCliente() {
+    setError("");
+    if (!form1.name.trim()) return setError("Poné el nombre del cliente.");
+    if (!form1.cuit.replace(/\D/g, "").match(/^\d{11}$/)) return setError("El CUIT debe tener 11 dígitos.");
+    if (form1.password.length < 6) return setError("La contraseña debe tener al menos 6 caracteres.");
+    setCargando(true);
+    try {
+      const r = await distribuidorCrearCliente({
+        name: form1.name.trim(),
+        password: form1.password,
+        cuit: form1.cuit,
+        telefono: form1.telefono,
+      });
+      setClienteCreado(r);
+      setForm2((f) => ({ ...f, nombreDeposito: `Depósito ${r.razonSocial || form1.name.trim()}` }));
+      setPaso(2);
+      onCreado?.();
+    } catch (e) {
+      setError(e.message || "No se pudo crear el cliente");
+    } finally {
+      setCargando(false);
+    }
+  }
+
+  async function crearDeposito() {
+    setError("");
+    if (!form2.nombreDeposito.trim()) return setError("Poné el nombre del depósito.");
+    setCargando(true);
+    try {
+      const r = await distribuidorCrearDepositoCliente({
+        clienteUid: clienteCreado.uid,
+        nombreDeposito: form2.nombreDeposito.trim(),
+        direccion: form2.direccion,
+        telefono: form2.telefono,
+      });
+      setDepositoCreado(r);
+      onCreado?.();
+    } catch (e) {
+      setError(e.message || "No se pudo crear el depósito");
+    } finally {
+      setCargando(false);
+    }
+  }
+
+  if (!abierto) {
+    return (
+      <button
+        onClick={() => setAbierto(true)}
+        className="rounded-xl border border-dashed border-emerald-300 bg-emerald-50/60 px-4 py-3 text-sm font-semibold text-emerald-700 transition hover:bg-emerald-50 dark:border-emerald-900 dark:bg-emerald-950/10 dark:text-emerald-400"
+      >
+        + Generar cliente nuevo
+      </button>
+    );
+  }
+
+  return (
+    <div className="rounded-2xl border border-emerald-200 bg-emerald-50/60 p-4 dark:border-emerald-900 dark:bg-emerald-950/10">
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-bold text-emerald-800 dark:text-emerald-400">🆕 Generar cliente nuevo</h2>
+        <button
+          onClick={() => {
+            setAbierto(false);
+            reiniciar();
+          }}
+          className="text-xs text-slate-400 hover:text-slate-600 dark:text-neutral-500 dark:hover:text-neutral-300"
+        >
+          Cerrar
+        </button>
+      </div>
+
+      <div className="mt-2 flex items-center gap-2 text-[11px] font-semibold">
+        <span className={paso === 1 ? "text-emerald-700 dark:text-emerald-400" : "text-slate-400 dark:text-neutral-500"}>
+          ① Crear cliente
+        </span>
+        <span className="text-slate-300 dark:text-neutral-700">→</span>
+        <span className={paso === 2 ? "text-emerald-700 dark:text-emerald-400" : "text-slate-400 dark:text-neutral-500"}>
+          ② Crear depósito
+        </span>
+      </div>
+
+      {error && <p className="mt-2 text-xs text-rose-600 dark:text-rose-400">{error}</p>}
+
+      {paso === 1 && (
+        <div className="mt-3 space-y-2">
+          <input
+            placeholder="Nombre del cliente"
+            value={form1.name}
+            onChange={(e) => setForm1((f) => ({ ...f, name: e.target.value }))}
+            className="w-full rounded-lg border border-emerald-200 bg-white px-2.5 py-1.5 text-xs dark:border-emerald-900 dark:bg-neutral-900 dark:text-white"
+          />
+          <input
+            placeholder="CUIT (11 dígitos)"
+            value={form1.cuit}
+            onChange={(e) => setForm1((f) => ({ ...f, cuit: e.target.value }))}
+            className="w-full rounded-lg border border-emerald-200 bg-white px-2.5 py-1.5 text-xs dark:border-emerald-900 dark:bg-neutral-900 dark:text-white"
+          />
+          <input
+            placeholder="Teléfono (opcional)"
+            value={form1.telefono}
+            onChange={(e) => setForm1((f) => ({ ...f, telefono: e.target.value }))}
+            className="w-full rounded-lg border border-emerald-200 bg-white px-2.5 py-1.5 text-xs dark:border-emerald-900 dark:bg-neutral-900 dark:text-white"
+          />
+          <input
+            type="password"
+            placeholder="Contraseña para el cliente (mín. 6 caracteres)"
+            value={form1.password}
+            onChange={(e) => setForm1((f) => ({ ...f, password: e.target.value }))}
+            className="w-full rounded-lg border border-emerald-200 bg-white px-2.5 py-1.5 text-xs dark:border-emerald-900 dark:bg-neutral-900 dark:text-white"
+          />
+          <p className="text-[11px] text-emerald-700/70 dark:text-emerald-400/60">
+            Con el CUIT se trae el nombre y domicilio reales de AFIP, se crea el cliente en Contabilium, se verifica
+            que haya quedado bien creado y recién ahí se crea el usuario — así no queda nada a medias.
+          </p>
+          <button
+            onClick={crearCliente}
+            disabled={cargando}
+            className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-emerald-700 disabled:opacity-60"
+          >
+            {cargando ? "Creando y verificando en Contabilium…" : "Crear cliente"}
+          </button>
+        </div>
+      )}
+
+      {paso === 2 && !depositoCreado && (
+        <div className="mt-3 space-y-2">
+          <p className="text-xs text-emerald-800 dark:text-emerald-400">
+            ✓ Cliente creado y verificado en Contabilium ({clienteCreado.razonSocial}) — ya es tu cliente. Ahora creale
+            su depósito.
+          </p>
+          <input
+            placeholder="Nombre del depósito"
+            value={form2.nombreDeposito}
+            onChange={(e) => setForm2((f) => ({ ...f, nombreDeposito: e.target.value }))}
+            className="w-full rounded-lg border border-emerald-200 bg-white px-2.5 py-1.5 text-xs dark:border-emerald-900 dark:bg-neutral-900 dark:text-white"
+          />
+          <input
+            placeholder="Dirección (opcional)"
+            value={form2.direccion}
+            onChange={(e) => setForm2((f) => ({ ...f, direccion: e.target.value }))}
+            className="w-full rounded-lg border border-emerald-200 bg-white px-2.5 py-1.5 text-xs dark:border-emerald-900 dark:bg-neutral-900 dark:text-white"
+          />
+          <input
+            placeholder="Teléfono (opcional)"
+            value={form2.telefono}
+            onChange={(e) => setForm2((f) => ({ ...f, telefono: e.target.value }))}
+            className="w-full rounded-lg border border-emerald-200 bg-white px-2.5 py-1.5 text-xs dark:border-emerald-900 dark:bg-neutral-900 dark:text-white"
+          />
+          <button
+            onClick={crearDeposito}
+            disabled={cargando}
+            className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-emerald-700 disabled:opacity-60"
+          >
+            {cargando ? "Creando depósito…" : "Crear depósito y vincular"}
+          </button>
+        </div>
+      )}
+
+      {depositoCreado && (
+        <div className="mt-3 space-y-2">
+          <p className="text-xs font-semibold text-emerald-800 dark:text-emerald-400">
+            ✓ Listo — {clienteCreado.razonSocial} ya tiene su depósito "{depositoCreado.depositoNombre}" vinculado y es
+            tu cliente. Ya podés mandarle stock desde "Mover stock".
+          </p>
+          <button
+            onClick={() => {
+              setAbierto(false);
+              reiniciar();
+            }}
+            className="rounded-lg bg-slate-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-700"
+          >
+            Cerrar
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Vista para clientes que coordinan un grupo de distribuidores propios (por
 // ahora, Alfredo Bavcevich) — resumen de stock consignado, deuda y últimas
 // facturas de cada uno. Solo se muestra si el usuario tiene
@@ -192,7 +400,7 @@ export default function MisVendedoresPage() {
       );
   }, []);
 
-  useEffect(() => {
+  const recargarLista = useCallback(() => {
     setListaError("");
     getMisVendedores()
       .then((r) => {
@@ -202,7 +410,13 @@ export default function MisVendedoresPage() {
       .catch((e) => setListaError(e.message || "No se pudo cargar"));
   }, [cargarDetalle]);
 
-  if (!profile?.vendedoresAsignados?.length) {
+  useEffect(() => {
+    recargarLista();
+  }, [recargarLista]);
+
+  const tieneDepositoPropio = !!profile?.contabiliumDepositoId;
+
+  if (!profile?.vendedoresAsignados?.length && !tieneDepositoPropio) {
     return (
       <div className="mx-auto max-w-3xl px-4 py-10">
         <p className="text-sm text-slate-500">No tenés vendedores asignados.</p>
@@ -219,13 +433,19 @@ export default function MisVendedoresPage() {
         </p>
       </div>
 
+      {tieneDepositoPropio && <GenerarClientePanel onCreado={recargarLista} />}
+
       <ResumenComision />
 
       {lista === null && !listaError && <p className="text-sm text-slate-400">Cargando…</p>}
-      {listaError && (
-        <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700 dark:border-rose-900 dark:bg-rose-950/20 dark:text-rose-400">
-          {listaError}
-        </div>
+      {listaError && listaError.includes("No tenés vendedores asignados") ? (
+        <p className="text-sm text-slate-400 dark:text-neutral-500">Todavía no tenés clientes propios.</p>
+      ) : (
+        listaError && (
+          <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700 dark:border-rose-900 dark:bg-rose-950/20 dark:text-rose-400">
+            {listaError}
+          </div>
+        )
       )}
 
       {lista && (

@@ -6,6 +6,7 @@ import {
   getClientesConUbicacion,
   subscribeClientesReportDetail,
   exportarMapaClientes,
+  exportarGuionLlamadas,
   adminGetClientComprobantes,
   adminImportarSituacionesClientes,
 } from "../../../services/comprobantes";
@@ -151,6 +152,7 @@ export default function MapaClientes({ crm }) {
   const [guardandoSituacion, setGuardandoSituacion] = useState(null); // contabiliumId en curso
   const [exportando, setExportando] = useState(false);
   const [exportError, setExportError] = useState("");
+  const [exportandoGuion, setExportandoGuion] = useState(false);
   const [importando, setImportando] = useState(false);
   const [importError, setImportError] = useState("");
   const [importResult, setImportResult] = useState(null);
@@ -205,25 +207,45 @@ export default function MapaClientes({ crm }) {
     }
   }
 
+  function descargarBase64Excel(base64, filename) {
+    const bytes = atob(base64);
+    const arr = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+    const blob = new Blob([arr], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename || "clientes.xlsx";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   async function handleExportar() {
     setExportando(true);
     setExportError("");
     try {
       const { base64, filename } = await exportarMapaClientes(provinciaElegida || undefined);
-      const bytes = atob(base64);
-      const arr = new Uint8Array(bytes.length);
-      for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
-      const blob = new Blob([arr], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = filename || "clientes.xlsx";
-      a.click();
-      URL.revokeObjectURL(url);
+      descargarBase64Excel(base64, filename);
     } catch (e) {
       setExportError(e.message || "No se pudo exportar");
     } finally {
       setExportando(false);
+    }
+  }
+
+  async function handleExportarGuion() {
+    setExportandoGuion(true);
+    setExportError("");
+    try {
+      const { guion, porZona } = await exportarGuionLlamadas();
+      const { generateGuionLlamadasPdf } = await import("../../../utils/generateGuionLlamadasPdf");
+      generateGuionLlamadasPdf(guion, porZona, {
+        fileName: `Guion de llamadas ${new Date().toISOString().slice(0, 10)}.pdf`,
+      });
+    } catch (e) {
+      setExportError(e.message || "No se pudo generar el guion de llamadas");
+    } finally {
+      setExportandoGuion(false);
     }
   }
 
@@ -941,7 +963,15 @@ export default function MapaClientes({ crm }) {
           disabled={exportando}
           className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:border-emerald-300 disabled:opacity-60 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300"
         >
-          {exportando ? "Exportando…" : provinciaElegida ? `⬇️ Exportar ${provinciaElegida}` : "⬇️ Exportar listado"}
+          {exportando ? "Exportando…" : provinciaElegida ? `⬇️ Exportar ${provinciaElegida}` : "⬇️ Exportar por provincia"}
+        </button>
+        <button
+          onClick={handleExportarGuion}
+          disabled={exportandoGuion}
+          title="PDF con el guion sugerido y el listado numerado de clientes por zona, todo junto"
+          className="rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-slate-600 transition hover:border-violet-300 disabled:opacity-60 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300"
+        >
+          {exportandoGuion ? "Generando…" : "📞 Guion de llamadas (PDF)"}
         </button>
         <button
           onClick={() => importInputRef.current?.click()}

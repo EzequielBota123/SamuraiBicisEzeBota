@@ -1,9 +1,39 @@
 import { useEffect, useMemo, useState } from "react";
+import { useLocation } from "react-router-dom";
 import { FirebaseError } from "firebase/app";
+import { doc, getDoc, serverTimestamp, updateDoc } from "firebase/firestore";
+import { db } from "../../firebase";
 import { listOrders, updateOrderStatus, linkOrderComprobante, deleteOrder } from "../../services/orders";
 import { triggerOrderStatusSync, subscribeToOrderSyncStatus } from "../../services/contabilium";
+import { transferirStockManual, generarRemitoRealManual, descargarRemitoPorArchivo, getDepositoStockAdmin } from "../../services/comprobantes";
+import { crearViaje } from "../../services/logisticaViajes";
 import { useAuth } from "../../auth/AuthContext";
 import { BusyButtonContent, LoadingOverlay } from "../../components/ui/LoadingIndicators";
+
+// Baja un PDF ya en base64 (sin pedirlo de nuevo al servidor) con el nombre
+// de archivo que se le pase.
+function descargarPdfBase64(base64, nombreArchivo) {
+  const bytes = atob(base64);
+  const arr = new Uint8Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+  const blob = new Blob([arr], { type: "application/pdf" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = nombreArchivo;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Los 3 depósitos propios — mismos ids que usa "Pedidos a confirmar" y el
+// resto del sistema de logística para reconocerlos en Contabilium. La
+// dirección es la misma que usa la grilla de logística (DEPOSITOS_PROPIOS
+// en logisticaViajes.ts) para armar el viaje con algo más que el nombre.
+const DEPOSITOS_PROPIOS_ORDERS = [
+  { id: 135151, nombre: "Lavalle", direccion: "Lavalle 105, B1834 Temperley, Provincia de Buenos Aires" },
+  { id: 133531, nombre: "Cañuelas", direccion: "Highway Route 6 Km 96.7, Cañuelas, Provincia de Buenos Aires" },
+  { id: 131151, nombre: "Credifin", direccion: "" },
+];
 
 const statusStyles = {
   pagada: "border border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400",
@@ -11,7 +41,29 @@ const statusStyles = {
   pendiente: "border border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400",
   cancelada: "border border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-400",
   solicitud: "border border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-400",
+  // Un pedido con envío confirmado es una consignación — mandamos la bici
+  // al depósito propio del cliente, pero no cobramos en el momento, así que
+  // "pagada"/"facturado" (que vienen de cotejar contra una factura real)
+  // serían engañosos acá. Mientras haya un envío en curso, el badge
+  // muestra este estado en vez del de la factura.
+  hecho: "border border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400",
+  en_revision: "border border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400",
 };
+
+// El pedido tiene su propio ciclo de vida de pago (pendiente → facturado →
+// pagada, sincronizado contra una factura real) pero una vez que hay un
+// envío confirmado eso deja de ser lo relevante para mostrar en la lista:
+// lo que importa ahí es si el envío (stock + remito real) quedó bien o
+// necesita revisión a mano — el cobro es aparte, como con cualquier
+// distribuidor en cuenta corriente.
+function displayStatus(order) {
+  const resultados = order.envio?.resultados;
+  if (resultados && resultados.length > 0) {
+    const todosReal = resultados.every((r) => r.remitoEsReal);
+    return todosReal ? { key: "hecho", label: "hecho" } : { key: "en_revision", label: "en revisión" };
+  }
+  return { key: order.status, label: order.status };
+}
 
 function syncTimeAgo(date) {
   if (!date) return "nunca";
@@ -54,10 +106,23 @@ export default function Orders() {
   const [linkValue, setLinkValue] = useState("");
   const [detailOrder, setDetailOrder] = useState(null);
   const { loading: authLoading } = useAuth();
+  const location = useLocation();
 
   useEffect(() => {
     return subscribeToOrderSyncStatus(setSyncStatus);
   }, []);
+
+  // Si llegamos acá desde una notificación de pedido nuevo (?orderId=X), le
+  // abrimos directo el detalle en vez de dejarlo perdido en la lista.
+  useEffect(() => {
+    if (!rows.length) return;
+    const params = new URLSearchParams(location.search);
+    const orderIdParam = params.get("orderId");
+    if (!orderIdParam) return;
+    const match = rows.find((o) => String(o.id) === orderIdParam);
+    if (match) setDetailOrder(match);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows, location.search]);
 
   async function fetchOrders(reset = true) {
     setLoading(true);
@@ -332,11 +397,11 @@ export default function Orders() {
                 </div>
                 <span
                   className={`shrink-0 inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] ${
-                    statusStyles[o.status] || "border border-slate-200 bg-slate-50 text-slate-600"
+                    statusStyles[displayStatus(o).key] || "border border-slate-200 bg-slate-50 text-slate-600"
                   }`}
                 >
                   <span className="h-1.5 w-1.5 rounded-full bg-current/80" />
-                  {o.status}
+                  {displayStatus(o).label}
                 </span>
               </div>
 
@@ -471,11 +536,11 @@ export default function Orders() {
                 <td className="px-4 py-4">
                   <span
                     className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs ${
-                      statusStyles[o.status] || "border border-slate-200 bg-slate-50 text-slate-600"
+                      statusStyles[displayStatus(o).key] || "border border-slate-200 bg-slate-50 text-slate-600"
                     }`}
                   >
                     <span className="h-2 w-2 rounded-full bg-current/80" />
-                    {o.status}
+                    {displayStatus(o).label}
                   </span>
                 </td>
                 <td className="px-4 py-4">
@@ -557,6 +622,10 @@ export default function Orders() {
         onMarkPaid={markPaid}
         onCancel={cancel}
         onReactivate={reactivate}
+        onEnvioConfirmado={(orderId, envio) => {
+          setRows((prev) => prev.map((o) => (o.id === orderId ? { ...o, envio } : o)));
+          setDetailOrder((prev) => (prev && prev.id === orderId ? { ...prev, envio } : prev));
+        }}
         authLoading={authLoading}
       />
     </div>
@@ -580,6 +649,42 @@ function buildOrderText(order) {
     "",
     `Total: ${money(order.total || 0)}`,
   ].filter(Boolean);
+  return lines.join("\n");
+}
+
+// Saca marca/modelo/talle en limpio del nombre completo del producto (ej:
+// "BIC MTB SAMURAI GOZEN R29 TALLE S ROSA - SHIMANO" → "GOZEN S ROSA") —
+// nada de SKU ni precio, es lo único que el chofer necesita para armar el
+// pedido físico.
+function nombreParaChofer(nombreCompleto) {
+  if (!nombreCompleto) return "";
+  return nombreCompleto
+    .replace(/\bBIC\b/gi, "")
+    .replace(/\bMTB\b/gi, "")
+    .replace(/\bSAMURAI\b/gi, "")
+    .replace(/\bSHIMANO\b/gi, "")
+    .replace(/\b21\s?V\b/gi, "")
+    .replace(/\bR2[49]\b/gi, "")
+    .replace(/\bTALLE\b/gi, "")
+    .replace(/\bT\.\s*/gi, "")
+    .replace(/-\s*$/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+// Versión simplificada para pasarle al chofer: a quién, cuántas de cada
+// bici (sin precio, sin SKU, sin nada que no haga falta para preparar el
+// pedido) y el total.
+function buildOrderTextChofer(order) {
+  const items = order.items || [];
+  const totalBicis = items.reduce((a, b) => a + Number(b.qty || 0), 0);
+  const lines = [
+    order.customer?.name || "-",
+    "",
+    ...items.map((it) => `${it.qty} ${nombreParaChofer(it.name)}`),
+    "",
+    `Total: ${totalBicis}`,
+  ];
   return lines.join("\n");
 }
 
@@ -610,16 +715,78 @@ function mensajeParaEmpresaSobreLead(order) {
   ].join("\n");
 }
 
-function OrderDetailModal({ order, onClose, onMarkPaid, onCancel, onReactivate, authLoading }) {
+// Una fila de un depósito ya confirmado: pide el PDF de nuevo (no se
+// guarda el base64 en Firestore, pesa demasiado) y avisa fuerte si el
+// remito quedó a nombre de FEPA TOP en vez del cliente real.
+function RemitoResultadoRow({ r }) {
+  const [descargando, setDescargando] = useState(null); // "real" | "interno" | null
+
+  async function descargar(tipo) {
+    const archivo = tipo === "real" ? r.remitoRealArchivo : r.remitoInternoArchivo;
+    if (!archivo) return;
+    setDescargando(tipo);
+    try {
+      const { remitoPdfBase64 } = await descargarRemitoPorArchivo(archivo);
+      descargarPdfBase64(remitoPdfBase64, `remito-${r.remitoNumero || r.depositoOrigenNombre}-${tipo}.pdf`);
+    } catch (e) {
+      alert(e.message || String(e));
+    } finally {
+      setDescargando(null);
+    }
+  }
+
+  return (
+    <li className="rounded-lg bg-white p-2 dark:bg-neutral-900">
+      <p>
+        Desde {r.depositoOrigenNombre}: remito {r.remitoNumero || "(sin número)"}
+      </p>
+      {!r.remitoEsReal && (
+        <p className="mt-1 font-semibold text-rose-600 dark:text-rose-400">
+          ⚠️ No se pudo reasignar a nombre del cliente — este remito quedó a nombre de FEPA TOP. Hay que reasignarlo a mano en Contabilium (Remitos → buscar {r.remitoNumero}).
+        </p>
+      )}
+      <div className="mt-1 flex flex-wrap gap-2">
+        {r.remitoRealArchivo && (
+          <button
+            onClick={() => descargar("real")}
+            disabled={descargando !== null}
+            className="rounded-lg border border-emerald-300 bg-emerald-50 px-2 py-1 font-medium text-emerald-700 hover:bg-emerald-100 disabled:opacity-60 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400"
+          >
+            {descargando === "real" ? "Descargando…" : "📄 Descargar remito (cliente)"}
+          </button>
+        )}
+        {r.remitoInternoArchivo && (
+          <button
+            onClick={() => descargar("interno")}
+            disabled={descargando !== null}
+            className="rounded-lg border border-slate-300 bg-white px-2 py-1 font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-60 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-300"
+          >
+            {descargando === "interno" ? "Descargando…" : "📄 Descargar remito interno (FEPA TOP)"}
+          </button>
+        )}
+      </div>
+    </li>
+  );
+}
+
+function OrderDetailModal({ order, onClose, onMarkPaid, onCancel, onReactivate, onEnvioConfirmado, authLoading }) {
   const [copied, setCopied] = useState(false);
+  const [copiedChofer, setCopiedChofer] = useState(false);
   if (!order) return null;
   const items = order.items || [];
   const esSolicitudSinCuenta = order.status === "solicitud" && !order.customer?.uid;
+  const puedeConfirmarEnvio = order.customer?.uid && order.status !== "cancelada" && !order.envio?.confirmadoAt;
 
   function handleCopy() {
     navigator.clipboard.writeText(buildOrderText(order));
     setCopied(true);
     setTimeout(() => setCopied(false), 1800);
+  }
+
+  function handleCopyChofer() {
+    navigator.clipboard.writeText(buildOrderTextChofer(order));
+    setCopiedChofer(true);
+    setTimeout(() => setCopiedChofer(false), 1800);
   }
 
   return (
@@ -633,6 +800,13 @@ function OrderDetailModal({ order, onClose, onMarkPaid, onCancel, onReactivate, 
               className="rounded-2xl border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 transition hover:border-sky-400 hover:text-slate-900 dark:border-neutral-700 dark:text-neutral-300 dark:hover:text-white"
             >
               {copied ? "✅ Copiado" : "📋 Copiar pedido"}
+            </button>
+            <button
+              onClick={handleCopyChofer}
+              title="Texto simple sin precios ni SKU, listo para pasarle al chofer"
+              className="rounded-2xl border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 transition hover:border-sky-400 hover:text-slate-900 dark:border-neutral-700 dark:text-neutral-300 dark:hover:text-white"
+            >
+              {copiedChofer ? "✅ Copiado" : "🚚 Copiar para chofer"}
             </button>
             <button onClick={onClose} className="rounded-2xl px-3 py-2 text-xs text-slate-500 hover:bg-slate-100 dark:text-neutral-400 dark:hover:bg-neutral-800">
               Cerrar
@@ -651,9 +825,12 @@ function OrderDetailModal({ order, onClose, onMarkPaid, onCancel, onReactivate, 
           </p>
           <p>
             <span className="text-slate-500 dark:text-neutral-400">Estado:</span>{" "}
-            <span className={`inline-flex items-center gap-2 rounded-full px-3 py-0.5 text-xs ${statusStyles[order.status] || "border border-slate-200 bg-slate-50 text-slate-600"}`}>
-              {order.status}
+            <span className={`inline-flex items-center gap-2 rounded-full px-3 py-0.5 text-xs ${statusStyles[displayStatus(order).key] || "border border-slate-200 bg-slate-50 text-slate-600"}`}>
+              {displayStatus(order).label}
             </span>
+            {order.envio?.resultados?.length > 0 && (
+              <span className="ml-1 text-[11px] text-slate-400 dark:text-neutral-500">(factura/cobro real: {order.status})</span>
+            )}
           </p>
           {order.contabiliumComprobanteNumero && (
             <p><span className="text-slate-500 dark:text-neutral-400">Comprobante:</span> {order.contabiliumComprobanteNumero}</p>
@@ -712,6 +889,22 @@ function OrderDetailModal({ order, onClose, onMarkPaid, onCancel, onReactivate, 
           <span className="text-lg font-bold text-slate-900 dark:text-white">{money(order.total || 0)}</span>
         </div>
 
+        {order.envio?.confirmadoAt && (
+          <div className="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-800 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400">
+            <p className="font-semibold">✅ Envío confirmado — stock movido</p>
+            <ul className="mt-2 space-y-2">
+              {(order.envio.resultados || []).map((r, i) => (
+                <RemitoResultadoRow key={i} r={r} />
+              ))}
+            </ul>
+            <a href="/admin/chofer/grilla" className="mt-2 inline-block underline">
+              ver viaje(s) en la grilla →
+            </a>
+          </div>
+        )}
+
+        {puedeConfirmarEnvio && <ConfirmarEnvioPanel order={order} onEnvioConfirmado={onEnvioConfirmado} />}
+
         <div className="mt-5 flex flex-wrap gap-2">
           {order.status !== "pagada" && order.status !== "cancelada" && (
             <button
@@ -742,6 +935,365 @@ function OrderDetailModal({ order, onClose, onMarkPaid, onCancel, onReactivate, 
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+// El admin elige UN depósito para todo el pedido (lo normal: todo sale del
+// mismo lugar) — solo si algún ítem puntual no tiene stock ahí aparece la
+// opción de mandar ESE ítem desde otro depósito (ahí sí, un movimiento +
+// remito aparte para ese grupo). Cada grupo se procesa en DOS pasos
+// separados, igual que "Mover stock" en Stock consignado: primero el
+// movimiento real (que ya genera el remito interno, a nombre de FEPA TOP,
+// y el viaje en la grilla), y recién después, como acción aparte y
+// reintentable, "Generar remito real" — que le dice claramente si logró
+// tomar al cliente real o no.
+function ConfirmarEnvioPanel({ order, onEnvioConfirmado }) {
+  const { user, profile } = useAuth();
+  const [abierto, setAbierto] = useState(false);
+  const [stockPorDeposito, setStockPorDeposito] = useState({});
+  const [stockCargando, setStockCargando] = useState({});
+  const [depositoGlobal, setDepositoGlobal] = useState("");
+  const [excepciones, setExcepciones] = useState({}); // { itemId: depositoId } — solo para ítems sin stock en el global
+  const [error, setError] = useState("");
+  const [cliente, setCliente] = useState(null); // { contabiliumId, contabiliumDepositoId, name, phone }
+  const [clienteError, setClienteError] = useState("");
+
+  // grupos: null hasta que se confirman los depósitos; después, un array
+  // [{ depId, depInfo, items }] fijo — ya no cambia aunque se reintente un
+  // paso puntual.
+  const [grupos, setGrupos] = useState(null);
+  // pasos: { [depId]: { moviendo, movido: {idTransferencia, remitoArchivo, remitoNumero, remitoPdfBase64}|null, viajeId, generandoReal, remitoReal: {remitoArchivo, remitoPdfBase64, numero}|null, errorMover, errorReal } }
+  const [pasos, setPasos] = useState({});
+
+  const items = order.items || [];
+
+  useEffect(() => {
+    if (!abierto) return;
+    DEPOSITOS_PROPIOS_ORDERS.forEach((d) => {
+      if (stockPorDeposito[d.id] || stockCargando[d.id]) return;
+      setStockCargando((s) => ({ ...s, [d.id]: true }));
+      getDepositoStockAdmin(d.id)
+        .then((r) => setStockPorDeposito((s) => ({ ...s, [d.id]: r.items || [] })))
+        .catch(() => setStockPorDeposito((s) => ({ ...s, [d.id]: [] })))
+        .finally(() => setStockCargando((s) => ({ ...s, [d.id]: false })));
+    });
+    if (!cliente && !clienteError && order.customer?.uid) {
+      getDoc(doc(db, "users", order.customer.uid))
+        .then((snap) => {
+          const u = snap.exists() ? snap.data() : null;
+          if (!u?.contabiliumId || !u?.contabiliumDepositoId) {
+            setClienteError("El cliente de este pedido no tiene depósito propio vinculado en Contabilium — no se puede generar el remito real.");
+            return;
+          }
+          setCliente({ contabiliumId: u.contabiliumId, contabiliumDepositoId: u.contabiliumDepositoId, name: u.name || order.customer.name, phone: u.phone || order.customer.phone || null });
+        })
+        .catch((e) => setClienteError(e.message || String(e)));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [abierto]);
+
+  function stockDe(depId, sku) {
+    return (stockPorDeposito[depId] || []).find((p) => p.sku === sku)?.stockDisponible ?? null;
+  }
+
+  const depGlobalId = depositoGlobal ? Number(depositoGlobal) : null;
+  const itemsConFaltante = depGlobalId
+    ? items.filter((it) => {
+        const s = stockDe(depGlobalId, it.sku);
+        return s != null && it.qty > s;
+      })
+    : [];
+
+  function confirmarDepositos() {
+    if (!depGlobalId) {
+      setError("Elegí de qué depósito sale el pedido.");
+      return;
+    }
+    if (!cliente) {
+      setError(clienteError || "Esperando los datos del cliente…");
+      return;
+    }
+    setError("");
+    const mapa = new Map();
+    for (const it of items) {
+      const depId = Number(excepciones[it.id] || depGlobalId);
+      if (!mapa.has(depId)) mapa.set(depId, []);
+      mapa.get(depId).push(it);
+    }
+    const nuevosGrupos = Array.from(mapa.entries()).map(([depId, itemsGrupo]) => ({
+      depId,
+      depInfo: DEPOSITOS_PROPIOS_ORDERS.find((d) => d.id === depId),
+      items: itemsGrupo,
+    }));
+    setGrupos(nuevosGrupos);
+    setPasos(Object.fromEntries(nuevosGrupos.map((g) => [g.depId, {}])));
+  }
+
+  // Guarda en el pedido el estado actual de todos los grupos — se llama
+  // después de cada paso (mover o remito real) para no perder nada si se
+  // cierra el modal a mitad de camino.
+  function persistir(pasosActuales) {
+    const resultados = (grupos || []).map((g) => {
+      const p = pasosActuales[g.depId] || {};
+      return {
+        depositoOrigenId: g.depId,
+        depositoOrigenNombre: g.depInfo?.nombre,
+        idTransferencia: p.movido?.idTransferencia ?? null,
+        remitoNumero: p.remitoReal?.numero || p.movido?.remitoNumero || null,
+        remitoInternoArchivo: p.movido?.remitoArchivo || null,
+        remitoRealArchivo: p.remitoReal?.remitoArchivo || null,
+        remitoEsReal: !!p.remitoReal?.remitoPdfBase64,
+        viajeId: p.viajeId || null,
+      };
+    });
+    updateDoc(doc(db, "orders", order.id), {
+      envio: { confirmadoAt: serverTimestamp(), confirmadoPorUid: user?.uid || null, resultados },
+      updatedAt: serverTimestamp(),
+    }).catch(() => {});
+    onEnvioConfirmado?.(order.id, { confirmadoAt: new Date(), resultados });
+  }
+
+  async function moverStock(g) {
+    setPasos((prev) => ({ ...prev, [g.depId]: { ...prev[g.depId], moviendo: true, errorMover: null } }));
+    try {
+      const observaciones = `Pedido web #${order.id} — ${cliente.name}`;
+      const r = await transferirStockManual({
+        depositoOrigenId: g.depId,
+        depositoDestinoId: Number(cliente.contabiliumDepositoId),
+        items: g.items.map((it) => ({ sku: it.sku, cantidad: it.qty, name: it.name })),
+        observaciones,
+        depositoOrigenNombre: g.depInfo?.nombre,
+        depositoDestinoNombre: cliente.name,
+      });
+      const numeroMatch = r.remitoArchivo && /(\d{4}-\d{8})/.exec(r.remitoArchivo);
+      let viajeId = null;
+      try {
+        const resumenItems = g.items.map((it) => `${it.qty}x ${it.name} (SKU ${it.sku})`).join(", ");
+        viajeId = await crearViaje(
+          {
+            fecha: null,
+            turno: "mañana",
+            origen: { tipo: "deposito", id: String(g.depId), nombre: g.depInfo?.nombre || "", direccion: g.depInfo?.direccion || "", lat: null, lon: null, horario: null, telefono: null },
+            destino: { tipo: "cliente", id: String(cliente.contabiliumId), nombre: cliente.name, direccion: "", lat: null, lon: null, horario: null, telefono: cliente.phone || null },
+            horaSalida: null,
+            duracionMin: null,
+            distanciaKm: null,
+            descargaMin: 20,
+            notas: `Pedido web #${order.id} — ${resumenItems}`,
+            remito: { numero: numeroMatch ? numeroMatch[1] : null, id: null, tienePdf: !!r.remitoPdfBase64 },
+            pedidoPendienteId: null,
+          },
+          { uid: user?.uid || "", nombre: profile?.name || user?.email || null }
+        );
+      } catch {
+        // el movimiento ya se hizo — si falla crear el viaje (ej. sin red un
+        // instante) no hay que perder el progreso, se puede cargar a mano
+      }
+      setPasos((prev) => {
+        const next = {
+          ...prev,
+          [g.depId]: {
+            ...prev[g.depId],
+            moviendo: false,
+            movido: { idTransferencia: r.idTransferencia, remitoArchivo: r.remitoArchivo, remitoNumero: numeroMatch ? numeroMatch[1] : null, remitoPdfBase64: r.remitoPdfBase64 },
+            viajeId,
+          },
+        };
+        persistir(next);
+        return next;
+      });
+    } catch (e) {
+      setPasos((prev) => ({ ...prev, [g.depId]: { ...prev[g.depId], moviendo: false, errorMover: e.message || String(e) } }));
+    }
+  }
+
+  async function generarReal(g) {
+    const p = pasos[g.depId];
+    if (!p?.movido?.remitoArchivo) return;
+    setPasos((prev) => ({ ...prev, [g.depId]: { ...prev[g.depId], generandoReal: true, errorReal: null } }));
+    try {
+      const r = await generarRemitoRealManual({
+        remitoArchivo: p.movido.remitoArchivo,
+        proveedorContabiliumId: cliente.contabiliumId,
+        observaciones: `Pedido web #${order.id} — ${cliente.name}`,
+        incluirMercaderiaConsignacion: true,
+      });
+      setPasos((prev) => {
+        const next = { ...prev, [g.depId]: { ...prev[g.depId], generandoReal: false, remitoReal: { remitoArchivo: r.remitoArchivo, remitoPdfBase64: r.remitoPdfBase64, numero: r.numero } } };
+        persistir(next);
+        return next;
+      });
+    } catch (e) {
+      setPasos((prev) => ({ ...prev, [g.depId]: { ...prev[g.depId], generandoReal: false, errorReal: e.message || String(e) } }));
+    }
+  }
+
+  if (!abierto) {
+    return (
+      <button
+        onClick={() => setAbierto(true)}
+        className="mt-4 w-full rounded-2xl border border-amber-300 bg-amber-50 px-4 py-2.5 text-sm font-semibold text-amber-800 transition hover:bg-amber-100 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
+      >
+        📦 Confirmar envío (mueve stock real + remito + viaje)
+      </button>
+    );
+  }
+
+  if (!grupos) {
+    return (
+      <div className="mt-4 space-y-3 rounded-2xl border border-amber-300 bg-amber-50 p-4 dark:border-amber-500/30 dark:bg-amber-500/10">
+        <p className="text-xs font-semibold text-amber-800 dark:text-amber-400">
+          ¿De qué depósito sale este pedido? — esto va a mover stock real en Contabilium.
+        </p>
+        {clienteError && <p className="text-xs text-rose-600 dark:text-rose-400">{clienteError}</p>}
+        {error && <p className="text-xs text-rose-600 dark:text-rose-400">{error}</p>}
+
+        <select
+          value={depositoGlobal}
+          onChange={(e) => {
+            setDepositoGlobal(e.target.value);
+            setExcepciones({});
+          }}
+          className="w-full rounded-lg border border-slate-200 bg-white px-2 py-2 text-sm font-medium dark:border-neutral-700 dark:bg-neutral-800"
+        >
+          <option value="">Elegí depósito…</option>
+          {DEPOSITOS_PROPIOS_ORDERS.map((d) => (
+            <option key={d.id} value={d.id}>
+              {d.nombre} {stockCargando[d.id] ? "(cargando stock…)" : ""}
+            </option>
+          ))}
+        </select>
+
+        {depGlobalId && itemsConFaltante.length > 0 && (
+          <div className="space-y-2 rounded-xl border border-rose-200 bg-rose-50 p-2.5 dark:border-rose-500/30 dark:bg-rose-500/10">
+            <p className="text-xs font-semibold text-rose-700 dark:text-rose-400">
+              No hay stock suficiente en {DEPOSITOS_PROPIOS_ORDERS.find((d) => d.id === depGlobalId)?.nombre} para estos ítems — elegí de dónde salen (va a generar un movimiento/remito aparte, de ese depósito):
+            </p>
+            {itemsConFaltante.map((it) => (
+              <div key={it.id} className="rounded-lg bg-white p-2 text-xs dark:bg-neutral-900">
+                <p className="font-medium text-slate-800 dark:text-white">
+                  {it.qty}x {it.name} <span className="text-slate-400">(stock en {DEPOSITOS_PROPIOS_ORDERS.find((d) => d.id === depGlobalId)?.nombre}: {stockDe(depGlobalId, it.sku) ?? 0})</span>
+                </p>
+                <select
+                  value={excepciones[it.id] || ""}
+                  onChange={(e) => setExcepciones((prev) => ({ ...prev, [it.id]: e.target.value }))}
+                  className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs dark:border-neutral-700 dark:bg-neutral-800"
+                >
+                  <option value="">Mantener en {DEPOSITOS_PROPIOS_ORDERS.find((d) => d.id === depGlobalId)?.nombre} (no alcanza)</option>
+                  {DEPOSITOS_PROPIOS_ORDERS.filter((d) => d.id !== depGlobalId).map((d) => (
+                    <option key={d.id} value={d.id}>
+                      {d.nombre} — stock {stockDe(d.id, it.sku) ?? "?"}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="flex gap-2">
+          <button onClick={() => setAbierto(false)} className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-medium text-slate-500 dark:border-neutral-700">
+            Cancelar
+          </button>
+          <button
+            onClick={confirmarDepositos}
+            disabled={!cliente}
+            className="flex-1 rounded-xl bg-amber-600 px-3 py-2 text-xs font-semibold text-white hover:bg-amber-700 disabled:opacity-60"
+          >
+            {!cliente && !clienteError ? "Buscando datos del cliente…" : "Confirmar depósito(s)"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-4 space-y-3 rounded-2xl border border-amber-300 bg-amber-50 p-4 dark:border-amber-500/30 dark:bg-amber-500/10">
+      <div className="flex items-center justify-between">
+        <p className="text-xs font-semibold text-amber-800 dark:text-amber-400">Paso 1: mover stock real. Paso 2 (aparte): generar el remito real.</p>
+        <button onClick={() => setAbierto(false)} className="text-xs text-amber-700 underline dark:text-amber-400">
+          Cerrar
+        </button>
+      </div>
+      {grupos.map((g) => {
+        const p = pasos[g.depId] || {};
+        return (
+          <div key={g.depId} className="space-y-2 rounded-xl bg-white p-3 text-xs dark:bg-neutral-900">
+            <p className="font-semibold text-slate-800 dark:text-white">
+              Desde {g.depInfo?.nombre} — {g.items.length} ítem(s)
+            </p>
+
+            {!p.movido && (
+              <>
+                {p.errorMover && <p className="text-rose-600 dark:text-rose-400">{p.errorMover}</p>}
+                <button
+                  onClick={() => moverStock(g)}
+                  disabled={p.moviendo}
+                  className="rounded-lg bg-slate-800 px-3 py-1.5 font-semibold text-white hover:bg-slate-900 disabled:opacity-60 dark:bg-neutral-700"
+                >
+                  {p.moviendo ? "Moviendo stock…" : "1️⃣ Mover stock real"}
+                </button>
+              </>
+            )}
+
+            {p.movido && (
+              <>
+                <p className="text-emerald-600 dark:text-emerald-400">
+                  ✓ Stock movido — remito interno {p.movido.remitoNumero || "(sin número)"}
+                  {p.viajeId ? " — viaje creado" : " — ⚠ no se pudo crear el viaje, cargalo a mano"}
+                </p>
+                {p.movido.remitoPdfBase64 && (
+                  <button
+                    onClick={() => descargarPdfBase64(p.movido.remitoPdfBase64, `remito-${p.movido.remitoNumero}-interno.pdf`)}
+                    className="rounded-lg border border-slate-300 bg-white px-2 py-1 font-medium text-slate-600 hover:bg-slate-50 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-300"
+                  >
+                    📄 Descargar remito interno (FEPA TOP)
+                  </button>
+                )}
+
+                {!p.remitoReal && (
+                  <div className="mt-1">
+                    {p.errorReal && <p className="text-rose-600 dark:text-rose-400">{p.errorReal}</p>}
+                    <button
+                      onClick={() => generarReal(g)}
+                      disabled={p.generandoReal}
+                      className="rounded-lg bg-amber-600 px-3 py-1.5 font-semibold text-white hover:bg-amber-700 disabled:opacity-60"
+                    >
+                      {p.generandoReal ? "Generando…" : "2️⃣ Generar remito real"}
+                    </button>
+                  </div>
+                )}
+
+                {p.remitoReal && !p.remitoReal.remitoPdfBase64 && (
+                  <div className="mt-1 rounded-lg border border-rose-200 bg-rose-50 p-2 dark:border-rose-500/30 dark:bg-rose-500/10">
+                    <p className="font-semibold text-rose-700 dark:text-rose-400">⚠️ No tomó al cliente real — sigue a nombre de FEPA TOP.</p>
+                    <button
+                      onClick={() => generarReal(g)}
+                      disabled={p.generandoReal}
+                      className="mt-1 rounded-lg bg-amber-600 px-3 py-1.5 font-semibold text-white hover:bg-amber-700 disabled:opacity-60"
+                    >
+                      {p.generandoReal ? "Reintentando…" : "Reintentar remito real"}
+                    </button>
+                  </div>
+                )}
+
+                {p.remitoReal?.remitoPdfBase64 && (
+                  <div className="mt-1">
+                    <p className="text-emerald-600 dark:text-emerald-400">✓ Remito real generado a nombre de {cliente.name}</p>
+                    <button
+                      onClick={() => descargarPdfBase64(p.remitoReal.remitoPdfBase64, `remito-${p.remitoReal.numero}-real.pdf`)}
+                      className="rounded-lg border border-emerald-300 bg-emerald-50 px-2 py-1 font-medium text-emerald-700 hover:bg-emerald-100 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400"
+                    >
+                      📄 Descargar remito real
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

@@ -17,7 +17,17 @@ export default function TransferirStockPage() {
   useEffect(() => {
     setLoadingBase(true);
     setErrorBase("");
-    Promise.all([getMyDepositoStock(), getMiDepositoPropio(), getMisVendedores()])
+    // getMisVendedores() solo sirve (y solo funciona) para quien tiene
+    // equipo propio a cargo — un distribuidor sin equipo (ej. Julián) no
+    // tiene a quién "mandarle stock", pero igual puede "recibir de
+    // Lavalle" — así que si falla, no tiramos abajo toda la pantalla, solo
+    // dejamos la lista de clientes vacía (el modo "enviar" ya maneja ese
+    // caso mostrando "no tenés clientes con depósito cargado").
+    Promise.all([
+      getMyDepositoStock(),
+      getMiDepositoPropio(),
+      getMisVendedores().catch(() => ({ vendedores: [] })),
+    ])
       .then(([mio, lav, { vendedores }]) => {
         setMiDeposito({ id: mio.depositoId, nombre: mio.depositoNombre || "Mi depósito" });
         setLavalle({ id: lav.depositoId, nombre: lav.depositoNombre || "Lavalle" });
@@ -139,7 +149,7 @@ function PasoElegirCliente({ clientes, miDeposito, onVolver }) {
   );
 }
 
-function BotonVolver({ onClick }) {
+export function BotonVolver({ onClick }) {
   return (
     <button type="button" onClick={onClick} className="mt-6 text-base font-medium text-slate-500 hover:text-slate-800 dark:text-neutral-400 dark:hover:text-white">
       ← Volver
@@ -154,7 +164,7 @@ function BotonVolver({ onClick }) {
 // opción aparte "Hacer remito real", donde ahí sí se elige a nombre de qué
 // cliente va y se puede tocar la observación — mismo patrón de dos pasos
 // que usa el panel de admin.
-function PasoTransferencia({ titulo, origenId, origenNombre, destinoId, destinoNombre, cargarStock, onVolver, clienteDestino, clientesDisponibles }) {
+export function PasoTransferencia({ titulo, origenId, origenNombre, destinoId, destinoNombre, cargarStock, onVolver, clienteDestino, clientesDisponibles }) {
   const [items, setItems] = useState(null);
   const [loadingItems, setLoadingItems] = useState(true);
   const [errorItems, setErrorItems] = useState("");
@@ -321,6 +331,25 @@ function PasoTransferencia({ titulo, origenId, origenNombre, destinoId, destinoN
         <p className="mt-1 text-slate-600 dark:text-neutral-400">
           {carrito.reduce((acc, c) => acc + c.cantidad, 0)} bici(s) — {origenNombre} → {destinoNombre}
         </p>
+
+        <ul className="mt-4 space-y-1.5 text-left">
+          {carrito.map((c) => (
+            <li key={c.sku} className="flex items-center justify-between gap-2 rounded-xl border border-emerald-200 bg-white px-3 py-2 text-sm dark:border-emerald-900/50 dark:bg-neutral-900">
+              <span className="min-w-0 truncate font-medium text-slate-900 dark:text-white">{c.name}</span>
+              <span className="shrink-0 rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-bold text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400">
+                x{c.cantidad}
+              </span>
+            </li>
+          ))}
+        </ul>
+
+        {nota.trim() && (
+          <p className="mt-3 text-left text-sm text-slate-600 dark:text-neutral-400">
+            <span className="font-semibold">Observación:</span> {nota.trim()}
+          </p>
+        )}
+        <p className="mt-2 text-left text-xs text-slate-500 dark:text-neutral-400">{conRemito ? "📄 Con remito" : "🚫 Sin remito"}</p>
+
         {remitoArchivo && <p className="mt-1 text-sm text-slate-500 dark:text-neutral-400">📄 Remito interno: {remitoArchivo}</p>}
         {remitoPdfBase64 ? (
           <button

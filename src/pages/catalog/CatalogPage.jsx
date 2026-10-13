@@ -18,7 +18,7 @@ const SITE_URL = "https://samurai.ar";
 // Pedidos suspendidos hasta nuevo aviso mientras se regulariza el stock —
 // cambiar a false para reactivar. Solo corta el frontend; ver firestore.rules
 // si además hace falta bloquear el lado del servidor.
-const PEDIDOS_SUSPENDIDOS = true;
+const PEDIDOS_SUSPENDIDOS = false;
 const MENSAJE_PEDIDOS_SUSPENDIDOS =
   "Los pedidos están temporalmente suspendidos mientras regularizamos el stock. Volvé a intentarlo pronto.";
 

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useLocation } from "react-router-dom";
 import * as XLSX from "xlsx";
 import { addDoc, arrayUnion, collection, doc, getDocs, increment, limit, onSnapshot, orderBy, query, serverTimestamp, Timestamp, updateDoc, where } from "firebase/firestore";
-import { reviewPagoReportado } from "../../services/comprobantes";
+import { reviewPagoReportado, confirmarPagoReportado, obtenerBancosYCajasPropios } from "../../services/comprobantes";
 import { puedeEditarNotas as puedeEditarNotasCheck } from "../../utils/permisosNotas";
 import { subirImagenesNota } from "../../utils/notaImagenes";
 import HistorialSeguimiento from "../../components/crm/HistorialSeguimiento";
@@ -13,11 +13,12 @@ import { subscribeCobranzas } from "../../services/cobranzas";
 import { nombreBanco, listaBancos } from "../../services/bancos";
 import { listAuditsByDeposito, getAuditProgramStart, nextAuditDate, isAuditOverdue, isAuditDueSoon, contarVistas } from "../../services/stockAudits";
 import AuditVideoPlayer from "../../components/stock/AuditVideoPlayer";
-import { adminGetClientComprobantes, adminGetClientPhone, adminActualizarTelefonosCliente, adminGetComprobanteDetail, getDepositoStockAdmin, adminLinkClientesByCuit, emitirFacturaManual, cobrarComprobante, verificarCondicionAfip, subscribeClientesReportDetail, adminAsignarVendedor, searchContabiliumClientes, leerComprobantePagoAdmin, adminListDistribuidoresConEquipo, adminAsignarClienteADistribuidor, adminBuscarClientePorTelefono } from "../../services/comprobantes";
+import { adminGetClientComprobantes, adminGetClientPhone, adminActualizarTelefonosCliente, adminGetComprobanteDetail, adminDescargarPdfComprobante, getDepositoStockAdmin, adminLinkClientesByCuit, emitirFacturaManual, emitirFacturaVenta, cobrarComprobante, verificarCondicionAfip, subscribeClientesReportDetail, adminAsignarVendedor, searchContabiliumClientes, leerComprobantePagoAdmin, adminListDistribuidoresConEquipo, adminAsignarClienteADistribuidor, adminBuscarClientePorTelefono, cargarCobranzaACuentaManual, listarChequesDisponiblesContabilium } from "../../services/comprobantes";
 import { limpiarNombreBici, extraerTalle, extraerModelo } from "../../utils/bikeName";
 import { getContabiliumDepositos, labelDeposito } from "../../services/contabiliumDepositos";
 import { addNotaEntrega, subscribeNotasEntregaPorCliente } from "../../services/notasEntrega";
 import { VENDEDORES } from "./Vendedores";
+import { PasoTransferencia } from "../mistock/TransferirStockPage";
 import { printComprobante } from "../../utils/printComprobante";
 import {
   subscribeRedVendedores,
@@ -32,7 +33,7 @@ import {
 // sub-vendedores (ej. Federico Stortini, con 5 vendedores) — se les muestra
 // la sección "Red de vendedores" en su ficha. La cuenta es manual (Excel que
 // manda el distribuidor), no está atada al stock real de Contabilium.
-const CONTABILIUM_IDS_CON_RED_VENDEDORES = new Set([108857074]); // Federico Stortini
+const CONTABILIUM_IDS_CON_RED_VENDEDORES = new Set([]); // vacío: nadie usa "Red de vendedores" por ahora
 
 const money = (n) =>
   Number(n || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 });
@@ -923,6 +924,7 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
   const [filtroModelo, setFiltroModelo] = useState("todos");
   const [vendedorGuardando, setVendedorGuardando] = useState(false);
   const [equiposDisponibles, setEquiposDisponibles] = useState(null); // distribuidores con equipo propio (flete/comisión), ej. Alfredo Bavcevich
+  const [transferStockDesde, setTransferStockDesde] = useState(null); // distribuidor { uid, name, contabiliumDepositoId, contabiliumDepositoNombre } con el que se abrió "¿pasarle bicis?" después de sumarlo al equipo
   const [equipoGuardando, setEquipoGuardando] = useState(false);
   const [equipoMsg, setEquipoMsg] = useState("");
   const [vendedoresRedFactura, setVendedoresRedFactura] = useState(null); // red de sub-vendedores de este distribuidor (si aplica)
@@ -956,8 +958,11 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
   const [cheques, setCheques] = useState(null);
   const [ventasReportadas, setVentasReportadas] = useState(null);
   const [revisandoPagoId, setRevisandoPagoId] = useState(null);
+  const [pagoConfirmandoId, setPagoConfirmandoId] = useState(null); // id del pago reportado con el form de "cargar en Contabilium" abierto
+  const [emitiendoVentaId, setEmitiendoVentaId] = useState(null); // id de la venta reportada que se está facturando
   const [programStart, setProgramStart] = useState(null);
   const [reciboAbierto, setReciboAbierto] = useState(null); // id de la factura con el form de recibo abierto
+  const [cobranzaCuentaAbierta, setCobranzaCuentaAbierta] = useState(false);
   const [remitoDesdeFactura, setRemitoDesdeFactura] = useState(null); // { items } de la factura desde la que se pidió "Hacer un remito"
   const [soloImpagas, setSoloImpagas] = useState(false);
   const [notasEntrega, setNotasEntrega] = useState([]);
@@ -1041,6 +1046,71 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
       setItemsPorFactura((prev) => ({ ...prev, [id]: detalle.Items || [] }));
     } catch (err) {
       setItemsPorFactura((prev) => ({ ...prev, [id]: "error" }));
+    }
+  }
+
+  // Descarga el PDF de UNA factura ya emitida (no recién generada) —
+  // primero el real de Contabilium, y si ningún endpoint candidato
+  // funciona, cae al render propio de Samurai, igual que al emitir.
+  const [descargandoFacturaId, setDescargandoFacturaId] = useState(null);
+  const [descargandoTodas, setDescargandoTodas] = useState(false);
+  // Diagnóstico visible en pantalla de qué endpoints candidatos se
+  // probaron para el PDF real de Contabilium — así no hace falta abrir la
+  // consola del navegador ni entrar a Contabilium, solo copiar esto.
+  const [pdfDebugIntentos, setPdfDebugIntentos] = useState(null);
+  async function descargarFacturaPdf(c) {
+    try {
+      const pdfResultado = await adminDescargarPdfComprobante(c.Id);
+      if (pdfResultado.ok && pdfResultado.pdfBase64) {
+        const bytes = atob(pdfResultado.pdfBase64);
+        const arr = new Uint8Array(bytes.length);
+        for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+        const blob = new Blob([arr], { type: "application/pdf" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${c.Numero || c.Id}.pdf`;
+        a.click();
+        URL.revokeObjectURL(url);
+        return;
+      }
+      setPdfDebugIntentos({ factura: c.Numero, intentos: pdfResultado.intentos });
+    } catch (e) {
+      setPdfDebugIntentos({ factura: c.Numero, error: e.message });
+    }
+    const detalle = itemsPorFactura[c.Id] && Array.isArray(itemsPorFactura[c.Id]) ? { ...c, Items: itemsPorFactura[c.Id] } : await adminGetComprobanteDetail(c.Id);
+    printComprobante(detalle);
+  }
+
+  async function handleDescargarUnaFactura(c) {
+    setDescargandoFacturaId(c.Id);
+    try {
+      await descargarFacturaPdf(c);
+    } catch (e) {
+      setError(e.message || "No se pudo descargar esta factura");
+    } finally {
+      setDescargandoFacturaId(null);
+    }
+  }
+
+  // Descarga todas las facturas que están listadas ahora mismo (respeta el
+  // filtro "solo impagas" si está activo) — el navegador va a pedir
+  // permiso para descargas múltiples la primera vez, es normal.
+  async function handleDescargarTodasLasFacturas() {
+    const lista = soloImpagas ? comprobantes.filter((c) => c.Saldo > 0) : comprobantes;
+    if (!lista || lista.length === 0) return;
+    setDescargandoTodas(true);
+    try {
+      for (const c of lista) {
+        await descargarFacturaPdf(c);
+        // Pausa corta entre cada descarga — si se disparan todas juntas el
+        // navegador bloquea las descargas múltiples como si fuera spam.
+        await new Promise((r) => setTimeout(r, 600));
+      }
+    } catch (e) {
+      setError(e.message || "No se pudieron descargar todas las facturas");
+    } finally {
+      setDescargandoTodas(false);
     }
   }
 
@@ -1192,6 +1262,15 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
     try {
       await adminAsignarClienteADistribuidor(distribuidorUid, cliente.id, {});
       setEquipoMsg("✓ Agregado");
+      // Si ese distribuidor tiene depósito propio, puede que ya tenga ahí
+      // guardadas bicis destinadas a este cliente nuevo — ofrecemos pasarlas
+      // al toque, con el mismo panel que usa el distribuidor para mandarle
+      // stock a sus clientes (con o sin remito), en vez de que quede como un
+      // paso suelto que alguien tiene que acordarse de hacer después.
+      const distribuidor = (equiposDisponibles || []).find((d) => d.uid === distribuidorUid);
+      if (distribuidor?.contabiliumDepositoId) {
+        setTransferStockDesde(distribuidor);
+      }
     } catch (e) {
       setEquipoMsg(e.message || "No se pudo agregar");
     } finally {
@@ -1330,6 +1409,29 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
       alert(e.message || "No se pudo revisar el pago.");
     } finally {
       setRevisandoPagoId(null);
+    }
+  }
+
+  // Factura UNA venta reportada puntual (la misma automatización que usa
+  // la pantalla "Ventas reportadas") directamente desde la ficha del
+  // cliente — así no hace falta salir a buscarla en otro lado para
+  // resolver la reserva de stock que genera mientras está pendiente.
+  async function handleFacturarVentaReportada(venta) {
+    if (
+      !confirm(
+        `Vas a EMITIR UNA FACTURA REAL en Contabilium (con CAE, irreversible) por:\n\n${venta.name || venta.sku} x${venta.quantity} — ${money(Number(venta.unitPrice || 0) * Number(venta.quantity || 0))}\n\n¿Confirmás?`
+      )
+    )
+      return;
+    setEmitiendoVentaId(venta.id);
+    try {
+      await emitirFacturaVenta([venta.id]);
+      setVentasReportadas((prev) => prev.map((v) => (v.id === venta.id ? { ...v, status: "facturado" } : v)));
+      recargarFacturas();
+    } catch (e) {
+      alert(e.message || "No se pudo facturar la venta reportada.");
+    } finally {
+      setEmitiendoVentaId(null);
     }
   }
 
@@ -1496,8 +1598,12 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
   const saldoPendiente = saldoTotal;
   const totalFacturado = (comprobantes || []).reduce((acc, c) => acc + Number(c.Total || 0), 0);
   const stockBicis = (stock || []).filter((s) => (s.category || "").toUpperCase() === "BICICLETAS");
-  const totalBicis = stockBicis.reduce((acc, s) => acc + Number(s.stockActual ?? 0), 0);
-  const valorConsignado = stockBicis.reduce((acc, s) => acc + Number(s.stockActual ?? 0) * Number(s.priceArs ?? 0), 0);
+  // stockDisponible ya viene del backend restando las ventas reportadas
+  // todavía no facturadas (getPendingSoldBySku) — usarlo acá evita que este
+  // resumen quede desactualizado hasta que alguien facture y ajuste el
+  // stock real en Contabilium a mano.
+  const totalBicis = stockBicis.reduce((acc, s) => acc + Number(s.stockDisponible ?? s.stockActual ?? 0), 0);
+  const valorConsignado = stockBicis.reduce((acc, s) => acc + Number(s.stockDisponible ?? s.stockActual ?? 0) * Number(s.priceArs ?? 0), 0);
 
   return (
     <div className="fixed inset-0 z-[9000] flex items-end justify-center bg-black/50 p-0 sm:items-center sm:p-4" onClick={onClose}>
@@ -1787,6 +1893,17 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
                 💳 Comprobante
               </button>
             )}
+            {!soloLectura && cliente.contabiliumId && (
+              <a
+                href={`/admin/pedidos-pendientes?clienteNombre=${encodeURIComponent(
+                  cliente.name || ""
+                )}&clienteContabiliumId=${cliente.contabiliumId}${telefono ? `&clienteTelefono=${encodeURIComponent(telefono)}` : ""}`}
+                title="Buscar stock en Lavalle/Cañuelas/Credifin para mandarle a este cliente"
+                className="rounded-xl bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-amber-700"
+              >
+                📦 Pedir bici
+              </a>
+            )}
             <button
               onClick={onClose}
               className="rounded-full p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:text-neutral-500 dark:hover:bg-neutral-800 dark:hover:text-neutral-300"
@@ -1921,6 +2038,38 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
               </div>
             )}
 
+            {ventasReportadas && ventasReportadas.filter((v) => v.status === "pendiente").length > 0 && (
+              <div className="mt-4 rounded-2xl border border-sky-200 bg-sky-50 p-4 dark:border-sky-900/50 dark:bg-sky-950/20">
+                <p className="mb-2 text-sm font-semibold text-sky-900 dark:text-sky-300">
+                  🚲 Ventas reportadas pendientes de facturar ({ventasReportadas.filter((v) => v.status === "pendiente").length})
+                </p>
+                <p className="mb-3 text-xs text-sky-700 dark:text-sky-400">
+                  El cliente reportó que ya vendió esto — mientras no se facture, la unidad queda reservada (no cuenta como disponible en "Facturar").
+                </p>
+                <div className="space-y-2">
+                  {ventasReportadas.filter((v) => v.status === "pendiente").map((v) => (
+                    <div key={v.id} className="flex items-center justify-between gap-2 rounded-xl border border-sky-200 bg-white px-3 py-2.5 text-sm dark:border-sky-900/50 dark:bg-neutral-900">
+                      <div className="min-w-0">
+                        <p className="truncate font-semibold text-slate-900 dark:text-white">{v.name || `SKU ${v.sku}`} x{v.quantity}</p>
+                        <p className="text-xs text-slate-400 dark:text-neutral-500">
+                          {money(Number(v.unitPrice || 0) * Number(v.quantity || 0))} · {v.createdAt?.toDate ? formatFecha(v.createdAt.toDate().toISOString().slice(0, 10)) : ""}
+                        </p>
+                      </div>
+                      {!soloLectura && (
+                        <button
+                          onClick={() => handleFacturarVentaReportada(v)}
+                          disabled={emitiendoVentaId === v.id}
+                          className="shrink-0 rounded-lg bg-sky-600 px-2.5 py-1.5 text-xs font-semibold text-white transition hover:bg-sky-700 disabled:opacity-60"
+                        >
+                          {emitiendoVentaId === v.id ? "Facturando…" : "✓ Facturar"}
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {pagosReportados && pagosReportados.filter((p) => p.estado === "pendiente").length > 0 && (
               <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 p-4 dark:border-amber-900/50 dark:bg-amber-950/20">
                 <p className="mb-2 text-sm font-semibold text-amber-900 dark:text-amber-300">
@@ -1944,11 +2093,10 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
                         {!soloLectura && (
                           <div className="ml-auto flex gap-1.5">
                             <button
-                              onClick={() => handleRevisarPago(p, true)}
-                              disabled={revisandoPagoId === p.id}
-                              className="rounded-lg bg-emerald-600 px-2.5 py-1 text-xs font-semibold text-white transition hover:bg-emerald-700 disabled:opacity-60"
+                              onClick={() => setPagoConfirmandoId(pagoConfirmandoId === p.id ? null : p.id)}
+                              className="rounded-lg bg-emerald-600 px-2.5 py-1 text-xs font-semibold text-white transition hover:bg-emerald-700"
                             >
-                              ✓ Ya está en Contabilium
+                              {pagoConfirmandoId === p.id ? "✕ Cancelar" : "✓ Cargar en Contabilium"}
                             </button>
                             <button
                               onClick={() => handleRevisarPago(p, false)}
@@ -1960,6 +2108,21 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
                           </div>
                         )}
                       </div>
+                      {pagoConfirmandoId === p.id && (
+                        <ConfirmarPagoForm
+                          pago={p}
+                          contabiliumId={cliente.contabiliumId}
+                          facturasAbiertas={(comprobantes || []).filter((c) => Number(c.Saldo || 0) > 0)}
+                          onClose={() => setPagoConfirmandoId(null)}
+                          onDone={(r) => {
+                            setPagoConfirmandoId(null);
+                            setPagosReportados((prev) =>
+                              prev.map((x) => (x.id === p.id ? { ...x, estado: "confirmado_manual", nroComprobanteRecibo: r.nroComprobante } : x))
+                            );
+                            recargarFacturas();
+                          }}
+                        />
+                      )}
                     </div>
                   ))}
                 </div>
@@ -2037,19 +2200,63 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
             <div className="mt-5">
               <div className="mb-2 flex items-center justify-between gap-2">
                 <p className="text-sm font-semibold text-slate-900 dark:text-white">Facturas</p>
-                {(comprobantes || []).length > 0 && (
-                  <button
-                    onClick={() => setSoloImpagas((v) => !v)}
-                    className={`rounded-lg border px-2 py-1 text-xs font-medium transition ${
-                      soloImpagas
-                        ? "border-rose-400 bg-rose-50 text-rose-700 dark:border-rose-500 dark:bg-rose-950/40 dark:text-rose-400"
-                        : "border-slate-200 text-slate-500 hover:border-rose-300 dark:border-neutral-700 dark:text-neutral-400"
-                    }`}
-                  >
-                    {soloImpagas ? "✓ " : ""}Solo impagas (sin recibo)
-                  </button>
-                )}
+                <div className="flex items-center gap-2">
+                  {!soloLectura && (
+                    <button
+                      onClick={() => setCobranzaCuentaAbierta((v) => !v)}
+                      className="rounded-lg border border-emerald-300 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-100 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-400"
+                    >
+                      {cobranzaCuentaAbierta ? "✕ Cancelar" : "➕ Cobranza a cuenta"}
+                    </button>
+                  )}
+                  {(comprobantes || []).length > 0 && (
+                    <button
+                      onClick={() => setSoloImpagas((v) => !v)}
+                      className={`rounded-lg border px-2 py-1 text-xs font-medium transition ${
+                        soloImpagas
+                          ? "border-rose-400 bg-rose-50 text-rose-700 dark:border-rose-500 dark:bg-rose-950/40 dark:text-rose-400"
+                          : "border-slate-200 text-slate-500 hover:border-rose-300 dark:border-neutral-700 dark:text-neutral-400"
+                      }`}
+                    >
+                      {soloImpagas ? "✓ " : ""}Solo impagas (sin recibo)
+                    </button>
+                  )}
+                  {(comprobantes || []).length > 0 && (
+                    <button
+                      onClick={handleDescargarTodasLasFacturas}
+                      disabled={descargandoTodas}
+                      className="rounded-lg border border-sky-300 bg-sky-50 px-2 py-1 text-xs font-medium text-sky-700 hover:bg-sky-100 disabled:opacity-60 dark:border-sky-800 dark:bg-sky-950/30 dark:text-sky-400"
+                    >
+                      {descargandoTodas ? "Descargando…" : "⬇️ Descargar todas"}
+                    </button>
+                  )}
+                </div>
               </div>
+              {pdfDebugIntentos && (
+                <div className="mb-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-xs dark:border-amber-700 dark:bg-amber-950/30">
+                  <div className="mb-1 flex items-center justify-between">
+                    <span className="font-semibold text-amber-800 dark:text-amber-300">
+                      PDF real de Contabilium no disponible para {pdfDebugIntentos.factura} — bajó el de respaldo. Copiá esto y pasáselo a Claude:
+                    </span>
+                    <button onClick={() => setPdfDebugIntentos(null)} className="text-amber-500 hover:text-amber-700">
+                      ✕
+                    </button>
+                  </div>
+                  <pre className="max-h-48 overflow-auto rounded-lg bg-white p-2 text-[10px] text-slate-700 dark:bg-neutral-950 dark:text-neutral-300">
+                    {JSON.stringify(pdfDebugIntentos, null, 2)}
+                  </pre>
+                </div>
+              )}
+              {cobranzaCuentaAbierta && (
+                <CobranzaACuentaForm
+                  contabiliumId={cliente.contabiliumId}
+                  onClose={() => setCobranzaCuentaAbierta(false)}
+                  onDone={() => {
+                    setCobranzaCuentaAbierta(false);
+                    recargarFacturas();
+                  }}
+                />
+              )}
               {(comprobantes || []).length === 0 ? (
                 <p className="text-sm text-slate-400 dark:text-neutral-500">Sin facturas en los últimos 2 años.</p>
               ) : (soloImpagas ? comprobantes.filter((c) => c.Saldo > 0) : comprobantes).length === 0 ? (
@@ -2061,37 +2268,52 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
                     const items = itemsPorFactura[c.Id];
                     return (
                       <div key={c.Id} className="rounded-xl border border-slate-100 dark:border-neutral-800">
-                        <button
-                          onClick={() => handleToggleFactura(c.Id)}
-                          className="flex w-full items-center justify-between px-3 py-2 text-left text-sm"
-                        >
-                          <div>
-                            <span className="font-mono text-slate-700 dark:text-neutral-300">{c.Numero}</span>
-                            {c.Tipo === "COT" && (
-                              <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-500 dark:bg-neutral-800 dark:text-neutral-400">
-                                Cotización
+                        <div className="flex w-full items-center gap-2 px-3 py-2">
+                          <button
+                            onClick={() => handleToggleFactura(c.Id)}
+                            className="flex flex-1 items-center justify-between text-left text-sm"
+                          >
+                            <div>
+                              <span className="font-mono text-slate-700 dark:text-neutral-300">{c.Numero}</span>
+                              {c.Tipo === "COT" && (
+                                <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-500 dark:bg-neutral-800 dark:text-neutral-400">
+                                  Cotización
+                                </span>
+                              )}
+                              {c.Tipo === "NCA" && (
+                                <span className="ml-2 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400">
+                                  Nota de crédito
+                                  {c.IdComprobanteAsociado &&
+                                    (() => {
+                                      const asociada = comprobantes.find((x) => x.Id === c.IdComprobanteAsociado);
+                                      return asociada ? ` → afecta a ${asociada.Numero}` : "";
+                                    })()}
+                                </span>
+                              )}
+                              <span className="ml-2 text-xs text-slate-400 dark:text-neutral-500">{formatFecha(c.Fecha)}</span>
+                            </div>
+                            <div className="flex items-center gap-3">
+                              <span className="text-slate-600 dark:text-neutral-400">{money(c.Total)}</span>
+                              <span className={c.Saldo > 0 ? "font-semibold text-rose-600 dark:text-rose-400" : "text-emerald-600 dark:text-emerald-400"}>
+                                {money(c.Saldo)}
                               </span>
-                            )}
-                            {c.Tipo === "NCA" && (
-                              <span className="ml-2 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400">
-                                Nota de crédito
-                                {c.IdComprobanteAsociado &&
-                                  (() => {
-                                    const asociada = comprobantes.find((x) => x.Id === c.IdComprobanteAsociado);
-                                    return asociada ? ` → afecta a ${asociada.Numero}` : "";
-                                  })()}
-                              </span>
-                            )}
-                            <span className="ml-2 text-xs text-slate-400 dark:text-neutral-500">{formatFecha(c.Fecha)}</span>
-                          </div>
-                          <div className="flex items-center gap-3">
-                            <span className="text-slate-600 dark:text-neutral-400">{money(c.Total)}</span>
-                            <span className={c.Saldo > 0 ? "font-semibold text-rose-600 dark:text-rose-400" : "text-emerald-600 dark:text-emerald-400"}>
-                              {money(c.Saldo)}
-                            </span>
-                            <span className="text-slate-400">{abierta ? "▲" : "▼"}</span>
-                          </div>
-                        </button>
+                              <span className="text-slate-400">{abierta ? "▲" : "▼"}</span>
+                            </div>
+                          </button>
+                          {c.Tipo !== "COT" && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleDescargarUnaFactura(c);
+                              }}
+                              disabled={descargandoFacturaId === c.Id}
+                              title="Descargar PDF de esta factura"
+                              className="shrink-0 rounded-lg border border-slate-200 px-2 py-1 text-xs text-slate-500 hover:border-sky-300 hover:text-sky-600 disabled:opacity-60 dark:border-neutral-700 dark:text-neutral-400"
+                            >
+                              {descargandoFacturaId === c.Id ? "…" : "⬇️"}
+                            </button>
+                          )}
+                        </div>
                         {abierta && (
                           <div className="border-t border-slate-100 px-3 py-2 dark:border-neutral-800">
                             {items === "loading" && (
@@ -2625,6 +2847,78 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
           onDone={() => { setReciboModalOpen(false); recargarFacturas(); recargarCheques(); }}
         />
       )}
+
+      {transferStockDesde && (
+        <TransferirStockDesdeAdminModal
+          distribuidor={transferStockDesde}
+          cliente={cliente}
+          onClose={() => setTransferStockDesde(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+// Después de sumar un cliente al equipo de un distribuidor con depósito
+// propio (ej. Cuchi), ofrece pasarle bicis de ese depósito al depósito del
+// cliente recién sumado — mismo panel (PasoTransferencia) que usa el
+// distribuidor desde "Mover stock" para mandarle stock a SUS clientes, solo
+// que acá el origen/destino ya vienen fijos (no hay que elegir a quién).
+function TransferirStockDesdeAdminModal({ distribuidor, cliente, onClose }) {
+  const [confirmado, setConfirmado] = useState(false);
+  const nombreCliente = cliente.contabiliumDepositoNombre || cliente.name;
+
+  return (
+    <div className="fixed inset-0 z-[9200] flex items-end justify-center bg-black/60 p-0 sm:items-center sm:p-4" onClick={onClose}>
+      <div
+        className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-t-3xl bg-white p-5 shadow-2xl sm:rounded-3xl dark:bg-neutral-900"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-3 flex items-center justify-between">
+          <h3 className="text-base font-bold text-slate-900 dark:text-white">🚲 Pasar bicis a {cliente.name}</h3>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600 dark:text-neutral-500">
+            ✕
+          </button>
+        </div>
+
+        {!confirmado ? (
+          <>
+            <p className="text-sm text-slate-600 dark:text-neutral-300">
+              Sumaste a <strong>{cliente.name}</strong> al equipo de <strong>{distribuidor.name}</strong>. ¿Querés pasar bicicletas del depósito de {distribuidor.name} ({distribuidor.contabiliumDepositoNombre}) al depósito de {cliente.name} ahora?
+            </p>
+            <div className="mt-4 flex gap-2">
+              <button
+                onClick={() => setConfirmado(true)}
+                className="rounded-xl bg-sky-600 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-700"
+              >
+                Sí, pasar bicis
+              </button>
+              <button
+                onClick={onClose}
+                className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-50 dark:border-neutral-700 dark:text-neutral-300"
+              >
+                Ahora no
+              </button>
+            </div>
+          </>
+        ) : !cliente.contabiliumDepositoId ? (
+          <p className="rounded-xl border border-dashed border-slate-300 p-3 text-center text-xs text-slate-500 dark:border-neutral-700 dark:text-neutral-400">
+            {cliente.name} todavía no tiene depósito consignado propio en Contabilium — asignale uno primero (editándolo en "Usuarios") para poder pasarle stock.
+          </p>
+        ) : (
+          <PasoTransferencia
+            titulo={`📤 ${distribuidor.contabiliumDepositoNombre} → ${nombreCliente}`}
+            origenId={distribuidor.contabiliumDepositoId}
+            origenNombre={distribuidor.contabiliumDepositoNombre}
+            destinoId={cliente.contabiliumDepositoId}
+            destinoNombre={nombreCliente}
+            cargarStock={() => getDepositoStockAdmin(distribuidor.contabiliumDepositoId).then((r) => r.items)}
+            onVolver={onClose}
+            clienteDestino={{ contabiliumId: cliente.contabiliumId, name: cliente.name }}
+            clientesDisponibles={[{ uid: cliente.id, name: cliente.name, contabiliumId: cliente.contabiliumId }]}
+          />
+        )}
+      </div>
     </div>
   );
 }
@@ -2728,6 +3022,335 @@ function ReciboModal({ contabiliumId, clienteName, clienteId, vendedor, realizad
   );
 }
 
+// Cache en memoria de la lista real de bancos/cajas propias de Contabilium
+// — se usa en los 2 forms de cobranza (factura puntual y "a cuenta") para
+// mostrar un <select> con las cuentas que de verdad existen en Contabilium
+// en vez de un campo de texto libre que había que escribir a mano y
+// confiar en que el backend lo matcheara bien. Se trae una sola vez por
+// carga de página (la lista casi no cambia) y se comparte entre forms.
+let _bancosYCajasPropiosPromise = null;
+function useBancosYCajasPropios() {
+  const [data, setData] = useState({ bancos: [], cajas: [], cargando: true });
+  useEffect(() => {
+    if (!_bancosYCajasPropiosPromise) _bancosYCajasPropiosPromise = obtenerBancosYCajasPropios();
+    _bancosYCajasPropiosPromise
+      .then((r) => setData({ bancos: r.bancos || [], cajas: r.cajas || [], cargando: false }))
+      .catch(() => setData({ bancos: [], cajas: [], cargando: false }));
+  }, []);
+  return data;
+}
+
+// Carga una cobranza "a cuenta" (sin aplicar a ninguna factura) en
+// Contabilium — automatización web, ver cargarCobranzaACuentaWeb. Útil
+// cuando un pago recibido supera lo pendiente de la única factura del
+// cliente, o cuando no hay ninguna factura abierta a la cual aplicarlo:
+// el sobrante queda registrado "a cuenta" para aplicarlo a futuro, en vez
+// de perderse sin ningún rastro.
+// Confirma un comprobante que un cliente subió, cargando el recibo DE
+// VERDAD en Contabilium (antes solo se marcaba un estado acá, sin tocar
+// nada real — por eso nunca impactaba la cuenta). El staff elige a mano a
+// qué factura se aplica (o "a cuenta" si no corresponde a ninguna
+// puntual) y confirma/corrige la fecha — la IA la lee de la imagen pero el
+// distribuidor puede haber tipeado otra al subir el comprobante, así que
+// se muestran las dos.
+function ConfirmarPagoForm({ pago, contabiliumId, facturasAbiertas, onClose, onDone }) {
+  const [idComprobante, setIdComprobante] = useState("-1");
+  const [importe, setImporte] = useState(pago.monto || "");
+  const [fecha, setFecha] = useState(pago.lecturaIA?.fecha || pago.fecha || new Date().toISOString().slice(0, 10));
+  const [forma, setForma] = useState("Transferencia");
+  const { bancos, cajas, cargando: cargandoBancos } = useBancosYCajasPropios();
+  const [idBanco, setIdBanco] = useState("");
+  const [idCaja, setIdCaja] = useState("");
+  const [nroRef, setNroRef] = useState(pago.lecturaIA?.referencia || "");
+  const [enviando, setEnviando] = useState(false);
+  const [error, setError] = useState("");
+
+  // Apenas llega la lista real, preseleccionamos lo que la IA leyó en la
+  // imagen (si matchea algún nombre) y la primera caja como default — nunca
+  // se manda vacío al backend una vez que la lista cargó.
+  useEffect(() => {
+    if (cargandoBancos) return;
+    if (!idBanco && bancos.length) {
+      const nombreLeido = (pago.lecturaIA?.banco || "").toLowerCase();
+      const match = nombreLeido && bancos.find((b) => b.nombre.toLowerCase().includes(nombreLeido) || nombreLeido.includes(b.nombre.toLowerCase()));
+      setIdBanco(String((match || bancos[0]).id));
+    }
+    if (!idCaja && cajas.length) setIdCaja(String(cajas[0].id));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cargandoBancos, bancos, cajas]);
+
+  const facturaElegida = facturasAbiertas.find((f) => String(f.Id) === idComprobante);
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setError("");
+    if (!importe || Number(importe) <= 0 || !fecha || (forma === "Efectivo" ? !idCaja : !idBanco)) {
+      setError("Completá importe, fecha y banco/caja.");
+      return;
+    }
+    setEnviando(true);
+    try {
+      const r = await confirmarPagoReportado({
+        id: pago.id,
+        idComprobante: idComprobante === "-1" ? "-1" : Number(idComprobante),
+        comprobante: facturaElegida?.Numero,
+        importe: Number(importe),
+        saldoFactura: facturaElegida ? Number(facturaElegida.Saldo) : undefined,
+        fecha,
+        forma,
+        idBanco: forma === "Efectivo" ? undefined : Number(idBanco),
+        idCaja: forma === "Efectivo" ? Number(idCaja) : undefined,
+        nroRef: nroRef.trim() || undefined,
+      });
+      onDone?.(r);
+    } catch (err) {
+      setError(err.message || "No se pudo cargar el recibo");
+    } finally {
+      setEnviando(false);
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit} className="mt-2 grid gap-2 rounded-xl border border-amber-300 bg-amber-50/60 p-3 text-xs dark:border-amber-800 dark:bg-amber-950/20">
+      {pago.lecturaIA && (
+        <p className="rounded-lg bg-white px-2 py-1.5 text-[11px] text-slate-600 dark:bg-neutral-900 dark:text-neutral-300">
+          🤖 La IA leyó en la imagen: {pago.lecturaIA.fecha ? `fecha ${formatFecha(pago.lecturaIA.fecha)}` : "sin fecha clara"}
+          {pago.lecturaIA.monto ? `, monto ${money(pago.lecturaIA.monto)}` : ""}
+          {pago.lecturaIA.banco ? `, banco "${pago.lecturaIA.banco}"` : ""} (confianza: {pago.lecturaIA.confianza}).
+          {pago.fecha && pago.lecturaIA.fecha && pago.fecha !== pago.lecturaIA.fecha && (
+            <> El distribuidor había puesto {formatFecha(pago.fecha)} al subirlo — revisá cuál es la correcta.</>
+          )}
+        </p>
+      )}
+      <div>
+        <label className="mb-1 block font-semibold text-slate-600 dark:text-neutral-300">
+          Aplicar a * — elegí la factura, o "a cuenta" ({facturasAbiertas.length} factura{facturasAbiertas.length === 1 ? "" : "s"} abierta{facturasAbiertas.length === 1 ? "" : "s"})
+        </label>
+        <select value={idComprobante} onChange={(e) => setIdComprobante(e.target.value)} className="w-full rounded-lg border-2 border-amber-400 bg-white px-2 py-2 font-semibold outline-none focus:border-amber-500 dark:border-amber-700 dark:bg-neutral-800 dark:text-white">
+          <option value="-1">⚠️ Cobranza a cuenta (sin factura puntual)</option>
+          {facturasAbiertas.map((f) => (
+            <option key={f.Id} value={f.Id}>
+              📄 Factura {f.Numero} — saldo {money(f.Saldo)}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <div>
+          <label className="mb-1 block text-slate-500 dark:text-neutral-400">Importe *</label>
+          <input type="number" value={importe} onChange={(e) => setImporte(e.target.value)} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-amber-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white" />
+        </div>
+        <div>
+          <label className="mb-1 block text-slate-500 dark:text-neutral-400">Fecha *</label>
+          <input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-amber-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white" />
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <div>
+          <label className="mb-1 block text-slate-500 dark:text-neutral-400">Forma de pago</label>
+          <select value={forma} onChange={(e) => setForma(e.target.value)} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-amber-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white">
+            <option value="Transferencia">Transferencia</option>
+            <option value="Efectivo">Efectivo</option>
+          </select>
+        </div>
+        <div>
+          <label className="mb-1 block text-slate-500 dark:text-neutral-400">{forma === "Efectivo" ? "Caja *" : "Banco propio *"}</label>
+          {forma === "Efectivo" ? (
+            <select value={idCaja} onChange={(e) => setIdCaja(e.target.value)} disabled={cargandoBancos} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-amber-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white">
+              {cargandoBancos && <option value="">Cargando…</option>}
+              {cajas.map((c) => (
+                <option key={c.id} value={c.id}>{c.nombre}</option>
+              ))}
+            </select>
+          ) : (
+            <select value={idBanco} onChange={(e) => setIdBanco(e.target.value)} disabled={cargandoBancos} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-amber-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white">
+              {cargandoBancos && <option value="">Cargando…</option>}
+              {bancos.map((b) => (
+                <option key={b.id} value={b.id}>{b.nombre}</option>
+              ))}
+            </select>
+          )}
+        </div>
+      </div>
+      <div>
+        <label className="mb-1 block text-slate-500 dark:text-neutral-400">Referencia</label>
+        <input type="text" value={nroRef} onChange={(e) => setNroRef(e.target.value)} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-amber-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white" />
+      </div>
+      {error && <p className="text-rose-600 dark:text-rose-400">{error}</p>}
+      <div className="flex gap-2">
+        <button type="submit" disabled={enviando} className="rounded-lg bg-emerald-600 px-3 py-1.5 font-bold text-white hover:bg-emerald-700 disabled:opacity-60">
+          {enviando ? "Cargando…" : "✓ Confirmar y cargar en Contabilium"}
+        </button>
+        <button type="button" onClick={onClose} className="rounded-lg border border-slate-200 px-3 py-1.5 text-slate-600 hover:bg-slate-50 dark:border-neutral-700 dark:text-neutral-300">
+          Cancelar
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function CobranzaACuentaForm({ contabiliumId, onClose, onDone }) {
+  const [importe, setImporte] = useState("");
+  const [fecha, setFecha] = useState(() => new Date().toISOString().slice(0, 10));
+  const { bancos, cargando: cargandoBancos } = useBancosYCajasPropios();
+  const [idBanco, setIdBanco] = useState("");
+  const [nroRef, setNroRef] = useState("");
+  const [observaciones, setObservaciones] = useState("");
+  const [enviando, setEnviando] = useState(false);
+  const [error, setError] = useState("");
+  const [resultado, setResultado] = useState(null);
+  const [leyendoComprobante, setLeyendoComprobante] = useState(false);
+  const [lecturaComprobante, setLecturaComprobante] = useState(null);
+
+  useEffect(() => {
+    if (!cargandoBancos && !idBanco && bancos.length) setIdBanco(String(bancos[0].id));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cargandoBancos, bancos]);
+
+  // Subís la foto/captura de la transferencia y se lee sola para
+  // precargar importe/fecha/banco/referencia — igual que en el recibo de
+  // factura. Siempre queda editable antes de guardar, nunca se aplica solo.
+  async function handleCargarComprobante(file) {
+    if (!file) return;
+    setError("");
+    setLecturaComprobante(null);
+    setLeyendoComprobante(true);
+    try {
+      const [url] = await subirImagenesNota(`comprobantesPago/${contabiliumId}`, [file]);
+      const { lectura } = await leerComprobantePagoAdmin(url);
+      if (!lectura) {
+        setLecturaComprobante({ confianza: "baja", vacio: true });
+        return;
+      }
+      if (lectura.monto) setImporte(String(lectura.monto));
+      if (lectura.fecha) setFecha(lectura.fecha);
+      if (lectura.banco && bancos.length) {
+        const nombreLeido = lectura.banco.toLowerCase();
+        const match = bancos.find((b) => b.nombre.toLowerCase().includes(nombreLeido) || nombreLeido.includes(b.nombre.toLowerCase()));
+        if (match) setIdBanco(String(match.id));
+      }
+      if (lectura.referencia) setNroRef(lectura.referencia);
+      setLecturaComprobante(lectura);
+    } catch (e) {
+      setError(e.message || "No se pudo leer el comprobante");
+    } finally {
+      setLeyendoComprobante(false);
+    }
+  }
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setError("");
+    if (!contabiliumId) {
+      setError("Este cliente no está vinculado a Contabilium.");
+      return;
+    }
+    if (!importe || Number(importe) <= 0 || !fecha || !idBanco) {
+      setError("Completá importe, fecha y banco propio.");
+      return;
+    }
+    setEnviando(true);
+    try {
+      const r = await cargarCobranzaACuentaManual({
+        idPersona: contabiliumId,
+        importe: Number(importe),
+        fecha,
+        idBanco: Number(idBanco),
+        nroRef: nroRef.trim() || undefined,
+        observaciones: observaciones.trim() || undefined,
+      });
+      setResultado(r);
+      onDone?.();
+    } catch (err) {
+      setError(err.message || "No se pudo cargar la cobranza");
+    } finally {
+      setEnviando(false);
+    }
+  }
+
+  if (resultado) {
+    return (
+      <div className="mb-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-3 text-xs dark:border-emerald-900 dark:bg-emerald-950/30">
+        <p className="font-semibold text-emerald-700 dark:text-emerald-400">
+          ✅ Cobranza a cuenta Nº {resultado.nroComprobante} cargada ({resultado.bancoNombre || `banco #${resultado.idBanco}`}).
+        </p>
+        <button type="button" onClick={onClose} className="mt-2 rounded-lg border border-emerald-300 bg-white px-2 py-1 font-semibold text-emerald-700 hover:bg-emerald-100 dark:border-emerald-800 dark:bg-neutral-900 dark:text-emerald-400">
+          Cerrar
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <form onSubmit={handleSubmit} className="mb-3 grid gap-2 rounded-2xl border border-emerald-200 bg-emerald-50/40 p-3 text-xs dark:border-emerald-900 dark:bg-emerald-950/10 sm:grid-cols-2">
+      <div className="flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-emerald-300 bg-white/60 px-2.5 py-2 dark:border-emerald-800 dark:bg-neutral-900/40 sm:col-span-2">
+        <label className="text-xs font-semibold text-emerald-700 dark:text-emerald-400">
+          🤖{" "}
+          <span className="cursor-pointer underline decoration-dotted">
+            {leyendoComprobante ? "Leyendo comprobante…" : "Cargar comprobante"}
+          </span>
+          <input
+            type="file"
+            accept="image/*"
+            disabled={leyendoComprobante}
+            onChange={(e) => handleCargarComprobante(e.target.files?.[0] || null)}
+            className="hidden"
+          />
+        </label>
+        <span className="text-[11px] text-slate-500 dark:text-neutral-400">
+          Subí la foto/captura y precarga importe/fecha/banco/referencia — revisá antes de guardar.
+        </span>
+        {lecturaComprobante && !lecturaComprobante.vacio && (
+          <span
+            className={`text-[11px] font-semibold ${
+              lecturaComprobante.confianza === "alta" ? "text-emerald-600 dark:text-emerald-400" : "text-amber-600 dark:text-amber-400"
+            }`}
+          >
+            {lecturaComprobante.confianza === "alta" ? "✓" : "⚠️"} Confianza {lecturaComprobante.confianza}
+          </span>
+        )}
+        {lecturaComprobante?.vacio && (
+          <span className="text-[11px] font-semibold text-rose-600 dark:text-rose-400">No se pudo leer la imagen, cargá los datos a mano</span>
+        )}
+      </div>
+      <div>
+        <label className="mb-1 block text-slate-500 dark:text-neutral-400">Importe *</label>
+        <input type="number" value={importe} onChange={(e) => setImporte(e.target.value)} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-emerald-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white" />
+      </div>
+      <div>
+        <label className="mb-1 block text-slate-500 dark:text-neutral-400">Fecha *</label>
+        <input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-emerald-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white" />
+      </div>
+      <div>
+        <label className="mb-1 block text-slate-500 dark:text-neutral-400">Banco propio *</label>
+        <select value={idBanco} onChange={(e) => setIdBanco(e.target.value)} disabled={cargandoBancos} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-emerald-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white">
+          {cargandoBancos && <option value="">Cargando…</option>}
+          {bancos.map((b) => (
+            <option key={b.id} value={b.id}>{b.nombre}</option>
+          ))}
+        </select>
+      </div>
+      <div>
+        <label className="mb-1 block text-slate-500 dark:text-neutral-400">Referencia</label>
+        <input type="text" value={nroRef} onChange={(e) => setNroRef(e.target.value)} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-emerald-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white" />
+      </div>
+      <div className="sm:col-span-2">
+        <label className="mb-1 block text-slate-500 dark:text-neutral-400">Observaciones</label>
+        <input type="text" value={observaciones} onChange={(e) => setObservaciones(e.target.value)} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-emerald-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white" />
+      </div>
+      {error && <p className="text-rose-600 dark:text-rose-400 sm:col-span-2">{error}</p>}
+      <div className="flex gap-2 sm:col-span-2">
+        <button type="submit" disabled={enviando} className="rounded-lg bg-emerald-600 px-3 py-1.5 font-bold text-white hover:bg-emerald-700 disabled:opacity-60">
+          {enviando ? "Cargando…" : "✓ Cargar cobranza a cuenta"}
+        </button>
+        <button type="button" onClick={onClose} className="rounded-lg border border-slate-200 px-3 py-1.5 text-slate-600 hover:bg-slate-50 dark:border-neutral-700 dark:text-neutral-300">
+          Cancelar
+        </button>
+      </div>
+    </form>
+  );
+}
+
 function ReciboForm({ factura, contabiliumId, clienteName, clienteId, vendedor, realizadoPor, notasCredito, onDone, soloCheque = false }) {
   const saldoActual = Number(factura?.Saldo || 0);
   // Notas de crédito de este cliente todavía con saldo disponible (Saldo
@@ -2756,6 +3379,18 @@ function ReciboForm({ factura, contabiliumId, clienteName, clienteId, vendedor, 
   const [guardando, setGuardando] = useState(false);
   const [subiendoFoto, setSubiendoFoto] = useState(false);
   const [error, setError] = useState("");
+  // Cheques reales que ya están cargados en Contabilium (Tesorería) — solo
+  // para referenciarlos en la observación ("Proviene del cheque X") cuando
+  // una parte de un cheque grande se usa para pagarle a este cliente en
+  // particular, sin aplicar el cheque de verdad (eso sigue siendo manual en
+  // Contabilium — ver nota en index.js, 2/10/2026).
+  const [chequesDisponibles, setChequesDisponibles] = useState(null);
+  const [chequeRefId, setChequeRefId] = useState("");
+  useEffect(() => {
+    listarChequesDisponiblesContabilium()
+      .then((r) => setChequesDisponibles(r.cheques))
+      .catch(() => setChequesDisponibles([]));
+  }, []);
   const [leyendoComprobante, setLeyendoComprobante] = useState(false);
   const [lecturaComprobante, setLecturaComprobante] = useState(null);
   const [arrastrandoComprobante, setArrastrandoComprobante] = useState(false);
@@ -3133,6 +3768,31 @@ function ReciboForm({ factura, contabiliumId, clienteName, clienteId, vendedor, 
         </p>
       ) : null}
 
+      {chequesDisponibles && chequesDisponibles.length > 0 && (
+        <label className="block text-xs text-slate-600 dark:text-neutral-300">
+          Cheque real de Contabilium (opcional — solo para dejar la referencia, no lo aplica de verdad)
+          <select
+            value={chequeRefId}
+            onChange={(e) => {
+              setChequeRefId(e.target.value);
+              const ch = chequesDisponibles.find((c) => String(c.id) === e.target.value);
+              if (ch) {
+                setNroReferencia(`Proviene del cheque ${ch.codigo} — ${ch.banco}`);
+                if (formaDePago === "Cheque") setFormaDePago("Transferencia");
+              }
+            }}
+            className="ml-1.5 w-full max-w-xs rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs dark:border-neutral-700 dark:bg-neutral-900 dark:text-white"
+          >
+            <option value="">Sin referenciar ningún cheque</option>
+            {chequesDisponibles.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.banco} — Nro:{c.codigo} — {money(c.importe)}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+
       <div className="flex flex-wrap items-center gap-2">
         <label className="text-xs text-slate-600 dark:text-neutral-300">
           Monto
@@ -3274,6 +3934,11 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
   const [descargando, setDescargando] = useState(false);
   const [facturaParaRecibo, setFacturaParaRecibo] = useState(null); // null=cerrado, "loading", o el comprobante fresco
   const [errorRecibo, setErrorRecibo] = useState("");
+  // Para cuando la mercadería ya se descontó de otra forma (ej: la vendió
+  // un revendedor de un distribuidor y ya se lo restaron a su propio
+  // stock chico) — esta factura es solo para que el pago tenga su
+  // comprobante, no debe volver a tocar el depósito consignado del cliente.
+  const [sinDescontarStock, setSinDescontarStock] = useState(false);
 
   // Trae el comprobante recién emitido con Total/Saldo reales (el `result`
   // crudo de crearComprobante no siempre los trae completos) para poder
@@ -3295,6 +3960,28 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
     if (!result?.Id) return;
     setDescargando(true);
     try {
+      // Primero intenta el PDF real de Contabilium (con CAE de AFIP) — si
+      // ningún endpoint candidato funciona, cae al render propio de Samurai
+      // como respaldo, para no dejar al usuario sin nada.
+      try {
+        const pdfResultado = await adminDescargarPdfComprobante(result.Id);
+        if (pdfResultado.ok && pdfResultado.pdfBase64) {
+          const bytes = atob(pdfResultado.pdfBase64);
+          const arr = new Uint8Array(bytes.length);
+          for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+          const blob = new Blob([arr], { type: "application/pdf" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `${result.Numero || result.Id}.pdf`;
+          a.click();
+          URL.revokeObjectURL(url);
+          return;
+        }
+        console.warn("[handleDescargarComprobante] PDF real de Contabilium no disponible, intentos:", pdfResultado.intentos);
+      } catch (e2) {
+        console.warn("[handleDescargarComprobante] falló la descarga del PDF real, usando el propio de Samurai:", e2.message);
+      }
       const detalle = await adminGetComprobanteDetail(result.Id);
       printComprobante(detalle);
     } catch (e) {
@@ -3436,10 +4123,11 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
     const esFiscal = tipoFc === "FCA" || tipoFc === "FCB" || tipoFc === "FCC";
     const tipoLabel = TIPO_LABELS[tipoFc] || tipoFc;
     const fechaLabel = fechaEmision !== hoyISO ? ` con fecha ${fechaEmision}` : "";
+    const stockLabel = sinDescontarStock ? "\n\n⚠️ NO le va a descontar nada del depósito consignado." : "";
     const ok = confirm(
       esFiscal
-        ? `Vas a EMITIR UNA ${tipoLabel.toUpperCase()} REAL en Contabilium (con CAE, irreversible) para ${destinatarioNombre}${fechaLabel}:\n\n${detalle}\n\nTotal: ${money(total)}\n\n¿Confirmás?`
-        : `Vas a generar un(a) ${tipoLabel} real en Contabilium (sin AFIP, no factura) para ${destinatarioNombre}${fechaLabel}:\n\n${detalle}\n\nTotal: ${money(total)}\n\n¿Confirmás?`
+        ? `Vas a EMITIR UNA ${tipoLabel.toUpperCase()} REAL en Contabilium (con CAE, irreversible) para ${destinatarioNombre}${fechaLabel}:\n\n${detalle}\n\nTotal: ${money(total)}${stockLabel}\n\n¿Confirmás?`
+        : `Vas a generar un(a) ${tipoLabel} real en Contabilium (sin AFIP, no factura) para ${destinatarioNombre}${fechaLabel}:\n\n${detalle}\n\nTotal: ${money(total)}${stockLabel}\n\n¿Confirmás?`
     );
     if (!ok) return;
 
@@ -3452,7 +4140,7 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
         precioUnitario: Number(l.precioUnitario),
         sku: l.sku,
       }));
-      const res = await emitirFacturaManual(destinatarioId, items, tipoFc, fechaEmision !== hoyISO ? fechaEmision : undefined);
+      const res = await emitirFacturaManual(destinatarioId, items, tipoFc, fechaEmision !== hoyISO ? fechaEmision : undefined, sinDescontarStock);
       registrarActividadCliente({
         clienteId,
         clienteNombre: destinatarioNombre,
@@ -3686,6 +4374,22 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
                     </p>
                   )}
                 </div>
+
+                {depositoId != null && (
+                  <label className="mt-3 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-2.5 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/20 dark:text-amber-400">
+                    <input
+                      type="checkbox"
+                      checked={sinDescontarStock}
+                      onChange={(e) => setSinDescontarStock(e.target.checked)}
+                      className="mt-0.5"
+                    />
+                    <span>
+                      No descontar del depósito consignado — usalo solo cuando la mercadería ya se descontó de otra
+                      forma (ej: la vendió un revendedor y ya se restó de su propio sub-stock) y esta factura es nada
+                      más para que el pago tenga comprobante.
+                    </span>
+                  </label>
+                )}
 
                 <div className="mt-3">
                   <p className="mb-1.5 text-xs font-medium text-slate-500 dark:text-neutral-400">

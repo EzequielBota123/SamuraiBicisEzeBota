@@ -11,7 +11,9 @@ import {
 } from "../../services/notifications";
 import { resolveSaleRequest } from "../../services/comprobantes";
 import ThemeToggle from "../ui/ThemeToggle";
-import { requestNotificationPermission, showDesktopNotification } from "../../utils/desktopNotify";
+import { requestNotificationPermission, showDesktopNotification, playNotificationSound } from "../../utils/desktopNotify";
+import { activarNotificacionesPush, permisoNotificacionesEstado } from "../../utils/pushNotifications";
+import { useAuth } from "../../auth/AuthContext";
 
 function money(n) {
   return Number(n || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS" });
@@ -68,6 +70,15 @@ function typeMeta(n) {
   if (n.type === "auto_link_cliente") {
     return { color: "text-indigo-600 dark:text-indigo-400", bg: "bg-indigo-50 border-indigo-200 dark:bg-indigo-950/40 dark:border-indigo-900", Icon: SaleIcon };
   }
+  if (n.type === "auto_invoice_failed") {
+    return { color: "text-rose-600 dark:text-rose-400", bg: "bg-rose-50 border-rose-200 dark:bg-rose-950/40 dark:border-rose-900", Icon: AuditIcon };
+  }
+  if (n.type === "pago_cc_auto_aplicado") {
+    return { color: "text-emerald-600 dark:text-emerald-400", bg: "bg-emerald-50 border-emerald-200 dark:bg-emerald-950/40 dark:border-emerald-900", Icon: SaleIcon };
+  }
+  if (n.type === "clientes_contabilium_auto_creados") {
+    return { color: "text-indigo-600 dark:text-indigo-400", bg: "bg-indigo-50 border-indigo-200 dark:bg-indigo-950/40 dark:border-indigo-900", Icon: OrderIcon };
+  }
   if (isStockRequest(n)) {
     return { color: "text-indigo-600 dark:text-indigo-400", bg: "bg-indigo-50 border-indigo-200 dark:bg-indigo-950/40 dark:border-indigo-900", Icon: StockIcon };
   }
@@ -106,7 +117,29 @@ function buildContabiliumText(n) {
 
 export default function AdminTopbar({ onToggleSidebar, mobileOpen }) {
   const history = useHistory();
+  const { user, profile } = useAuth();
   const [notifications, setNotifications] = useState([]);
+  // Push real (FCM) al celular — hasta ahora solo existía este botón en el
+  // navbar de clientes; el admin nunca tenía forma de activarlo, por eso no
+  // saltaba nada en el celular aunque toda la infraestructura ya estuviera
+  // armada del lado del servidor.
+  const [notifPermiso, setNotifPermiso] = useState(null);
+  const [notifBusy, setNotifBusy] = useState(false);
+  useEffect(() => {
+    permisoNotificacionesEstado().then(setNotifPermiso);
+  }, []);
+  async function handleActivarPush() {
+    if (!user?.uid) return;
+    setNotifBusy(true);
+    try {
+      await activarNotificacionesPush(user.uid);
+      setNotifPermiso("granted");
+    } catch (e) {
+      alert(e.message || "No se pudo activar");
+    } finally {
+      setNotifBusy(false);
+    }
+  }
   const [open, setOpen] = useState(false);
   const [copiedId, setCopiedId] = useState(null);
   const [collapsedGroups, setCollapsedGroups] = useState({});
@@ -205,13 +238,29 @@ export default function AdminTopbar({ onToggleSidebar, mobileOpen }) {
 
   const unread = notifications.filter((n) => !n.read).length;
 
+  // Título de la pestaña con el contador — así se ve el aviso aunque el
+  // admin esté en otra pestaña del navegador, no solo mirando la campanita.
+  useEffect(() => {
+    const base = "Samurai Admin";
+    document.title = unread > 0 ? `(${unread > 99 ? "99+" : unread}) ${base}` : base;
+    return () => {
+      document.title = base;
+    };
+  }, [unread]);
+
   // Agrupa las notificaciones por cliente/distribuidor, conservando el
   // orden general por la más reciente de cada grupo.
   const groupedNotifications = useMemo(() => {
     const order = [];
     const byKey = new Map();
     for (const n of notifications) {
-      const isDistributor = n.type === "sale_reported" || n.type === "comprobante_pago" || n.type === "pago_cc_pendiente" || n.type === "auto_link_cliente";
+      const isDistributor =
+        n.type === "sale_reported" ||
+        n.type === "comprobante_pago" ||
+        n.type === "pago_cc_pendiente" ||
+        n.type === "auto_link_cliente" ||
+        n.type === "auto_invoice_failed" ||
+        n.type === "pago_cc_auto_aplicado";
       const key = isDistributor ? `d:${n.distributorName || "?"}` : `c:${n.customerName || "?"}`;
       if (!byKey.has(key)) {
         byKey.set(key, { key, label: isDistributor ? n.distributorName : n.customerName, items: [] });
@@ -240,11 +289,19 @@ export default function AdminTopbar({ onToggleSidebar, mobileOpen }) {
     }
     history.push(
       n.type === "audit_alert"
-        ? "/admin/stock-consignado"
+        ? n.depositoId
+          ? `/admin/stock-consignado?depositoId=${encodeURIComponent(n.depositoId)}`
+          : "/admin/stock-consignado"
         : n.type === "comprobante_pago"
-        ? "/admin/ventas-reportadas?tab=comprobantes"
-        : n.type === "pago_cc_pendiente" || n.type === "auto_link_cliente"
+        ? `/admin/ventas-reportadas?tab=comprobantes&distribuidor=${encodeURIComponent(n.distributorName || "")}`
+        : n.type === "auto_invoice_failed"
+        ? `/admin/ventas-reportadas?tab=pendiente&distribuidor=${encodeURIComponent(n.distributorName || "")}`
+        : n.type === "pago_cc_pendiente" || n.type === "auto_link_cliente" || n.type === "pago_cc_auto_aplicado"
         ? `/admin/clientes-360?buscar=${encodeURIComponent(n.distributorName || "")}`
+        : n.type === "clientes_contabilium_auto_creados"
+        ? "/admin/users"
+        : n.orderId
+        ? `/admin/orders?orderId=${encodeURIComponent(n.orderId)}`
         : "/admin/orders"
     );
   }
@@ -372,16 +429,31 @@ export default function AdminTopbar({ onToggleSidebar, mobileOpen }) {
             )}
           </div>
 
+          {notifPermiso !== "unsupported" && notifPermiso !== null && (profile?.fcmTokens || []).length === 0 && (
+            <button
+              onClick={handleActivarPush}
+              disabled={notifBusy}
+              title="Recibir las notificaciones como push real en el celular, aunque no tengas la app abierta"
+              className="inline-flex items-center gap-1.5 rounded-2xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-700 transition hover:border-sky-300 hover:bg-sky-100 disabled:opacity-60 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-400"
+            >
+              {notifBusy ? "Activando…" : "📲 Activar en el celular"}
+            </button>
+          )}
+
           {/* Campana de notificaciones (M5) */}
           <div className="relative" ref={panelRef}>
             <button
               onClick={() => setOpen((v) => !v)}
-              className="relative inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-600 transition hover:border-sky-400 hover:text-slate-900 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300 dark:hover:text-white"
+              className={`relative inline-flex items-center gap-2 rounded-2xl border px-4 py-2 text-xs font-semibold transition ${
+                unread > 0
+                  ? "border-rose-300 bg-rose-50 text-rose-700 hover:border-rose-400 dark:border-rose-500/40 dark:bg-rose-500/10 dark:text-rose-400"
+                  : "border-slate-200 bg-white text-slate-600 hover:border-sky-400 hover:text-slate-900 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300 dark:hover:text-white"
+              }`}
             >
-              <BellIcon className="h-4 w-4" />
+              <BellIcon className={`h-4 w-4 ${unread > 0 ? "animate-bounce" : ""}`} />
               <span className="hidden sm:inline">Notificaciones</span>
               {unread > 0 ? (
-                <span className="inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-rose-500 px-1.5 text-[11px] font-bold text-white">
+                <span className="inline-flex h-5 min-w-[20px] animate-pulse items-center justify-center rounded-full bg-rose-500 px-1.5 text-[11px] font-bold text-white">
                   {unread > 99 ? "99+" : unread}
                 </span>
               ) : (
@@ -402,6 +474,13 @@ export default function AdminTopbar({ onToggleSidebar, mobileOpen }) {
                     Notificaciones {unread > 0 && <span className="text-rose-500">({unread})</span>}
                   </p>
                   <div className="flex items-center gap-3">
+                    <button
+                      onClick={() => playNotificationSound()}
+                      title="Probar el sonido de notificación"
+                      className="text-xs font-medium text-slate-500 transition hover:text-slate-800 dark:text-neutral-400 dark:hover:text-white"
+                    >
+                      🔊 Probar
+                    </button>
                     {unread > 0 && (
                       <button
                         onClick={() => markAllNotificationsRead().catch(console.error)}
@@ -474,6 +553,12 @@ export default function AdminTopbar({ onToggleSidebar, mobileOpen }) {
                                         ? `${n.distributorName || "Distribuidor"} reportó ${saleItemsCount(n)} venta${saleItemsCount(n) === 1 ? "" : "s"}`
                                         : n.type === "comprobante_pago"
                                         ? `${n.distributorName || "Distribuidor"} subió un comprobante de pago`
+                                        : n.type === "auto_invoice_failed"
+                                        ? `🚨 No se pudo facturar sola: ${n.distributorName || "Distribuidor"}`
+                                        : n.type === "pago_cc_auto_aplicado"
+                                        ? `✅ Pago aplicado solo: ${n.distributorName || "Distribuidor"}`
+                                        : n.type === "clientes_contabilium_auto_creados"
+                                        ? `🔗 ${n.cantidad} cliente${n.cantidad === 1 ? "" : "s"} nuevo${n.cantidad === 1 ? "" : "s"} vinculado${n.cantidad === 1 ? "" : "s"} solo`
                                         : isStockRequest(n)
                                         ? `${n.customerName} pidió más stock`
                                         : `${n.customerName} hizo un pedido`}
@@ -520,6 +605,26 @@ export default function AdminTopbar({ onToggleSidebar, mobileOpen }) {
                                   ) : n.type === "auto_link_cliente" ? (
                                     <p className="mt-0.5 truncate text-xs text-slate-600 dark:text-neutral-400">
                                       🔗 Vinculado automáticamente a "{n.razonSocial}" en Contabilium (id {n.contabiliumId})
+                                    </p>
+                                  ) : n.type === "auto_invoice_failed" ? (
+                                    <>
+                                      <p className="mt-0.5 truncate text-xs text-slate-600 dark:text-neutral-400">
+                                        {n.name || `SKU ${n.sku}`} — hay que facturarla a mano desde Ventas reportadas
+                                      </p>
+                                      {n.error && (
+                                        <p className="mt-0.5 truncate text-xs text-rose-600 dark:text-rose-400" title={n.error}>
+                                          {n.error}
+                                        </p>
+                                      )}
+                                    </>
+                                  ) : n.type === "pago_cc_auto_aplicado" ? (
+                                    <p className="mt-0.5 truncate text-xs text-slate-600 dark:text-neutral-400">
+                                      {money(n.monto)} aplicado a {n.facturaAplicada || "una factura"} automáticamente
+                                    </p>
+                                  ) : n.type === "clientes_contabilium_auto_creados" ? (
+                                    <p className="mt-0.5 truncate text-xs text-slate-600 dark:text-neutral-400">
+                                      {(n.clientes || []).slice(0, 3).map((c) => c.nombre).join(", ")}
+                                      {(n.clientes || []).length > 3 ? "…" : ""}
                                     </p>
                                   ) : (
                                     <>
