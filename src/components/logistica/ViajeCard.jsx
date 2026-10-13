@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
-import { ESTADO_INFO, llegadaEstimada, libreEstimado, salidaPlanificada, cambiarEstadoViaje, obtenerPdfRemitoViaje } from "../../services/logisticaViajes";
+import { ESTADO_INFO, llegadaEstimada, libreEstimado, salidaPlanificada, cambiarEstadoViaje, obtenerPdfRemitoViaje, actualizarRemitoViaje } from "../../services/logisticaViajes";
 import { fmtDuracion, fmtHora, linkComoLlegar } from "../../utils/rutaViaje";
+import { transferirStockManual, generarRemitoRealManual } from "../../services/comprobantes";
+import { obtenerPedidoPendiente, obtenerDepositoDeCliente } from "../../services/pedidosPendientes";
 
 const SIGUIENTE = {
   programado: { estado: "en_camino", label: "🚚 Salí", cls: "bg-sky-600 hover:bg-sky-700" },
@@ -64,6 +66,56 @@ export default function ViajeCard({ viaje, esChofer, actor, onEditar }) {
       setError(e.message || "No se pudo abrir el remito");
     } finally {
       setCargandoPdf(false);
+    }
+  }
+
+  // Viajes creados al confirmar un "pedido a confirmar" nacen sin remito
+  // (esa pantalla es solo visual, no toca stock) — este botón hace acá,
+  // recién cuando el chofer/admin lo confirma en la calle, el movimiento de
+  // stock real (depósito origen → depósito propio del cliente) y el remito
+  // real a su nombre, y lo deja adjunto al viaje.
+  const [moviendoStock, setMoviendoStock] = useState(false);
+  async function hacerMovimientoDeStock() {
+    if (!viaje.pedidoPendienteId) return;
+    setError("");
+    if (!viaje.origen.id) {
+      setError(`No sé el ID de depósito de "${viaje.origen.nombre}" en Contabilium — completalo editando el viaje antes de mover stock.`);
+      return;
+    }
+    setMoviendoStock(true);
+    try {
+      const pedido = await obtenerPedidoPendiente(viaje.pedidoPendienteId);
+      if (!pedido) throw new Error("No se encontró el pedido de origen (¿se borró?)");
+      if (!pedido.clienteContabiliumId) throw new Error("Este pedido no tiene un cliente real de Contabilium asociado");
+      const deposito = await obtenerDepositoDeCliente(pedido.clienteContabiliumId);
+      if (!deposito) {
+        throw new Error(
+          `${pedido.clienteNombre} todavía no tiene un depósito propio en Contabilium — no se puede mover stock, hay que facturarle directo.`
+        );
+      }
+      const transferencia = await transferirStockManual({
+        depositoOrigenId: Number(viaje.origen.id),
+        depositoDestinoId: deposito.depositoId,
+        items: pedido.items.map((it) => ({ sku: it.sku, cantidad: it.cantidad, name: it.nombre })),
+        observaciones: pedido.notas || undefined,
+        depositoOrigenNombre: viaje.origen.nombre,
+        depositoDestinoNombre: deposito.depositoNombre || undefined,
+      });
+      if (!transferencia.remitoArchivo) throw new Error("El stock se movió pero no se pudo generar el remito");
+      const remitoReal = await generarRemitoRealManual({
+        remitoArchivo: transferencia.remitoArchivo,
+        proveedorContabiliumId: pedido.clienteContabiliumId,
+        observaciones: pedido.notas || undefined,
+      });
+      await actualizarRemitoViaje(viaje.id, {
+        numero: remitoReal.numero,
+        archivo: remitoReal.remitoArchivo || transferencia.remitoArchivo,
+        pdfBase64: remitoReal.remitoPdfBase64 || transferencia.remitoPdfBase64,
+      });
+    } catch (e) {
+      setError(e.message || "No se pudo mover el stock");
+    } finally {
+      setMoviendoStock(false);
     }
   }
 
@@ -143,6 +195,16 @@ export default function ViajeCard({ viaje, esChofer, actor, onEditar }) {
             className={`rounded-lg px-3 py-1.5 text-xs font-bold text-white transition disabled:opacity-60 ${siguiente.cls}`}
           >
             {guardando ? "…" : siguiente.label}
+          </button>
+        )}
+        {!esChofer && viaje.pedidoPendienteId && !viaje.remito?.numero && (
+          <button
+            type="button"
+            onClick={hacerMovimientoDeStock}
+            disabled={moviendoStock}
+            className="rounded-lg bg-indigo-600 px-2 py-1 text-[11px] font-semibold text-white hover:bg-indigo-700 disabled:opacity-60"
+          >
+            {moviendoStock ? "Moviendo stock…" : "📦 Mover stock y generar remito"}
           </button>
         )}
         {viaje.remito?.tienePdf && (

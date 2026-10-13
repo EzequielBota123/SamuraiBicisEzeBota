@@ -70,6 +70,10 @@ export type Viaje = {
   remito: { numero: string | null; id: number | null; tienePdf: boolean } | null;
   creadoPorNombre: string | null;
   updatedAt: Date | null;
+  // Si este viaje se creó al confirmar un pedido pendiente, el id de ese
+  // pedido — permite, desde la tarjeta del viaje, recuperar sus items
+  // exactos y armar el movimiento de stock real + remito real.
+  pedidoPendienteId: string | null;
 };
 
 const COL = "logisticaViajes";
@@ -112,6 +116,7 @@ function toViaje(id: string, d: any): Viaje {
     remito: d?.remito ? { numero: d.remito.numero ?? null, id: d.remito.id ?? null, tienePdf: !!d.remito.tienePdf } : null,
     creadoPorNombre: d?.creadoPorNombre ?? null,
     updatedAt: toDate(d?.updatedAt),
+    pedidoPendienteId: d?.pedidoPendienteId ?? null,
   };
 }
 
@@ -157,6 +162,7 @@ export type DatosViaje = {
   notas: string;
   remito?: { numero: string | null; id: number | null; tienePdf: boolean } | null;
   chofer?: { uid: string; nombre: string } | null; // a quién se le asigna el viaje
+  pedidoPendienteId?: string | null;
 };
 
 function lugarPlano(l: Lugar) {
@@ -190,6 +196,7 @@ export async function crearViaje(datos: DatosViaje, actor: { uid: string; nombre
     llegoAt: null,
     entregadoAt: null,
     remito: datos.remito ?? null,
+    pedidoPendienteId: datos.pedidoPendienteId ?? null,
     creadoPorUid: actor.uid,
     creadoPorNombre: actor.nombre,
     createdAt: serverTimestamp(),
