@@ -187,6 +187,13 @@ service cloud.firestore {
       allow read, write: if esChoferOAdmin();
     }
 
+    // Tablero visual de "pedidos a confirmar": lo que un cliente pidió de
+    // alguno de los 3 depósitos, anotado a mano hasta confirmarlo. No mueve
+    // stock ni Contabilium — solo lo ve/edita el equipo de admin.
+    match /pedidosPendientes/{id} {
+      allow read, write: if esChoferOAdmin();
+    }
+
     // PDF del remito de cada viaje (aparte del viaje, se lee solo al
     // tocar "Ver remito").
     match /logisticaViajesRemitos/{id} {

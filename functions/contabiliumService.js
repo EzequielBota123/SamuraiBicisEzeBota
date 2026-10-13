@@ -112,6 +112,37 @@ async function getStockDisponibleBySKU(email, apiKey, sku) {
     .reduce((acc, s) => acc + Number(s.StockActual || 0), 0);
 }
 
+// Mismo pedido que getStockDisponibleBySKU (un solo golpe a Contabilium),
+// pero en vez de descartar el desglose por depósito, lo devuelve completo:
+// cuánto hay en cada uno de los 3 depósitos propios por separado, y cuánto
+// hay en total repartido en depósitos de clientes (consignado). Se usa para
+// la vista "Stock por depósito" del panel de Productos — ahí no alcanza con
+// el total combinado que guarda el sync normal, hace falta depósito por
+// depósito.
+async function getStockDesglosadoBySKU(email, apiKey, sku) {
+  const token = await getAccessToken(email, apiKey);
+  const res = await fetch(
+    `${API_BASE}/inventarios/getStockBySKU?codigo=${encodeURIComponent(sku)}`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) throw new Error(`Contabilium getStockBySKU error ${res.status}`);
+  const data = await res.json();
+  const stock = Array.isArray(data.stock) ? data.stock : [];
+  const porId = new Map(stock.map((s) => [s.Id, Number(s.StockActual || 0)]));
+  const [lavalleId, canuelasId, credifinId] = DEPOSITOS_PROPIOS;
+  const lavalle = porId.get(lavalleId) || 0;
+  const canuelas = porId.get(canuelasId) || 0;
+  const credifin = porId.get(credifinId) || 0;
+  const totalGeneral = stock.reduce((acc, s) => acc + Number(s.StockActual || 0), 0);
+  return {
+    lavalle,
+    canuelas,
+    credifin,
+    propiosTotal: lavalle + canuelas + credifin,
+    consignadoTotal: Math.max(0, totalGeneral - lavalle - canuelas - credifin),
+  };
+}
+
 // Trae un cliente de Contabilium por su Id
 async function getClientById(email, apiKey, contabiliumId) {
   const token = await getAccessToken(email, apiKey);
@@ -179,7 +210,10 @@ async function getAllClientes(email, apiKey) {
 // de 50 por página. Sin esto, siempre se veía solo la página 1 de toda la
 // empresa, así que la mayoría de los clientes no traían sus facturas reales.
 async function getComprobantesByClientId(email, apiKey, contabiliumId, {
-  tipos = ["FCA", "NCA", "NDA"],
+  // Incluye las variantes B y C de factura/nota, no solo A — Contabilium a
+  // veces emite Factura B (ver diagTiposComprobante), y quedaban afuera del
+  // saldo de cuenta corriente si solo se pedía FCA.
+  tipos = ["FCA", "FCB", "FCC", "NCA", "NCB", "NCC", "NDA", "NDB", "NDC"],
   desde = null,
   hasta = null,
 } = {}) {
@@ -1017,4 +1051,28 @@ async function deleteComprobante(email, apiKey, id) {
   return body;
 }
 
-module.exports = { getAllConceptos, getClientById, searchClientByDoc, getComprobantesByClientId, getAllComprobantes, getComprobanteById, getStockByDeposito, getDepositosViaStockBySKU, searchClientesByFiltro, getAllClientes, getCobranzasList, getCobranzaById, getStockDisponibleBySKU, buscarCobranzasPorClientePaginado, testPageIndexRaw, probeBancosEndpoints, probeMovimientosDepositoEndpoints, probeChequesEndpoints, debugComprobantesPaging, debugSaldoByCuit, debugClienteSearchRaw, debugProbeCcEndpoints, debugProbeRemitosEndpoints, debugProbeCrearComprobanteEndpoints, debugProbeCrearComprobantePayload, debugProbeStockDescuento, emitirFacturaElectronica, cobrarComprobante, crearComprobante, getDatosAfip, deleteComprobante, updateCliente, crearCliente };
+// Actualiza un concepto (producto) ya existente — nunca probado antes en
+// este repo, no hay precedente de escritura de conceptos (solo lectura vía
+// getAllConceptos). Mirror del patrón de updateCliente: PUT con el objeto
+// completo (Contabilium en general no soporta PATCH parcial), a un endpoint
+// candidato /conceptos?id=X — si Contabilium devuelve 404/405 acá, significa
+// que el REST no soporta escribir conceptos y hay que ir por automatización
+// web (como se hizo para stock/remitos en contabiliumWebAutomation.js).
+async function updateConcepto(email, apiKey, id, concepto) {
+  const token = await getAccessToken(email, apiKey);
+  const res = await fetch(`${API_BASE}/conceptos?id=${id}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(concepto),
+  });
+  const text = await res.text();
+  let body;
+  try { body = JSON.parse(text); } catch { body = text; }
+  if (!res.ok) {
+    const msg = typeof body === "string" ? body : (body?.Message || body?.message || JSON.stringify(body));
+    throw new Error(`Contabilium no pudo actualizar el concepto (status ${res.status}): ${msg}`);
+  }
+  return body;
+}
+
+module.exports = { getAllConceptos, getClientById, searchClientByDoc, getComprobantesByClientId, getAllComprobantes, getComprobanteById, getStockByDeposito, getDepositosViaStockBySKU, searchClientesByFiltro, getAllClientes, getCobranzasList, getCobranzaById, getStockDisponibleBySKU, getStockDesglosadoBySKU, buscarCobranzasPorClientePaginado, testPageIndexRaw, probeBancosEndpoints, probeMovimientosDepositoEndpoints, probeChequesEndpoints, debugComprobantesPaging, debugSaldoByCuit, debugClienteSearchRaw, debugProbeCcEndpoints, debugProbeRemitosEndpoints, debugProbeCrearComprobanteEndpoints, debugProbeCrearComprobantePayload, debugProbeStockDescuento, emitirFacturaElectronica, cobrarComprobante, crearComprobante, getDatosAfip, deleteComprobante, updateCliente, crearCliente, updateConcepto };
