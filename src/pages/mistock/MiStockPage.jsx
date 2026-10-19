@@ -11,8 +11,6 @@ import SkuScannerModal from "../../components/stock/SkuScannerModal";
 import QrLabelsModal from "../../components/stock/QrLabelsModal";
 import { listAuditsByDeposito, uploadAudit, nextAuditDate, isAuditOverdue, isAuditDueSoon, getAuditProgramStart } from "../../services/stockAudits";
 
-const WHATSAPP_NUMBER = "5491149166234";
-
 const money = (n) =>
   Number(n || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 });
 
@@ -190,7 +188,7 @@ export default function MiStockPage() {
     }
 
     const customerName = profile?.name || user.displayName || user.email || "Distribuidor";
-    const orderId = await createOrder({
+    await createOrder({
       customer: {
         name: customerName,
         email: user.email || "",
@@ -200,18 +198,6 @@ export default function MiStockPage() {
       items: reqItems.map((it) => ({ id: it.id, name: it.name, price: Number(it.priceArs || 0), qty: it.quantity })),
     });
 
-    const lines = [
-      "Hola Samurai Bicis, quiero pedir stock para mi depósito:",
-      "",
-      `Distribuidor: ${customerName}`,
-      data?.depositoNombre ? `Depósito: ${data.depositoNombre}` : null,
-      "",
-      ...reqItems.map((it) => `• ${it.name} x${it.quantity}${it.sku ? ` — SKU ${it.sku}` : ""}`),
-      "",
-      orderId ? `ID de pedido: ${orderId}` : null,
-    ].filter(Boolean);
-    const whatsappMessage = encodeURIComponent(lines.join("\n"));
-    window.open(`https://wa.me/${WHATSAPP_NUMBER}?text=${whatsappMessage}`, "_blank");
     await loadMyStockOrders();
   }
 
@@ -637,7 +623,6 @@ export default function MiStockPage() {
         onRequestMore={handleRequestMore}
         distributorName={profile?.name || user.displayName || user.email || "Distribuidor"}
         depositoNombre={data?.depositoNombre}
-        whatsappNumber={WHATSAPP_NUMBER}
       />
 
       <RequestStockModal open={requestOpen} onClose={() => setRequestOpen(false)} onSubmit={submitStockRequest} />

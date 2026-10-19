@@ -18,6 +18,7 @@ const items = [
   { to: "/admin", label: "Dashboard", icon: DashboardIcon, exact: true },
   { to: "/admin/dashboard-negocio", label: "Dashboard de Gestión", icon: GestionIcon },
   { to: "/admin/contador-diario", label: "Contador diario", icon: GestionIcon },
+  { to: "/admin/reporte-semanal", label: "Reporte semanal", icon: ReporteIcon },
   { to: "/admin/reporte-clientes", label: "Reporte de Clientes", icon: ReporteIcon },
   { to: "/admin/remitos-reporte", label: "Remitos y Cobranza", icon: RemitosIcon },
   { to: "/admin/pedidos-pendientes", label: "Pedidos a confirmar", icon: ReceiptIcon },

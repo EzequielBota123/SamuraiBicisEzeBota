@@ -201,23 +201,30 @@ async function doContabiliumSync(email, apiKey) {
     if (!code) continue;
     const desglose = desgloseMap.get(code);
     conceptoMap[code] = {
-      stock:    desglose ? desglose.propiosTotal : Math.round(c.Stock || 0),
-      priceArs: c.PrecioFinal || null,
+      stock: desglose ? desglose.propiosTotal : Math.round(c.Stock || 0),
     };
   }
 
   const snapshot = await db.collection("products").get();
 
+  // OJO: acá solo se sincroniza STOCK, nunca precio. El precio ("priceArs")
+  // tiene una sola dirección válida: Samurai → Contabilium, vía
+  // adminSincronizarPreciosCatalogo — ese endpoint lo dice explícito ("la
+  // única fuente de verdad del precio con IVA es Samurai"). Este sync acá
+  // ANTES también traía Contabilium.PrecioFinal → Firestore.priceArs, lo
+  // cual iba justo al revés: si alguien actualizaba precios en Firestore
+  // pero la sincronización hacia Contabilium fallaba o tardaba, este sync
+  // (corre cada 5 min) pisaba el precio nuevo con el viejo de Contabilium
+  // antes de que se pudiera corregir — pasó de verdad el 16/10/2026 con el
+  // aumento de precios. Se saca por completo esa pata.
   const updates = [];
   for (const docSnap of snapshot.docs) {
-    const { sku, stock, priceArs } = docSnap.data();
+    const { sku, stock } = docSnap.data();
     const skuStr = (sku || "").toString().trim();
     if (!skuStr || !(skuStr in conceptoMap)) continue;
-    const { stock: newStock, priceArs: newPriceArs } = conceptoMap[skuStr];
-    const stockChanged    = newStock !== stock;
-    const priceArsChanged = newPriceArs !== null && newPriceArs !== priceArs;
-    if (stockChanged || priceArsChanged) {
-      updates.push({ ref: docSnap.ref, stock: newStock, priceArs: newPriceArs });
+    const { stock: newStock } = conceptoMap[skuStr];
+    if (newStock !== stock) {
+      updates.push({ ref: docSnap.ref, stock: newStock });
     }
   }
 
@@ -226,7 +233,6 @@ async function doContabiliumSync(email, apiKey) {
     for (const u of updates.slice(i, i + 499)) {
       batch.update(u.ref, {
         stock:     u.stock,
-        priceArs:  u.priceArs,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     }
@@ -2454,11 +2460,27 @@ exports.getMisVendedores = onRequest(
     }
 
     try {
+      const { distribuidorUid } = req.body || {};
       const db = admin.firestore();
       const callerSnap = await db.doc(`users/${uid}`).get();
       if (!callerSnap.exists) return res.status(404).json({ error: "Usuario no encontrado" });
       const caller = callerSnap.data();
-      const asignados = Array.isArray(caller.vendedoresAsignados) ? caller.vendedoresAsignados : [];
+
+      // Un admin/chofer puede pedir la cartera de CUALQUIER distribuidor
+      // (ej. desde el panel de Vendedores, para ver la misma vista "Mis
+      // clientes" que tiene Alfredo en su propia cuenta) pasando
+      // distribuidorUid — un distribuidor normal solo puede pedir la suya.
+      let targetUid = uid;
+      if (distribuidorUid && distribuidorUid !== uid) {
+        if (!["admin", "chofer"].includes(caller.role)) {
+          return res.status(403).json({ error: "No tenés permiso para ver la cartera de otro distribuidor" });
+        }
+        targetUid = distribuidorUid;
+      }
+      const targetSnap = targetUid === uid ? callerSnap : await db.doc(`users/${targetUid}`).get();
+      if (!targetSnap.exists) return res.status(404).json({ error: "Distribuidor no encontrado" });
+      const target = targetSnap.data();
+      const asignados = Array.isArray(target.vendedoresAsignados) ? target.vendedoresAsignados : [];
       if (asignados.length === 0) {
         return res.status(403).json({ error: "No tenés vendedores asignados" });
       }
@@ -2537,12 +2559,16 @@ function ultimoDiaDelMes(mes) {
 }
 
 // Cuenta corriente mensual de un supervisor con `vendedoresAsignados` (ej.
-// Alfredo Bavcevich): cobra flete (monto fijo por viaje de Lavalle a su
-// depósito — Contabilium no registra "viajes", así que se carga a mano con
-// setViajesVendedorMes) + comisión (% sobre lo que facturan sus clientes
+// Alfredo Bavcevich): cobra flete (monto fijo por cada viaje de la grilla de
+// logística que sale de su depósito propio hacia un cliente, contado solo
+// — ver más abajo) + comisión (% sobre lo que facturan sus clientes
 // asignados ese mes, calculado automático desde Contabilium). Lo puede ver
 // el propio vendedor (su uid) o un admin/chofer pasando `vendedorUid`.
-async function buildResumenComision(db, email, apiKey, targetUid, mes) {
+function escapeRegExpBackend(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function buildResumenComision(db, email, apiKey, webEmail, webPassword, targetUid, mes) {
   const targetSnap = await db.doc(`users/${targetUid}`).get();
   if (!targetSnap.exists) throw new Error("Usuario no encontrado");
   const target = targetSnap.data();
@@ -2551,12 +2577,53 @@ async function buildResumenComision(db, email, apiKey, targetUid, mes) {
   const comisionPorcentaje = Number(target.comisionPorcentaje ?? 5);
   const tarifaFletePorViaje = Number(target.tarifaFletePorViaje ?? 10000);
 
-  const mesDocSnap = await db.doc(`resumenVendedorMensual/${targetUid}_${mes}`).get();
-  const viajes = Number(mesDocSnap.exists ? mesDocSnap.data().viajes || 0 : 0);
-  const fleteTotal = viajes * tarifaFletePorViaje;
-
   const desde = `${mes}-01`;
   const hasta = ultimoDiaDelMes(mes);
+
+  // Viajes del mes: ya no se cargan a mano — se cuentan solos los
+  // movimientos de stock reales de Contabilium (la misma fuente que usa el
+  // panel de Remitos y Cobranza / Contador Diario, vía obtenerMovimientosStock
+  // → movinventarios/GetPageWithFilters) cuyo "origen" es el depósito del
+  // vendedor y cuyo "destino" NO es un depósito propio de Samurai (o sea,
+  // una entrega real a un cliente). La grilla de logística propia
+  // (logisticaViajes) no sirve acá: no registra viajes con un vendedor
+  // como origen. Cada movimiento es por producto, no por viaje — varios
+  // productos de un mismo viaje comparten fecha + observaciones, así que
+  // se cuentan pares (fecha, observaciones) distintos, no filas.
+  // `origenesViajes` (array de palabras, ej. ["CAÑUELAS","CREDIFIN"]) deja
+  // elegir a mano de qué depósito(s) salen los viajes de este vendedor,
+  // para los casos donde no coincide con su propio nombre (ej. "Jíbaro"
+  // maneja viajes que salen de Cañuelas Y Credifin; "Vito" maneja la
+  // camioneta de Rodados Argentinos, no la suya propia). Si no está
+  // cargado, se sigue derivando del nombre del vendedor como antes (caso
+  // Cuchi, que sí sale de su propio depósito).
+  const nombreVendedor = (target.contabiliumDepositoNombre || target.name || "").trim();
+  const palabraClave = nombreVendedor.split(/\s+/).filter((w) => w.length >= 5)[0] || nombreVendedor;
+  const palabrasOrigen = Array.isArray(target.origenesViajes) && target.origenesViajes.filter(Boolean).length
+    ? target.origenesViajes.filter(Boolean)
+    : [palabraClave];
+  let viajes = 0;
+  if (palabrasOrigen.length && webEmail && webPassword) {
+    try {
+      const { obtenerMovimientosStock } = require("./contabiliumWebAutomation");
+      const origenVendedorRe = new RegExp(palabrasOrigen.map(escapeRegExpBackend).join("|"), "i");
+      const depositoPropioRe = /lavalle|temperley|ca[ñn]uelas|credifin/i;
+      const movimientos = await obtenerMovimientosStock({
+        db, email: webEmail, password: webPassword, fechaDesde: desde, fechaHasta: hasta,
+      });
+      const viajesUnicos = new Set();
+      for (const m of movimientos) {
+        const origen = (m.origen || "").trim();
+        const destino = (m.destino || "").trim();
+        if (!origenVendedorRe.test(origen) || depositoPropioRe.test(destino)) continue;
+        viajesUnicos.add(`${m.fecha || ""}__${m.observaciones || ""}`);
+      }
+      viajes = viajesUnicos.size;
+    } catch (err) {
+      console.error("[buildResumenComision] no se pudo traer movimientos de stock para contar viajes:", err.message);
+    }
+  }
+  const fleteTotal = viajes * tarifaFletePorViaje;
 
   let ventasTotal = 0;
   // Detalle bici por bici (modelo + cliente + comisión de esa venta puntual)
@@ -2645,7 +2712,7 @@ exports.getResumenComisionVendedor = onRequest(
   // El desglose bici por bici pide el detalle de cada comprobante por
   // separado (getComprobanteById) — con varias facturas en el mes puede
   // tardar más que el timeout corto original.
-  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 180 },
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 180 },
   async (req, res) => {
     setCorsHeaders(req, res);
     if (req.method === "OPTIONS") return res.status(204).send("");
@@ -2676,10 +2743,163 @@ exports.getResumenComisionVendedor = onRequest(
         targetUid = vendedorUid;
       }
 
-      const resumen = await buildResumenComision(db, CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value(), targetUid, mes);
+      const resumen = await buildResumenComision(
+        db,
+        CONTABILIUM_EMAIL.value(),
+        CONTABILIUM_API_KEY.value(),
+        CONTABILIUM_WEB_EMAIL.value(),
+        CONTABILIUM_WEB_PASSWORD.value(),
+        targetUid,
+        mes
+      );
       return res.json(resumen);
     } catch (err) {
       console.error("[getResumenComisionVendedor] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Excel descargable de UN mes puntual para un vendedor con
+// `vendedoresAsignados` (ej. Alfredo "Cuchi" Bavcevich) — tres solapas:
+// Resumen (flete/ventas/comisión del mes), Viajes (cada viaje real desde su
+// depósito a un cliente, con los productos que llevó) y Ventas (factura por
+// factura, línea por línea, de sus clientes asignados). Reusa
+// buildResumenComision para las ventas (misma lógica ya probada); para los
+// viajes arma la lista detallada acá mismo, agrupando los movimientos de
+// stock por su "id" real de Contabilium (que si viaja en cada línea y es la
+// forma confiable de saber qué productos salieron juntos en un mismo viaje
+// — el campo "observaciones" que usaba buildResumenComision para contar
+// viajes no existe en la respuesta real, el que sí viene es "descripcion").
+exports.descargarResumenVendedorExcel = onRequest(
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 180 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "No autorizado" });
+    let uid;
+    try {
+      uid = (await admin.auth().verifyIdToken(idToken)).uid;
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+
+    try {
+      const { mes, vendedorUid } = req.body || {};
+      if (!mes || !/^\d{4}-\d{2}$/.test(mes)) return res.status(400).json({ error: "Falta mes (formato YYYY-MM)" });
+
+      const db = admin.firestore();
+      let targetUid = uid;
+      if (vendedorUid && vendedorUid !== uid) {
+        const callerSnap = await db.doc(`users/${uid}`).get();
+        const caller = callerSnap.exists ? callerSnap.data() : null;
+        if (!caller || !["admin", "chofer"].includes(caller.role)) {
+          return res.status(403).json({ error: "No tenés permiso para ver la cuenta de otro vendedor" });
+        }
+        targetUid = vendedorUid;
+      }
+
+      const targetSnap = await db.doc(`users/${targetUid}`).get();
+      if (!targetSnap.exists) return res.status(404).json({ error: "Usuario no encontrado" });
+      const target = targetSnap.data();
+      const nombreVendedor = target.contabiliumDepositoNombre || target.name || "Vendedor";
+
+      const email = CONTABILIUM_EMAIL.value();
+      const apiKey = CONTABILIUM_API_KEY.value();
+      const webEmail = CONTABILIUM_WEB_EMAIL.value();
+      const webPassword = CONTABILIUM_WEB_PASSWORD.value();
+
+      const resumen = await buildResumenComision(db, email, apiKey, webEmail, webPassword, targetUid, mes);
+
+      const desde = `${mes}-01`;
+      const hasta = ultimoDiaDelMes(mes);
+      const { obtenerMovimientosStock } = require("./contabiliumWebAutomation");
+      const movimientos = await obtenerMovimientosStock({ db, email: webEmail, password: webPassword, fechaDesde: desde, fechaHasta: hasta });
+
+      const palabraClave = nombreVendedor.split(/\s+/).filter((w) => w.length >= 5)[0] || nombreVendedor;
+      const palabrasOrigen = Array.isArray(target.origenesViajes) && target.origenesViajes.filter(Boolean).length
+        ? target.origenesViajes.filter(Boolean)
+        : [palabraClave];
+      const origenRe = new RegExp(palabrasOrigen.map(escapeRegExpBackend).join("|"), "i");
+      const depositoPropioRe = /lavalle|temperley|ca[ñn]uelas|credifin/i;
+
+      const viajesMap = new Map();
+      for (const m of movimientos) {
+        const origen = (m.origen || "").trim();
+        const destino = (m.destino || "").trim();
+        if (!origenRe.test(origen) || depositoPropioRe.test(destino)) continue;
+        const key = m.id;
+        if (!viajesMap.has(key)) {
+          viajesMap.set(key, { fecha: m.fecha || "", destino, descripcion: m.descripcion || "", items: [] });
+        }
+        viajesMap.get(key).items.push({ producto: m.codigoNombre || "", cantidad: m.cantidad != null ? Number(m.cantidad) : null });
+      }
+      const viajes = Array.from(viajesMap.values()).sort((a, b) => (a.fecha || "").localeCompare(b.fecha || ""));
+
+      const XLSX = require("xlsx");
+      const wb = XLSX.utils.book_new();
+
+      const fleteTotal = viajes.length * resumen.tarifaFletePorViaje;
+      const resumenRows = [
+        { Campo: "Vendedor", Valor: nombreVendedor },
+        { Campo: "Mes", Valor: mes },
+        { Campo: "Viajes", Valor: viajes.length },
+        { Campo: "Tarifa flete por viaje", Valor: resumen.tarifaFletePorViaje },
+        { Campo: "Flete total", Valor: fleteTotal },
+        { Campo: "Ventas (neto)", Valor: Math.round(resumen.ventasTotal) },
+        { Campo: "% comisión", Valor: resumen.comisionPorcentaje },
+        { Campo: "Comisión", Valor: Math.round(resumen.comisionTotal) },
+        { Campo: "Total a cobrar", Valor: Math.round(fleteTotal + resumen.comisionTotal) },
+      ];
+      const wsResumen = XLSX.utils.json_to_sheet(resumenRows, { header: ["Campo", "Valor"] });
+      wsResumen["!cols"] = [{ wch: 24 }, { wch: 32 }];
+      XLSX.utils.book_append_sheet(wb, wsResumen, "Resumen");
+
+      const viajesRows = [];
+      viajes.forEach((v, idx) => {
+        v.items.forEach((it, j) => {
+          viajesRows.push({
+            "N° Viaje": j === 0 ? idx + 1 : "",
+            "Fecha y hora": v.fecha,
+            "Cliente destino": v.destino,
+            Producto: it.producto,
+            Cantidad: it.cantidad,
+            Descripción: v.descripcion,
+          });
+        });
+      });
+      const wsViajes = XLSX.utils.json_to_sheet(viajesRows, {
+        header: ["N° Viaje", "Fecha y hora", "Cliente destino", "Producto", "Cantidad", "Descripción"],
+      });
+      wsViajes["!cols"] = [{ wch: 9 }, { wch: 20 }, { wch: 28 }, { wch: 42 }, { wch: 10 }, { wch: 40 }];
+      XLSX.utils.book_append_sheet(wb, wsViajes, "Viajes");
+
+      const ventasRows = (resumen.detalle || []).map((d) => ({
+        Fecha: d.fecha,
+        Cliente: d.cliente,
+        "N° Factura": d.numero,
+        Tipo: d.tipo,
+        Producto: d.modelo,
+        Cantidad: d.cantidad,
+        Monto: Math.round(d.monto || 0),
+        Comisión: Math.round(d.comision || 0),
+      }));
+      const wsVentas = XLSX.utils.json_to_sheet(ventasRows, {
+        header: ["Fecha", "Cliente", "N° Factura", "Tipo", "Producto", "Cantidad", "Monto", "Comisión"],
+      });
+      wsVentas["!cols"] = [{ wch: 20 }, { wch: 26 }, { wch: 15 }, { wch: 7 }, { wch: 42 }, { wch: 9 }, { wch: 14 }, { wch: 13 }];
+      XLSX.utils.book_append_sheet(wb, wsVentas, "Ventas");
+
+      const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+      const base64 = buf.toString("base64");
+
+      return res.json({ ok: true, base64, filename: `${nombreVendedor} - ${mes}.xlsx` });
+    } catch (err) {
+      console.error("[descargarResumenVendedorExcel] error:", err);
       return res.status(500).json({ error: err.message || String(err) });
     }
   }
@@ -3222,9 +3442,10 @@ exports.cargarCobranzaACuentaManual = onRequest(
       const { idPersona, importe, fecha, forma, banco, idBanco, caja, idCaja, nroRef, observaciones } = req.body || {};
 
       const esEfectivo = forma === "Efectivo";
-      if (!idPersona || importe == null || !fecha || (!esEfectivo && !banco && idBanco == null)) {
+      const sinCuenta = forma === "Cheque";
+      if (!idPersona || importe == null || !fecha || (!esEfectivo && !sinCuenta && !banco && idBanco == null)) {
         return res.status(400).json({
-          error: "Faltan datos: idPersona, importe, fecha, banco (o idBanco) — no hace falta banco si forma es Efectivo",
+          error: "Faltan datos: idPersona, importe, fecha, banco (o idBanco) — no hace falta banco si forma es Efectivo o Cheque",
         });
       }
 
@@ -3539,6 +3760,75 @@ const DEPOSITOS_PROPIOS_INFO = {
   133531: { nombre: "Depósito Cañuelas", direccion: "Highway Route 6 Km 96.7, Cañuelas, Provincia de Buenos Aires" },
   131151: { nombre: "Credifin", direccion: "" },
 };
+
+// Valida en vivo contra Contabilium (no contra el campo "stock" cacheado de
+// "products", que sync cada 15 min) que haya stock suficiente para los ítems
+// de un pedido del catálogo. Se llama justo antes de crear el pedido, para
+// achicar la ventana en la que el catálogo muestra stock que en Contabilium
+// ya no está (venta por otro canal, ajuste manual, etc.). No reemplaza la
+// validación de la transacción de Firestore en createOrder (esa sigue
+// siendo la que da atomicidad contra otros pedidos simultáneos) — es un
+// chequeo adicional, en vivo, contra la fuente real.
+exports.checkStockEnVivo = onRequest(
+  {
+    cors: false,
+    secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY],
+    timeoutSeconds: 60,
+  },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "No autorizado" });
+    try {
+      await admin.auth().verifyIdToken(idToken);
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+
+    try {
+      const { items } = req.body || {};
+      if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ error: "Falta la lista de items" });
+      }
+
+      const { getStockDisponibleBySKU } = require("./contabiliumService");
+      const email = CONTABILIUM_EMAIL.value();
+      const apiKey = CONTABILIUM_API_KEY.value();
+
+      const skus = [...new Set(items.map((it) => String(it.sku || "").trim()).filter(Boolean))];
+      const stockPorSku = new Map();
+      await mapWithConcurrency(skus, 4, async (sku) => {
+        try {
+          const disponible = await getStockDisponibleBySKU(email, apiKey, sku);
+          stockPorSku.set(sku, disponible);
+        } catch (err) {
+          console.error(`[checkStockEnVivo] error consultando stock de SKU ${sku}:`, err);
+          stockPorSku.set(sku, null); // null = no se pudo verificar, no bloquea
+        }
+      });
+
+      const shortages = [];
+      for (const it of items) {
+        const sku = String(it.sku || "").trim();
+        const qty = Number(it.qty || 0);
+        if (!sku) continue;
+        const disponible = stockPorSku.get(sku);
+        if (disponible != null && disponible < qty) {
+          shortages.push({ id: it.id, name: it.name, available: disponible, requested: qty });
+        }
+      }
+
+      return res.json({ ok: shortages.length === 0, shortages });
+    } catch (err) {
+      console.error("[checkStockEnVivo] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
 
 // Confirma un pedido hecho por un cliente desde el catálogo público: por
 // cada ítem el admin ya eligió de qué depósito propio sale (ver
@@ -4551,7 +4841,11 @@ exports.exportarGuionLlamadas = onRequest(
 // antes de tocar nada) y después, ya confirmado, para probar la escritura en
 // un solo producto antes de correrlo en masa para todo el catálogo.
 exports.adminProbarPrecioProducto = onRequest(
-  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 120 },
+  {
+    cors: false,
+    secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD],
+    timeoutSeconds: 120,
+  },
   async (req, res) => {
     setCorsHeaders(req, res);
     if (req.method === "OPTIONS") return res.status(204).send("");
@@ -4571,8 +4865,21 @@ exports.adminProbarPrecioProducto = onRequest(
         return res.json({ ok: true, dryRun: true, conceptoCrudo: concepto });
       }
 
-      const conceptoModificado = { ...concepto, PrecioFinal: Number(precioConIva) };
-      const resultado = await updateConcepto(email, apiKey, concepto.Id, conceptoModificado);
+      // La REST vieja (/api/conceptos PUT) rechaza el campo "Tipo" (llega
+      // como texto "Producto" en la lectura, pero la escritura espera otra
+      // cosa — nunca determinado). En vez de seguir ahí, se usa la API
+      // interna real que usa el formulario web nuevo de Contabilium
+      // (vir-internalapi.contabilium.com), reversada por captura de red real
+      // el 16/10/2026 — ver actualizarPrecioProductoWeb.
+      const { actualizarPrecioProductoWeb } = require("./contabiliumWebAutomation");
+      const db = admin.firestore();
+      const resultado = await actualizarPrecioProductoWeb({
+        db,
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+        concepto,
+        nuevoPrecioConIva: Number(precioConIva),
+      });
 
       // Vuelve a leer el concepto para confirmar si el cambio realmente
       // quedó guardado (no confiar solo en que el PUT devolvió 200).
@@ -4603,7 +4910,11 @@ exports.adminProbarPrecioProducto = onRequest(
 // verdad del precio con IVA es Samurai, así que cualquier diferencia se
 // pisa, no solo los que están en 0).
 exports.adminSincronizarPreciosCatalogo = onRequest(
-  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 280 },
+  {
+    cors: false,
+    secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD],
+    timeoutSeconds: 280,
+  },
   async (req, res) => {
     setCorsHeaders(req, res);
     if (req.method === "OPTIONS") return res.status(204).send("");
@@ -4688,19 +4999,29 @@ exports.adminSincronizarPreciosCatalogo = onRequest(
         });
       }
 
+      const { actualizarPrecioProductoWeb } = require("./contabiliumWebAutomation");
       const aAplicar = filas.filter((f) => f.seAplicaAutomatico);
       const resultados = [];
       for (const f of aAplicar) {
         try {
           const concepto = conceptoPorSku.get(f.sku);
-          await updateConcepto(email, apiKey, concepto.Id, { ...concepto, PrecioFinal: f.precioObjetivoSamurai, Iva: 21 });
+          // Ver comentario en adminProbarPrecioProducto: la REST vieja
+          // rechaza el PUT por el campo "Tipo" — se usa la API interna real
+          // del formulario web (vir-internalapi.contabilium.com).
+          await actualizarPrecioProductoWeb({
+            db,
+            email: CONTABILIUM_WEB_EMAIL.value(),
+            password: CONTABILIUM_WEB_PASSWORD.value(),
+            concepto,
+            nuevoPrecioConIva: f.precioObjetivoSamurai,
+          });
           resultados.push({ sku: f.sku, ok: true });
         } catch (err) {
           resultados.push({ sku: f.sku, ok: false, error: err.message || String(err) });
         }
-        // Contabilium tiene rate limit (30 req/10s) — un respiro corto entre
-        // escrituras evita 429 en catálogos grandes.
-        await new Promise((r) => setTimeout(r, 250));
+        // Esta API nueva no tiene el mismo rate-limit documentado que la
+        // REST vieja, pero dejamos igual una pausa corta por las dudas.
+        await new Promise((r) => setTimeout(r, 400));
       }
 
       return res.json({
@@ -6361,7 +6682,16 @@ exports.getDepositoStockAdmin = onRequest(
 // Samurai lo factura manualmente en Contabilium y lo marca resuelto.
 // ─────────────────────────────────────────────────────────────
 exports.reportSale = onRequest(
-  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 90 },
+  {
+    cors: false,
+    secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD],
+    timeoutSeconds: 90,
+    // Para FCA/FCB/FCC pasa por emitirComprobanteConIva → crearComprobanteWeb
+    // (Puppeteer) — con el default de 256MiB se queda sin memoria a mitad de
+    // sesión (visto en logs: "Memory limit of 256 MiB exceeded with ~290MiB
+    // used"), igual que crearDepositoManual/transferirStockManual.
+    memory: "1GiB",
+  },
   async (req, res) => {
     setCorsHeaders(req, res);
     if (req.method === "OPTIONS") return res.status(204).send("");
@@ -6776,7 +7106,14 @@ exports.resolveSaleRequest = onRequest(
 // diferencia de resolveSaleRequest (que solo cambia el estado a mano
 // después de facturar manualmente en Contabilium), esto factura de verdad.
 exports.emitirFacturaVenta = onRequest(
-  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 90 },
+  {
+    cors: false,
+    secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD],
+    timeoutSeconds: 90,
+    // Mismo motivo que reportSale — emitirComprobanteConIva usa Puppeteer
+    // para FCA/FCB/FCC, 256MiB no alcanza.
+    memory: "1GiB",
+  },
   async (req, res) => {
     setCorsHeaders(req, res);
     if (req.method === "OPTIONS") return res.status(204).send("");
@@ -6894,7 +7231,16 @@ exports.emitirFacturaVenta = onRequest(
 // que el distribuidor la haya reportado desde su celular). A diferencia de
 // emitirFacturaVenta, no depende de registros previos en `saleRequests`.
 exports.emitirFacturaManual = onRequest(
-  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 90 },
+  {
+    cors: false,
+    secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD],
+    timeoutSeconds: 90,
+    // Mismo motivo que reportSale/emitirFacturaVenta — emitirComprobanteConIva
+    // usa Puppeteer para FCA/FCB/FCC, 256MiB no alcanza (era el Error 500 que
+    // veía el admin al facturar desde Clientes 360, confirmado en logs:
+    // "Memory limit of 256 MiB exceeded with ~290-300MiB used").
+    memory: "1GiB",
+  },
   async (req, res) => {
     setCorsHeaders(req, res);
     if (req.method === "OPTIONS") return res.status(204).send("");
@@ -7222,15 +7568,23 @@ async function leerComprobanteConIA(imageUrl, anthropicApiKey) {
   if (!anthropicApiKey) return null;
   try {
     const imgRes = await fetch(imageUrl);
-    if (!imgRes.ok) return null;
+    if (!imgRes.ok) {
+      console.error(`[pagosCC] leerComprobanteConIA: no se pudo bajar el archivo (status ${imgRes.status}) de ${imageUrl}`);
+      return null;
+    }
     const contentType = imgRes.headers.get("content-type") || "image/jpeg";
     const buffer = Buffer.from(await imgRes.arrayBuffer());
-    const esPdf = contentType === "application/pdf";
-    // Los PDF no son un "image/*" válido para el bloque de imagen del API,
-    // pero Claude sí puede leerlos directo con un bloque "document" — antes
-    // esto devolvía null siempre y quedaba pendiente de revisión manual
-    // (bug detectado 2/10/2026).
-    if (!esPdf && !contentType.startsWith("image/")) return null;
+    // No confiar solo en el header Content-Type — Firebase Storage/CDN a
+    // veces lo sirve distinto al que se guardó (ej. octet-stream), lo que
+    // antes hacía que un PDF real cayera siempre en "no se pudo leer" sin
+    // ningún log (bug detectado 14/10/2026). La firma real del archivo
+    // ("%PDF-" al principio) es lo único confiable para saber si es un PDF.
+    const esPdfPorFirma = buffer.length > 4 && buffer.subarray(0, 5).toString("latin1") === "%PDF-";
+    const esPdf = esPdfPorFirma || contentType === "application/pdf";
+    if (!esPdf && !contentType.startsWith("image/")) {
+      console.error(`[pagosCC] leerComprobanteConIA: tipo de archivo no soportado (content-type "${contentType}", ${buffer.length} bytes) de ${imageUrl}`);
+      return null;
+    }
     const base64 = buffer.toString("base64");
     const contentBlock = esPdf
       ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64 } }
@@ -7986,6 +8340,37 @@ async function computeClientesReport(db, email, apiKey) {
   const porDeposito = rollupDetailSnap.exists ? (rollupDetailSnap.data().porDeposito || []) : [];
   const depositoById = new Map(porDeposito.map((d) => [String(d.id), d]));
 
+  // "Debe video": igual criterio que isAuditOverdue del lado del cliente
+  // (src/services/stockAudits.ts) — vencido si pasaron más de
+  // auditIntervalDays (default 10) desde el último video de auditoría de
+  // stock de ese depósito, o desde el arranque del programa si nunca grabó
+  // ninguno. Se trae TODA la colección stockAudits de una (son pocos docs,
+  // uno cada ~10 días por depósito) y se agarra el más reciente por
+  // depositoId en memoria, en vez de pegarle a Firestore depósito por
+  // depósito.
+  const AUDIT_INTERVAL_DIAS_DEFAULT = 10;
+  const programStartSnap = await db.doc("meta/stockAuditProgram").get();
+  const programStart = programStartSnap.exists && programStartSnap.data().startedAt?.toDate
+    ? programStartSnap.data().startedAt.toDate()
+    : null;
+  const audisSnap = await db.collection("stockAudits").orderBy("createdAt", "desc").get();
+  const ultimoVideoPorDeposito = new Map();
+  audisSnap.docs.forEach((d) => {
+    const a = d.data();
+    const depId = String(a.depositoId || "");
+    if (!depId || ultimoVideoPorDeposito.has(depId)) return; // ya tenemos el más reciente de este
+    ultimoVideoPorDeposito.set(depId, a.createdAt?.toDate ? a.createdAt.toDate() : null);
+  });
+  function debeVideoAuditoria(depositoId, intervalDays) {
+    if (!depositoId) return false;
+    const lastAuditAt = ultimoVideoPorDeposito.get(String(depositoId)) || null;
+    const base = lastAuditAt || programStart;
+    if (!base) return true;
+    const next = new Date(base);
+    next.setDate(next.getDate() + (intervalDays || AUDIT_INTERVAL_DIAS_DEFAULT));
+    return next.getTime() <= Date.now();
+  }
+
   const usersSnap = await db.collection("users").where("kind", "==", "client").get();
 
   const rows = usersSnap.docs.map((uDoc) => {
@@ -8005,6 +8390,7 @@ async function computeClientesReport(db, email, apiKey) {
     const saldo = sumaComprobantes - cobrado.total;
 
     const dep = u.contabiliumDepositoId ? depositoById.get(String(u.contabiliumDepositoId)) : null;
+    const stockConsignado = dep ? dep.bicicletas : 0;
 
     return {
       uid: uDoc.id,
@@ -8012,7 +8398,8 @@ async function computeClientesReport(db, email, apiKey) {
       localidad: u.city || "",
       contabiliumId,
       depositoId: u.contabiliumDepositoId || null,
-      stockConsignado: dep ? dep.bicicletas : 0,
+      debeVideo: stockConsignado > 0 ? debeVideoAuditoria(u.contabiliumDepositoId, u.auditIntervalDays) : false,
+      stockConsignado,
       valorConsignado: dep ? (dep.valor || 0) : 0,
       facturadoTotal,
       cantidadFacturas: facturas.length,

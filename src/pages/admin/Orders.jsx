@@ -191,6 +191,20 @@ export default function Orders() {
       }
     }
   }
+  async function markDone(id) {
+    setActionError("");
+    try {
+      await updateOrderStatus(id, "hecho");
+      setRows((prev) => prev.map((o) => (o.id === id ? { ...o, status: "hecho" } : o)));
+    } catch (e) {
+      console.error(e);
+      if (e instanceof FirebaseError) {
+        setActionError("Necesitás permisos de administrador");
+      } else {
+        setActionError("No se pudo actualizar la orden.");
+      }
+    }
+  }
   async function reactivate(id) {
     setActionError("");
     try {
@@ -620,6 +634,7 @@ export default function Orders() {
         order={detailOrder}
         onClose={() => setDetailOrder(null)}
         onMarkPaid={markPaid}
+        onMarkDone={markDone}
         onCancel={cancel}
         onReactivate={reactivate}
         onEnvioConfirmado={(orderId, envio) => {
@@ -688,8 +703,6 @@ function buildOrderTextChofer(order) {
   return lines.join("\n");
 }
 
-const WHATSAPP_EMPRESA = "5491149166234";
-
 function soloDigitos(s) {
   return String(s || "").replace(/\D/g, "");
 }
@@ -705,13 +718,6 @@ function mensajeParaClienteSinCuenta(order) {
     "Para poder comprar necesitás una cuenta de distribuidor aprobada en nuestro sistema — es rápido, completá este formulario y te damos de alta: https://samurai.ar/quiero-ser-cliente",
     "",
     "Una vez aprobado, ya podés hacer el pedido directo desde tu cuenta. ¡Cualquier duda, contame!",
-  ].join("\n");
-}
-
-function mensajeParaEmpresaSobreLead(order) {
-  return [
-    `Te paso un lead nuevo: ${order.customer?.name || "(sin nombre)"} (${order.customer?.email || "sin email"}, ${order.customer?.phone || "sin teléfono"}) pidió comprar "${order.items?.[0]?.name || "-"}" desde el catálogo público, pero no tiene cuenta de distribuidor.`,
-    "Le mandé el link para que se registre en \"Quiero ser distribuidor\" — seguilo para cerrar la venta una vez que complete el alta.",
   ].join("\n");
 }
 
@@ -769,7 +775,7 @@ function RemitoResultadoRow({ r }) {
   );
 }
 
-function OrderDetailModal({ order, onClose, onMarkPaid, onCancel, onReactivate, onEnvioConfirmado, authLoading }) {
+function OrderDetailModal({ order, onClose, onMarkPaid, onMarkDone, onCancel, onReactivate, onEnvioConfirmado, authLoading }) {
   const [copied, setCopied] = useState(false);
   const [copiedChofer, setCopiedChofer] = useState(false);
   if (!order) return null;
@@ -840,7 +846,7 @@ function OrderDetailModal({ order, onClose, onMarkPaid, onCancel, onReactivate, 
         {esSolicitudSinCuenta && (
           <div className="mt-4 flex flex-wrap gap-2 rounded-2xl border border-sky-200 bg-sky-50 p-3 dark:border-sky-900 dark:bg-sky-950/20">
             <p className="w-full text-xs text-sky-800 dark:text-sky-400">
-              Pidió comprar sin tener cuenta de distribuidor — avisale a él y a Contacto Empresa por WhatsApp:
+              Pidió comprar sin tener cuenta de distribuidor — avisale por WhatsApp:
             </p>
             {order.customer?.phone && (
               <a
@@ -852,14 +858,6 @@ function OrderDetailModal({ order, onClose, onMarkPaid, onCancel, onReactivate, 
                 💬 Escribirle a {order.customer.name || "cliente"}
               </a>
             )}
-            <a
-              href={`https://wa.me/${WHATSAPP_EMPRESA}?text=${encodeURIComponent(mensajeParaEmpresaSobreLead(order))}`}
-              target="_blank"
-              rel="noreferrer"
-              className="rounded-xl border border-sky-300 bg-white px-3 py-2 text-xs font-semibold text-sky-700 hover:bg-sky-100 dark:border-sky-800 dark:bg-neutral-900"
-            >
-              💬 Avisar a Contacto Empresa
-            </a>
           </div>
         )}
 
@@ -915,6 +913,24 @@ function OrderDetailModal({ order, onClose, onMarkPaid, onCancel, onReactivate, 
               Marcar pagada
             </button>
           )}
+          {order.status !== "hecho" && (
+            <button
+              onClick={() => { onMarkDone(order.id); onClose(); }}
+              disabled={authLoading}
+              className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-2 text-xs font-semibold text-emerald-700 transition hover:border-emerald-300 hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400"
+            >
+              Marcar hecho
+            </button>
+          )}
+          {order.status !== "pendiente" && (
+            <button
+              onClick={() => { onReactivate(order.id); onClose(); }}
+              disabled={authLoading}
+              className="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-2 text-xs font-semibold text-sky-700 transition hover:border-sky-300 hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-400"
+            >
+              Marcar pendiente
+            </button>
+          )}
           {order.status !== "cancelada" && (
             <button
               onClick={() => { onCancel(order.id); onClose(); }}
@@ -922,15 +938,6 @@ function OrderDetailModal({ order, onClose, onMarkPaid, onCancel, onReactivate, 
               className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-2 text-xs font-semibold text-rose-700 transition hover:border-rose-300 hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-400"
             >
               Cancelar
-            </button>
-          )}
-          {order.status === "cancelada" && (
-            <button
-              onClick={() => { onReactivate(order.id); onClose(); }}
-              disabled={authLoading}
-              className="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-2 text-xs font-semibold text-sky-700 transition hover:border-sky-300 hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-400"
-            >
-              Reactivar
             </button>
           )}
         </div>
@@ -955,6 +962,9 @@ function ConfirmarEnvioPanel({ order, onEnvioConfirmado }) {
   const [stockCargando, setStockCargando] = useState({});
   const [depositoGlobal, setDepositoGlobal] = useState("");
   const [excepciones, setExcepciones] = useState({}); // { itemId: depositoId } — solo para ítems sin stock en el global
+  const [sustituciones, setSustituciones] = useState({}); // { itemId: { sku, name } } — reemplazo de bici cuando no hay stock del modelo pedido
+  const [buscadorAbierto, setBuscadorAbierto] = useState(null); // itemId con el buscador de sustituto abierto
+  const [filtroSustituto, setFiltroSustituto] = useState("");
   const [error, setError] = useState("");
   const [cliente, setCliente] = useState(null); // { contabiliumId, contabiliumDepositoId, name, phone }
   const [clienteError, setClienteError] = useState("");
@@ -997,13 +1007,33 @@ function ConfirmarEnvioPanel({ order, onEnvioConfirmado }) {
     return (stockPorDeposito[depId] || []).find((p) => p.sku === sku)?.stockDisponible ?? null;
   }
 
+  // Si el ítem fue reemplazado por otra bici (sustituciones), de acá en
+  // adelante se trata como si el pedido fuera por esa bici — mismo qty/id,
+  // sku/nombre del sustituto.
+  function itemEfectivo(it) {
+    const sus = sustituciones[it.id];
+    return sus ? { ...it, sku: sus.sku, name: sus.name } : it;
+  }
+
   const depGlobalId = depositoGlobal ? Number(depositoGlobal) : null;
+  // Para la validación/grupos: usa el sku ya sustituido, si lo hay.
   const itemsConFaltante = depGlobalId
     ? items.filter((it) => {
-        const s = stockDe(depGlobalId, it.sku);
+        const itEf = itemEfectivo(it);
+        const s = stockDe(depGlobalId, itEf.sku);
         return s != null && it.qty > s;
       })
     : [];
+  // Para mostrar el bloque de "sin stock / reemplazar": además de los que
+  // siguen sin alcanzar, incluye los que ya tienen un reemplazo elegido
+  // (aunque el sustituto sí alcance) para no perder el botón de deshacer.
+  const itemsParaBloque = depGlobalId
+    ? items.filter((it) => {
+        const s = stockDe(depGlobalId, it.sku);
+        return (s != null && it.qty > s) || sustituciones[it.id];
+      })
+    : [];
+  const catalogoDeposito = stockPorDeposito[depGlobalId] || [];
 
   function confirmarDepositos() {
     if (!depGlobalId) {
@@ -1017,9 +1047,10 @@ function ConfirmarEnvioPanel({ order, onEnvioConfirmado }) {
     setError("");
     const mapa = new Map();
     for (const it of items) {
+      const itEf = itemEfectivo(it);
       const depId = Number(excepciones[it.id] || depGlobalId);
       if (!mapa.has(depId)) mapa.set(depId, []);
-      mapa.get(depId).push(it);
+      mapa.get(depId).push(itEf);
     }
     const nuevosGrupos = Array.from(mapa.entries()).map(([depId, itemsGrupo]) => ({
       depId,
@@ -1165,12 +1196,12 @@ function ConfirmarEnvioPanel({ order, onEnvioConfirmado }) {
           ))}
         </select>
 
-        {depGlobalId && itemsConFaltante.length > 0 && (
+        {depGlobalId && itemsParaBloque.length > 0 && (
           <div className="space-y-2 rounded-xl border border-rose-200 bg-rose-50 p-2.5 dark:border-rose-500/30 dark:bg-rose-500/10">
             <p className="text-xs font-semibold text-rose-700 dark:text-rose-400">
-              No hay stock suficiente en {DEPOSITOS_PROPIOS_ORDERS.find((d) => d.id === depGlobalId)?.nombre} para estos ítems — elegí de dónde salen (va a generar un movimiento/remito aparte, de ese depósito):
+              No hay stock suficiente en {DEPOSITOS_PROPIOS_ORDERS.find((d) => d.id === depGlobalId)?.nombre} para estos ítems — elegí de dónde salen, o reemplazalos por otra bici:
             </p>
-            {itemsConFaltante.map((it) => (
+            {itemsParaBloque.map((it) => (
               <div key={it.id} className="rounded-lg bg-white p-2 text-xs dark:bg-neutral-900">
                 <p className="font-medium text-slate-800 dark:text-white">
                   {it.qty}x {it.name} <span className="text-slate-400">(stock en {DEPOSITOS_PROPIOS_ORDERS.find((d) => d.id === depGlobalId)?.nombre}: {stockDe(depGlobalId, it.sku) ?? 0})</span>
@@ -1178,7 +1209,8 @@ function ConfirmarEnvioPanel({ order, onEnvioConfirmado }) {
                 <select
                   value={excepciones[it.id] || ""}
                   onChange={(e) => setExcepciones((prev) => ({ ...prev, [it.id]: e.target.value }))}
-                  className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs dark:border-neutral-700 dark:bg-neutral-800"
+                  disabled={!!sustituciones[it.id]}
+                  className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs disabled:opacity-50 dark:border-neutral-700 dark:bg-neutral-800"
                 >
                   <option value="">Mantener en {DEPOSITOS_PROPIOS_ORDERS.find((d) => d.id === depGlobalId)?.nombre} (no alcanza)</option>
                   {DEPOSITOS_PROPIOS_ORDERS.filter((d) => d.id !== depGlobalId).map((d) => (
@@ -1187,6 +1219,92 @@ function ConfirmarEnvioPanel({ order, onEnvioConfirmado }) {
                     </option>
                   ))}
                 </select>
+
+                <div className="mt-2 border-t border-rose-100 pt-2 dark:border-rose-500/20">
+                  {sustituciones[it.id] ? (
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-emerald-700 dark:text-emerald-400">
+                        🔁 Reemplazado por: {sustituciones[it.id].name} (SKU {sustituciones[it.id].sku}, stock {stockDe(depGlobalId, sustituciones[it.id].sku) ?? 0})
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSustituciones((prev) => {
+                            const next = { ...prev };
+                            delete next[it.id];
+                            return next;
+                          })
+                        }
+                        className="shrink-0 text-slate-400 underline"
+                      >
+                        Deshacer
+                      </button>
+                    </div>
+                  ) : buscadorAbierto === it.id ? (
+                    <div className="space-y-1">
+                      <input
+                        autoFocus
+                        value={filtroSustituto}
+                        onChange={(e) => setFiltroSustituto(e.target.value)}
+                        placeholder="Buscar bici por nombre o SKU…"
+                        className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs dark:border-neutral-700 dark:bg-neutral-800"
+                      />
+                      <div className="max-h-40 overflow-y-auto rounded-lg border border-slate-200 dark:border-neutral-700">
+                        {catalogoDeposito.length === 0 && (
+                          <p className="px-2 py-1.5 text-slate-400">Cargando catálogo…</p>
+                        )}
+                        {catalogoDeposito
+                          .filter((p) => {
+                            const q = filtroSustituto.trim().toLowerCase();
+                            if (!q) return true;
+                            return (p.name || "").toLowerCase().includes(q) || (p.sku || "").includes(q);
+                          })
+                          .map((p) => (
+                            <button
+                              type="button"
+                              key={p.sku}
+                              onClick={() => {
+                                setSustituciones((prev) => ({ ...prev, [it.id]: { sku: p.sku, name: p.name } }));
+                                setBuscadorAbierto(null);
+                                setFiltroSustituto("");
+                              }}
+                              className="flex w-full items-center justify-between gap-2 px-2 py-1.5 text-left hover:bg-slate-50 dark:hover:bg-neutral-800"
+                            >
+                              <span className="text-slate-700 dark:text-neutral-200">{p.name}</span>
+                              <span
+                                className={`shrink-0 font-semibold ${
+                                  (p.stockDisponible ?? 0) > 0 ? "text-emerald-600" : "text-slate-400"
+                                }`}
+                              >
+                                stock {p.stockDisponible ?? 0}
+                              </span>
+                            </button>
+                          ))}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setBuscadorAbierto(null);
+                          setFiltroSustituto("");
+                        }}
+                        className="text-slate-400 underline"
+                      >
+                        Cancelar
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setBuscadorAbierto(it.id);
+                        setFiltroSustituto("");
+                      }}
+                      className="font-medium text-indigo-600 underline dark:text-indigo-400"
+                    >
+                      🔄 Cambiar por otra bici
+                    </button>
+                  )}
+                </div>
               </div>
             ))}
           </div>

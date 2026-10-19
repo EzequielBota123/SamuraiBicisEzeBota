@@ -26,6 +26,34 @@ export type OrderItem = { id: string; name: string; price: number; qty: number; 
 export type Customer = { name: string; email?: string; phone?: string; notes?: string; };
 
 const ORDERS = collection(db, "orders");
+const FUNCTIONS_BASE_URL = "https://us-central1-bikeshop-ab2f0.cloudfunctions.net";
+
+export type StockShortage = { id: string; name: string; available: number; requested: number };
+
+// Valida en vivo contra Contabilium (no contra el campo "stock" cacheado)
+// justo antes de confirmar el pedido, para achicar la ventana en la que el
+// catálogo muestra stock que ya no está disponible de verdad.
+export async function checkStockEnVivo(
+  items: Array<{ id: string; name: string; sku?: string; qty: number }>
+): Promise<{ ok: boolean; shortages: StockShortage[] }> {
+  const itemsConSku = items.filter((it) => it.sku);
+  if (itemsConSku.length === 0) return { ok: true, shortages: [] };
+
+  const user = auth.currentUser ?? (await authReady());
+  if (!user) throw new Error("Necesitás una cuenta de distribuidor para hacer un pedido.");
+  const token = await user.getIdToken();
+
+  const res = await fetch(`${FUNCTIONS_BASE_URL}/checkStockEnVivo`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ items: itemsConSku }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: `Error ${res.status}` }));
+    throw new Error(err.error || `Error ${res.status}`);
+  }
+  return res.json();
+}
 
 function sum(items: OrderItem[]) {
   return items.reduce((acc, it) => acc + Number(it.price || 0) * Number(it.qty || 0), 0);
@@ -208,7 +236,7 @@ export async function listOrders(params: ListOrdersParams = {}) {
 
 export async function updateOrderStatus(
   orderId: string,
-  newStatus: "pendiente" | "facturado" | "pagada" | "cancelada"
+  newStatus: "pendiente" | "facturado" | "pagada" | "cancelada" | "hecho"
 ) {
   const patch: any = { status: newStatus, updatedAt: serverTimestamp() };
   if (newStatus === "facturado") patch.facturadoAt = serverTimestamp();

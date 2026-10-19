@@ -814,12 +814,16 @@ async function cargarCobranzaACuentaWeb({
 }) {
   let cookie = await getCookieValida(db, email, password);
   const esEfectivo = forma === "Efectivo";
+  // "Cheque" no pide banco ni caja — mismo patrón ya probado y en producción
+  // en el recibo de factura (ReciboForm): se manda la forma "Cheque" sola,
+  // con el número de cheque como referencia, sin idBanco/idCaja.
+  const sinCuenta = forma === "Cheque";
 
   const intentar = async () => {
-    let idBancoFinal = !esEfectivo ? (idBanco != null ? Number(idBanco) : null) : null;
+    let idBancoFinal = !esEfectivo && !sinCuenta ? (idBanco != null ? Number(idBanco) : null) : null;
     let idCajaFinal = esEfectivo ? (idCaja != null ? Number(idCaja) : null) : null;
     let bancoNombre = null;
-    if (!esEfectivo && idBancoFinal == null) {
+    if (!esEfectivo && !sinCuenta && idBancoFinal == null) {
       const bancos = await obtenerBancosPropios(cookie, fecha);
       idBancoFinal = resolverIdBancoPropio(banco, bancos);
       bancoNombre = bancos.find((b) => b.id === idBancoFinal)?.nombre || null;
@@ -1984,6 +1988,76 @@ async function obtenerMovimientosStock({ db, email, password, fechaDesde, fechaH
   return todos;
 }
 
+// Tercera API de Contabilium descubierta (vir-internalapi.contabilium.com),
+// la que usa el formulario nuevo "Editar producto" (v3/attributes/edition) —
+// distinta tanto de la REST pública (rest.contabilium.com, que rechaza el
+// PUT de conceptos por el campo "Tipo") como de la v2 (api.contabilium.com,
+// usada para movimientos). Confirmado por captura real de red, 16/10/2026:
+// el Bearer token es LITERAL el valor de la cookie "Secure-1CBL" que ya
+// conseguimos con loginYSacarCookie — no hace falta pedir un token aparte.
+// El payload no tiene campo "Tipo" en absoluto.
+const VIR_INTERNAL_API = "https://vir-internalapi.contabilium.com/api/products";
+
+function extraerSecure1CBL(cookie) {
+  const match = /(?:^|;\s*)Secure-1CBL=([^;]+)/.exec(cookie);
+  if (!match) throw new Error("La cookie no tiene Secure-1CBL — ¿falló el login?");
+  return match[1];
+}
+
+// `concepto` es el objeto crudo tal cual lo devuelve getAllConceptos (REST
+// vieja, de solo lectura) — de ahí sacamos todos los campos que no cambian,
+// mapeados al formato que espera esta API nueva. `nuevoPrecioConIva` es el
+// único valor que realmente queremos modificar.
+async function actualizarPrecioProductoWeb({ db, email, password, concepto, nuevoPrecioConIva }) {
+  const cookie = await getCookieValida(db, email, password);
+  const token = extraerSecure1CBL(cookie);
+
+  const body = {
+    name: concepto.Nombre || "",
+    status: concepto.Estado === "Activo" ? "A" : "I",
+    description: concepto.Descripcion || "",
+    // IdRubro/IdSubrubro a veces vienen como string vacío ("") en vez de
+    // null cuando el producto no tiene subrubro cargado — Number("") da 0,
+    // que Contabilium rechaza como un subrubro inexistente (QUERY_EXCEPTION).
+    headingId: concepto.IdRubro ? Number(concepto.IdRubro) : null,
+    subHeadingId: concepto.IdSubrubro ? Number(concepto.IdSubrubro) : null,
+    code: concepto.Codigo || "",
+    barcode: concepto.CodigoBarras || "",
+    minStock: Number(concepto.StockMinimo || 0),
+    currencyId: concepto.IDMoneda != null ? Number(concepto.IDMoneda) : null,
+    internalCost: Number(concepto.CostoInterno || 0),
+    profitability: Number(concepto.Rentabilidad || 0),
+    unitPrice: Number(nuevoPrecioConIva),
+    iva: 21,
+    visible: true,
+    RG5329: !!concepto.AplicaRG5329,
+    observations: concepto.Observaciones || "",
+    ivaRateId: 5, // visto en captura real para 21% — todo el catálogo usa 21%
+    unitPriceForAll: false,
+    ivaForAll: false,
+  };
+
+  const res = await fetch(`${VIR_INTERNAL_API}/${concepto.Id}`, {
+    method: "PUT",
+    headers: {
+      Accept: "application/json, text/plain, */*",
+      "Content-Type": "application/json",
+      Authorization: token,
+      Origin: BASE,
+      Referer: `${BASE}/`,
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  let respBody;
+  try { respBody = JSON.parse(text); } catch { respBody = text; }
+  if (!res.ok) {
+    const msg = typeof respBody === "string" ? respBody : (respBody?.message || respBody?.Message || JSON.stringify(respBody));
+    throw new Error(`vir-internalapi no pudo actualizar el producto (status ${res.status}): ${msg}`);
+  }
+  return respBody;
+}
+
 module.exports = {
   ajustarStockWeb,
   transferirStockWeb,
@@ -2017,4 +2091,5 @@ module.exports = {
   aplicarPagoFacturaWeb,
   obtenerMovimientosStock,
   descargarRemitoPorArchivoWeb,
+  actualizarPrecioProductoWeb,
 };

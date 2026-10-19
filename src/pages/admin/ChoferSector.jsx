@@ -3,6 +3,7 @@ import { NavLink, Redirect, Route, Switch } from "react-router-dom";
 import GrillaLogisticaPage from "./GrillaLogisticaPage";
 import UbicacionChoferes from "./UbicacionChoferes";
 import ChequeosVehiculo from "./ChequeosVehiculo";
+import CuentasCorrientesLogistica from "./CuentasCorrientesLogistica";
 import { subscribeViajesRango } from "../../services/logisticaViajes";
 import { subscribeUbicacionesChoferes } from "../../services/ubicacionChofer";
 import { hoyISO, subscribeChequeosRecientes } from "../../services/chequeosVehiculo";
@@ -12,6 +13,7 @@ import { movimientosPorChofer } from "../../utils/movimientosChofer";
 
 const TABS = [
   { to: "/admin/chofer/grilla", label: "📅 Grilla y viajes" },
+  { to: "/admin/chofer/cuentas-corrientes", label: "💰 Cuentas corrientes" },
   { to: "/admin/chofer/ubicacion", label: "📍 Dónde está" },
   { to: "/admin/chofer/chequeos", label: "🚐 Chequeo de vehículo" },
 ];
@@ -168,6 +170,7 @@ export default function ChoferSector() {
 
       <Switch>
         <Route path="/admin/chofer/grilla" component={GrillaLogisticaPage} />
+        <Route path="/admin/chofer/cuentas-corrientes" component={CuentasCorrientesLogistica} />
         <Route path="/admin/chofer/ubicacion" component={UbicacionChoferes} />
         <Route path="/admin/chofer/chequeos" component={ChequeosVehiculo} />
         <Redirect to="/admin/chofer/grilla" />

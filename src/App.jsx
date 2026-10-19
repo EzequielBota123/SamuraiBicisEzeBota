@@ -35,6 +35,7 @@ import Clientes360 from './pages/admin/Clientes360'
 import ClientesReporte from './pages/admin/ClientesReporte'
 import DashboardNegocio from './pages/admin/DashboardNegocio'
 import ContadorDiario from './pages/admin/ContadorDiario'
+import ReporteSemanal from './pages/admin/ReporteSemanal'
 import RemitosReporte from './pages/admin/RemitosReporte'
 import PedidosPendientes from './pages/admin/PedidosPendientes'
 import Vendedores from './pages/admin/Vendedores'
@@ -82,6 +83,7 @@ export default function App() {
               <Route path="/admin/reporte-clientes" component={ClientesReporte} />
               <Route path="/admin/dashboard-negocio" component={DashboardNegocio} />
               <Route path="/admin/contador-diario" component={ContadorDiario} />
+              <Route path="/admin/reporte-semanal" component={ReporteSemanal} />
               <Route path="/admin/remitos-reporte" component={RemitosReporte} />
               <Route path="/admin/pedidos-pendientes" component={PedidosPendientes} />
               <Route path="/admin/vendedores" component={Vendedores} />

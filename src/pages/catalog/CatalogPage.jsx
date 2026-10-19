@@ -4,7 +4,7 @@ import { createPortal } from "react-dom";
 import { useAuth } from "../../auth/AuthContext";
 import { useLocation, Link } from "react-router-dom";
 import { listProducts } from "../../services/products";
-import { createOrder } from "../../services/orders";
+import { createOrder, checkStockEnVivo } from "../../services/orders";
 import { getCustomerTypeById } from "../../services/customerTypes";
 import { fetchEffectiveRate } from "../../services/exchangeRates";
 import { getDollarConfig } from "../../services/dollarConfig";
@@ -237,6 +237,36 @@ export default function CatalogPage() {
       active = false;
     };
   }, []);
+
+  // Congelamiento de precios por cliente: algunos clientes puntuales
+  // (acordado a mano, ej. Stortini) mantienen el precio viejo hasta una
+  // fecha/hora límite guardada en su perfil (users/{uid}.congelamientoPrecios
+  // = { hasta: Timestamp, precios: { "<precioNuevo>": precioViejo, ... } }).
+  // Mapea por VALOR de precio (no por SKU) porque el mismo aumento aplica
+  // igual a todas las variantes de un modelo. Es idempotente: una vez
+  // reemplazado el precio por el viejo, ya no vuelve a matchear el mapa, así
+  // que no hay riesgo de aplicarlo dos veces ni de loop de renders.
+  useEffect(() => {
+    const congelamiento = profile?.congelamientoPrecios;
+    const precios = congelamiento?.precios;
+    const hasta = congelamiento?.hasta;
+    if (!precios || !hasta) return;
+    const hastaMs = typeof hasta?.toDate === "function" ? hasta.toDate().getTime() : new Date(hasta).getTime();
+    if (!Number.isFinite(hastaMs) || Date.now() >= hastaMs) return;
+
+    setItems((prev) => {
+      let changed = false;
+      const next = prev.map((p) => {
+        const viejo = precios[String(p.priceArs)];
+        if (viejo == null) return p;
+        const viejoNum = Number(viejo);
+        if (!Number.isFinite(viejoNum) || viejoNum === p.priceArs) return p;
+        changed = true;
+        return { ...p, priceArs: viejoNum };
+      });
+      return changed ? next : prev;
+    });
+  }, [items, profile?.congelamientoPrecios]);
 
   useEffect(() => {
     setCart((prev) => {
@@ -526,32 +556,25 @@ export default function CatalogPage() {
 
     try {
       setOrderSubmitting(true);
+
+      // Chequeo final en vivo contra Contabilium: el stock de arriba es el
+      // cacheado del catálogo (sync cada 15 min), puede estar desactualizado.
+      const liveCheck = await checkStockEnVivo(orderItems);
+      if (!liveCheck.ok) {
+        const names = liveCheck.shortages.map((s) => s.name).join(", ");
+        setOrderResult({
+          ok: false,
+          error: `No hay stock suficiente para: ${names}. Actualizá las cantidades antes de continuar.`,
+        });
+        setOrderSubmitting(false);
+        return;
+      }
+
       const orderId = await createOrder({
         customer,
         items: orderItems,
       });
       setOrderResult({ ok: true, orderId });
-      const orderTotal = orderItems.reduce((acc, item) => acc + item.price * item.qty, 0);
-      const lines = [
-        "Hola Samurai Bicis, este es el pedido que realicé:",
-        "",
-        `Nombre: ${customer.name}`,
-        customer.cuit ? `CUIT: ${customer.cuit}` : null,
-        customer.email ? `Email: ${customer.email}` : null,
-        customer.phone ? `Teléfono: ${customer.phone}` : null,
-        customer.notes ? `Notas: ${customer.notes}` : null,
-        "",
-        "Detalle del pedido:",
-        ...orderItems.map((item) =>
-          `• ${item.name} x${item.qty} — ${money(item.price)} c/u — Subtotal: ${money(item.price * item.qty)}`
-        ),
-        "",
-        `Total: ${money(orderTotal)}`,
-        orderId ? `ID de pedido: ${orderId}` : null,
-      ].filter(Boolean);
-      const whatsappMessage = encodeURIComponent(lines.join("\n"));
-      const whatsappNumber = "5491149166234";
-      window.open(`https://wa.me/${whatsappNumber}?text=${whatsappMessage}`, "_blank");
       setItems((prev) =>
         prev.map((product) => {
           const match = orderItems.find((it) => it.id === product.id);

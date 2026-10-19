@@ -12,7 +12,16 @@ import {
 } from "../../services/comprobantes";
 import { subscribeCobranzas } from "../../services/cobranzas";
 import { movimientosPorChofer, salidasPorDeposito, detectarChoferesEnTexto } from "../../utils/movimientosChofer";
+import { generateEtiquetasPdf } from "../../utils/generateEtiquetasPdf";
 import CalendarioRemitos from "../../components/remitos/CalendarioRemitos";
+
+// Pide la dirección de destino por prompt (sin dato guardado acá todavía)
+// y genera la hoja de 5 etiquetas para cortar con tijera.
+function handleGenerarEtiquetas(cliente) {
+  const destino = window.prompt(`Dirección de destino para ${cliente}:`, "");
+  if (!destino) return;
+  generateEtiquetasPdf({ cliente, destino }, { fileName: `Etiquetas ${cliente}.pdf` });
+}
 import MovimientosStockPanel from "../../components/remitos/MovimientosStockPanel";
 import SectorMovimientoStock from "../../components/remitos/SectorMovimientoStock";
 import SectorRemitosPersonalizados from "../../components/remitos/SectorRemitosPersonalizados";
@@ -1212,11 +1221,23 @@ export default function RemitosReporte() {
                                             <span className="font-mono text-slate-500 dark:text-neutral-400">{r.numero}</span>
                                             <span className="font-semibold text-slate-800 dark:text-white">{r.bicis} bici(s)</span>
                                           </div>
-                                          <p className="text-slate-600 dark:text-neutral-300">
-                                            {r.esInterno ? "Interno FEPA→FEPA" : r.cliente}
-                                            {r.atribuidoDesdeObservacion
-                                              ? ` (detectado por observación · confianza ${r.confianzaAtribucion || "?"}, no es el proveedor real del remito en Contabilium)`
-                                              : ""}
+                                          <p className="flex items-center justify-between gap-2 text-slate-600 dark:text-neutral-300">
+                                            <span>
+                                              {r.esInterno ? "Interno FEPA→FEPA" : r.cliente}
+                                              {r.atribuidoDesdeObservacion
+                                                ? ` (detectado por observación · confianza ${r.confianzaAtribucion || "?"}, no es el proveedor real del remito en Contabilium)`
+                                                : ""}
+                                            </span>
+                                            {!r.esInterno && r.cliente && (
+                                              <button
+                                                type="button"
+                                                onClick={() => handleGenerarEtiquetas(r.cliente)}
+                                                className="shrink-0 rounded-lg border border-slate-200 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 hover:border-sky-300 hover:text-sky-700 dark:border-neutral-700 dark:text-neutral-400"
+                                                title="Generar hoja de etiquetas para cortar (5 por hoja)"
+                                              >
+                                                🏷️ Etiquetas
+                                              </button>
+                                            )}
                                           </p>
                                           {r.observaciones && <p className="text-[11px] text-slate-400 dark:text-neutral-500">💬 {r.observaciones}</p>}
                                         </div>

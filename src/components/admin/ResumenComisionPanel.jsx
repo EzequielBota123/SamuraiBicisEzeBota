@@ -5,7 +5,20 @@
 // (pide sus propios datos) para poder colgarlo tanto en Vendedores como en
 // la ficha del cliente en Clientes 360, sin duplicar la lógica.
 import { useCallback, useEffect, useState } from "react";
-import { getResumenComisionVendedor, setViajesVendedorMes, adminSetTarifasVendedor } from "../../services/comprobantes";
+import { getResumenComisionVendedor, setViajesVendedorMes, adminSetTarifasVendedor, descargarResumenVendedorExcel } from "../../services/comprobantes";
+
+function descargarBase64Xlsx(base64, filename) {
+  const bytes = atob(base64);
+  const arr = new Uint8Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+  const blob = new Blob([arr], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename || "resumen.xlsx";
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 const money = (n) =>
   Number(n || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 });
@@ -29,6 +42,20 @@ export default function ResumenComisionPanel({ vendedorUid, comisionPorcentajeIn
   const [comisionInput, setComisionInput] = useState(comisionPorcentajeInicial != null ? String(comisionPorcentajeInicial) : "5");
   const [fleteInput, setFleteInput] = useState(tarifaFletePorViajeInicial != null ? String(tarifaFletePorViajeInicial) : "10000");
   const [guardando, setGuardando] = useState(false);
+  const [descargando, setDescargando] = useState(false);
+
+  async function descargarExcel() {
+    setDescargando(true);
+    setError("");
+    try {
+      const r = await descargarResumenVendedorExcel(mes, vendedorUid);
+      descargarBase64Xlsx(r.base64, r.filename);
+    } catch (e) {
+      setError(e.message || "No se pudo generar el Excel");
+    } finally {
+      setDescargando(false);
+    }
+  }
 
   const cargar = useCallback((m) => {
     if (!vendedorUid) return;
@@ -82,12 +109,21 @@ export default function ResumenComisionPanel({ vendedorUid, comisionPorcentajeIn
     <div className="rounded-2xl border border-sky-200 bg-sky-50/60 p-4 dark:border-sky-900 dark:bg-sky-950/10">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-sm font-bold text-sky-800 dark:text-sky-400">💰 Cuenta corriente (flete + comisión)</h2>
-        <input
-          type="month"
-          value={mes}
-          onChange={(e) => setMes(e.target.value)}
-          className="rounded-lg border border-sky-200 bg-white px-2 py-1 text-xs dark:border-sky-900 dark:bg-neutral-900 dark:text-white"
-        />
+        <div className="flex items-center gap-2">
+          <input
+            type="month"
+            value={mes}
+            onChange={(e) => setMes(e.target.value)}
+            className="rounded-lg border border-sky-200 bg-white px-2 py-1 text-xs dark:border-sky-900 dark:bg-neutral-900 dark:text-white"
+          />
+          <button
+            onClick={descargarExcel}
+            disabled={descargando}
+            className="rounded-lg border border-sky-300 bg-white px-3 py-1.5 text-xs font-semibold text-sky-700 transition hover:bg-sky-50 disabled:opacity-60 dark:border-sky-800 dark:bg-neutral-900 dark:text-sky-400"
+          >
+            {descargando ? "Generando…" : "📥 Descargar Excel"}
+          </button>
+        </div>
       </div>
 
       {error && <p className="mt-2 text-xs text-rose-600 dark:text-rose-400">{error}</p>}

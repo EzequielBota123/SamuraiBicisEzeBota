@@ -93,6 +93,7 @@ export default function ClientesReporte() {
       "Fecha última cobranza": formatFecha(r.fechaUltimaCobranza),
       "Deuda": r.saldoDeudor,
       "A favor": r.saldoAFavor,
+      "Debe video": r.debeVideo ? "Sí" : "No",
     }));
     const ws = XLSX.utils.json_to_sheet(wsRows);
     const wb = XLSX.utils.book_new();
@@ -225,6 +226,7 @@ export default function ClientesReporte() {
                 <th className="px-3 py-2">Última cobranza</th>
                 <th className="px-3 py-2 text-right">Deuda</th>
                 <th className="px-3 py-2 text-right">A favor</th>
+                <th className="px-3 py-2 text-center">Debe video</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-neutral-800">
@@ -249,11 +251,26 @@ export default function ClientesReporte() {
                   <td className={`px-3 py-2 text-right font-semibold ${r.saldoAFavor > 0 ? "text-emerald-600 dark:text-emerald-400" : ""}`}>
                     {r.saldoAFavor ? money(r.saldoAFavor) : "-"}
                   </td>
+                  <td className="px-3 py-2 text-center">
+                    {r.stockConsignado > 0 ? (
+                      r.debeVideo ? (
+                        <span className="rounded-full bg-rose-100 px-2 py-0.5 text-xs font-semibold text-rose-700 dark:bg-rose-500/10 dark:text-rose-400">
+                          Debe
+                        </span>
+                      ) : (
+                        <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-semibold text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400">
+                          Al día
+                        </span>
+                      )
+                    ) : (
+                      "-"
+                    )}
+                  </td>
                 </tr>
               ))}
               {rows.length === 0 && (
                 <tr>
-                  <td colSpan={11} className="px-3 py-8 text-center text-slate-400 dark:text-neutral-500">
+                  <td colSpan={12} className="px-3 py-8 text-center text-slate-400 dark:text-neutral-500">
                     Sin datos todavía — tocá "Refrescar" para generar el reporte.
                   </td>
                 </tr>

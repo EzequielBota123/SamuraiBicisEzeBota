@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { subscribeClients } from "../../services/accounts";
+import ClientesDeDistribuidorPanel from "../../components/admin/ClientesDeDistribuidorPanel";
 import {
   subscribeClientesReportDetail,
   adminAsignarVendedor,
@@ -227,6 +228,15 @@ function ResumenDistribuidoresConEquipo({ clientes }) {
               />
             </label>
           </div>
+
+          {seleccionado && (
+            <div className="mt-3 border-t border-sky-100 pt-3 dark:border-sky-900/40">
+              <p className="mb-2 text-xs font-bold text-sky-800 dark:text-sky-300">
+                👥 Sus clientes (stock consignado, deuda y últimas facturas) — misma vista que ve {distActual?.name || "el distribuidor"} en "Mis clientes"
+              </p>
+              <ClientesDeDistribuidorPanel key={seleccionado} distribuidorUid={seleccionado} />
+            </div>
+          )}
 
           <div className="mt-3 border-t border-sky-100 pt-3 dark:border-sky-900/40">
             <p className="text-xs font-bold text-sky-800 dark:text-sky-300">+ Sumar un cliente a esta cartera</p>

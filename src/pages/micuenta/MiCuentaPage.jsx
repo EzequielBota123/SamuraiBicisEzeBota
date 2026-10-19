@@ -82,7 +82,8 @@ function DownloadBtn({ loading, onClick }) {
 }
 
 export default function MiCuentaPage() {
-  const { user } = useAuth();
+  const { user, profile } = useAuth();
+  const cuentaOculta = profile?.ocultarCuentaEnSamurai?.activo === true;
   const history = useHistory();
   const [comprobantes, setComprobantes] = useState([]);
   const [saldoTotal, setSaldoTotal] = useState(0);
@@ -100,6 +101,14 @@ let cancelled = false;
     getClientComprobantes()
       .then(({ items, saldoTotal }) => {
         if (cancelled) return;
+        // Mismo ocultamiento visual que en el panel admin — mientras se
+        // corrige algo a mano en Contabilium, el cliente tampoco ve el
+        // saldo/facturas viejos acá en su propia cuenta.
+        if (cuentaOculta) {
+          setComprobantes([]);
+          setSaldoTotal(0);
+          return;
+        }
         setComprobantes(items);
         setSaldoTotal(saldoTotal ?? 0);
       })
@@ -107,7 +116,7 @@ let cancelled = false;
       .finally(() => { if (!cancelled) setLoading(false); });
 
     return () => { cancelled = true; };
-  }, [user, history]);
+  }, [user, history, cuentaOculta]);
 
   const vencidos = comprobantes.filter((c) => isOverdue(c.FechaVencimiento) && c.Saldo > 0);
   const porVencer = comprobantes.filter((c) => isDueSoon(c.FechaVencimiento) && c.Saldo > 0);

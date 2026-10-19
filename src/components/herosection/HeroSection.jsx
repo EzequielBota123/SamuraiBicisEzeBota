@@ -10,14 +10,6 @@ const contactHighlights = [
     action: "copy",
     value: "contacto@samurai.ar",
   },
-  {
-    id: "phone",
-    label: "Teléfono y WhatsApp",
-    title: "11 4916-6234",
-    description: "Hablá directo con nuestro equipo mayorista.",
-    action: "whatsapp",
-    value: "5491149166234",
-  },
 ];
 
 function CopyIcon({ className = "h-3.5 w-3.5" }) {
@@ -25,14 +17,6 @@ function CopyIcon({ className = "h-3.5 w-3.5" }) {
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <rect x="9" y="9" width="13" height="13" rx="2" />
       <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-    </svg>
-  );
-}
-
-function WhatsAppIcon({ className = "h-3.5 w-3.5" }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-      <path d="M20.52 3.48A11.94 11.94 0 0 0 12.04 0C5.46 0 .13 5.33.13 11.91c0 2.1.55 4.14 1.6 5.94L0 24l6.31-1.65a11.86 11.86 0 0 0 5.72 1.46h.01c6.58 0 11.91-5.33 11.91-11.91 0-3.18-1.24-6.17-3.43-8.42Zm-8.48 18.3h-.01a9.9 9.9 0 0 1-5.04-1.38l-.36-.21-3.74.98 1-3.65-.24-.37a9.9 9.9 0 0 1-1.52-5.24c0-5.47 4.45-9.92 9.93-9.92a9.86 9.86 0 0 1 7.02 2.91 9.86 9.86 0 0 1 2.9 7.01c0 5.47-4.45 9.87-9.94 9.87Zm5.44-7.4c-.3-.15-1.76-.87-2.03-.97-.27-.1-.47-.15-.67.15-.2.3-.77.97-.94 1.17-.17.2-.35.22-.65.07-.3-.15-1.25-.46-2.38-1.46-.88-.78-1.47-1.75-1.64-2.05-.17-.3-.02-.46.13-.61.13-.13.3-.35.44-.52.15-.17.2-.3.3-.5.1-.2.05-.37-.02-.52-.07-.15-.67-1.62-.92-2.21-.24-.58-.49-.5-.67-.51h-.57c-.2 0-.52.07-.79.37-.27.3-1.04 1.02-1.04 2.48 0 1.46 1.07 2.87 1.22 3.07.15.2 2.1 3.2 5.08 4.49.71.3 1.26.49 1.69.62.71.23 1.36.2 1.87.12.57-.09 1.76-.72 2.01-1.41.25-.7.25-1.29.17-1.41-.07-.13-.27-.2-.57-.35Z" />
     </svg>
   );
 }
@@ -46,10 +30,6 @@ export default function HeroSection({
   const [copiedId, setCopiedId] = useState(null);
 
   function handleContactAction(item) {
-    if (item.action === "whatsapp") {
-      window.open(`https://wa.me/${item.value}`, "_blank");
-      return;
-    }
     navigator.clipboard.writeText(item.value).then(() => {
       setCopiedId(item.id);
       setTimeout(() => setCopiedId((c) => (c === item.id ? null : c)), 1800);
@@ -166,7 +146,7 @@ export default function HeroSection({
                       className="group/card relative overflow-hidden rounded-2xl border border-slate-200 bg-white/85 p-4 text-left shadow-[0_24px_55px_-35px_rgba(15,23,42,0.35)] transition duration-300 hover:-translate-y-0.5 hover:border-sky-300/60 hover:shadow-[0_28px_60px_-30px_rgba(15,23,42,0.3)] dark:border-neutral-700 dark:bg-neutral-800/70 dark:shadow-none dark:hover:border-sky-500/50 sm:p-5"
                     >
                       <span className="absolute right-3 top-3 flex h-7 w-7 items-center justify-center rounded-full bg-slate-50 text-slate-400 opacity-0 transition duration-300 group-hover/card:opacity-100 group-hover/card:text-sky-600 dark:bg-neutral-700 dark:text-neutral-300">
-                        {item.action === "whatsapp" ? <WhatsAppIcon /> : <CopyIcon />}
+                        <CopyIcon />
                       </span>
                       <p className="text-xs font-medium uppercase tracking-wide text-slate-400 dark:text-neutral-500">
                         {item.label}

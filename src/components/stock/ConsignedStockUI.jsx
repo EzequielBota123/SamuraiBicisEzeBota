@@ -1,7 +1,5 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { generateReceiptImage } from "../../utils/generateReceiptImage";
-import { shareReceiptToWhatsapp } from "../../utils/shareToWhatsapp";
 import { limpiarNombreBici, extraerTalle } from "../../utils/bikeName";
 
 // Elige un tamaño de fuente en base al largo del texto, en vez de vw
@@ -119,14 +117,13 @@ export function BikeCard({ item, onSelect, money }) {
   );
 }
 
-export function ItemModal({ item, onClose, money, onReportSale, onRequestMore, distributorName, depositoNombre, whatsappNumber, onAjustarStock }) {
+export function ItemModal({ item, onClose, money, onReportSale, onRequestMore, distributorName, depositoNombre, onAjustarStock }) {
   const [qty, setQty] = useState(1);
   const [tipoDocumento, setTipoDocumento] = useState("FCA");
   const [reporting, setReporting] = useState(false);
   const [reportError, setReportError] = useState("");
   const [reported, setReported] = useState(false);
   const [reportedTipo, setReportedTipo] = useState("FCA");
-  const [sharingReceipt, setSharingReceipt] = useState(false);
 
   const [moreQty, setMoreQty] = useState(1);
   const [requesting, setRequesting] = useState(false);
@@ -145,7 +142,6 @@ export function ItemModal({ item, onClose, money, onReportSale, onRequestMore, d
     setReporting(false);
     setReportError("");
     setReported(false);
-    setSharingReceipt(false);
     setMoreQty(1);
     setRequesting(false);
     setRequestError("");
@@ -170,27 +166,6 @@ export function ItemModal({ item, onClose, money, onReportSale, onRequestMore, d
       });
       setReportedTipo(result?.tipoDocumentoEmitido || null);
       setReported(true);
-
-      if (whatsappNumber) {
-        setSharingReceipt(true);
-        try {
-          const blob = await generateReceiptImage({
-            distributorName,
-            depositoNombre,
-            productName: item.name,
-            sku: item.sku,
-            quantity: qty,
-            unitPrice: item.priceArs,
-            referenceId: result?.id || "—",
-          });
-          const texto = `Hola Samurai, te mando el comprobante de una venta que reporté: ${item.name} x${qty}.`;
-          await shareReceiptToWhatsapp({ blob, fileName: `comprobante-${item.sku}.png`, text: texto, whatsappNumber });
-        } catch (shareErr) {
-          console.error("Error compartiendo comprobante:", shareErr);
-        } finally {
-          setSharingReceipt(false);
-        }
-      }
     } catch (e) {
       setReportError(e.message || "No se pudo registrar la venta");
     } finally {
@@ -297,13 +272,6 @@ export function ItemModal({ item, onClose, money, onReportSale, onRequestMore, d
                         ? "Ya le emitimos el comprobante a Samurai en Contabilium, no hace falta que hagas nada más."
                         : "Ya le avisamos a Samurai, pero no pudimos facturarla sola en el momento — la van a facturar ellos a mano en breve."}
                     </p>
-                    {whatsappNumber && (
-                      <p className="mt-2 text-xs text-emerald-700">
-                        {sharingReceipt
-                          ? "📄 Generando el comprobante para WhatsApp…"
-                          : "📄 Te abrimos WhatsApp con el comprobante — mandalo para que quede el respaldo."}
-                      </p>
-                    )}
                   </div>
                 ) : (
                   <>
@@ -362,7 +330,7 @@ export function ItemModal({ item, onClose, money, onReportSale, onRequestMore, d
               <div className="rounded-2xl border border-sky-200 bg-sky-50 p-4">
                 {requested ? (
                   <p className="text-sm font-semibold text-sky-700">
-                    ✓ Pedido enviado a Samurai. Te va a llegar la confirmación por WhatsApp.
+                    ✓ Pedido enviado a Samurai.
                   </p>
                 ) : (
                   <>
@@ -387,7 +355,7 @@ export function ItemModal({ item, onClose, money, onReportSale, onRequestMore, d
                     </div>
                     {requestError && <p className="mt-2 text-xs text-rose-500">{requestError}</p>}
                     <p className="mt-2 text-[11px] text-slate-500">
-                      Genera un pedido a Samurai y te abre WhatsApp para confirmarlo con el vendedor.
+                      Genera un pedido de reposición a Samurai.
                     </p>
                   </>
                 )}

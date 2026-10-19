@@ -161,10 +161,14 @@ export type VendedorResumen = {
 // `vendedoresAsignados` en su doc de usuario) — lista liviana (solo
 // nombres), sin tocar Contabilium. El detalle pesado de cada uno se pide
 // aparte con getVendedorResumen, uno por uno.
-export async function getMisVendedores(): Promise<{
+// `distribuidorUid` es opcional — solo lo usa el admin/chofer desde el panel
+// de Vendedores para ver la cartera de OTRO distribuidor (ej. Alfredo), no
+// la propia. Un distribuidor normal lo ignora (o lo manda y el server lo
+// rechaza si no es el suyo).
+export async function getMisVendedores(distribuidorUid?: string): Promise<{
   vendedores: VendedorBasico[];
 }> {
-  return callFunction("getMisVendedores", {});
+  return callFunction("getMisVendedores", distribuidorUid ? { distribuidorUid } : {});
 }
 
 // Paso 1 del alta de cliente propio (ver distribuidorCrearCliente en
@@ -228,6 +232,14 @@ export type ResumenComisionVendedor = {
 // la de otro.
 export async function getResumenComisionVendedor(mes: string, vendedorUid?: string): Promise<ResumenComisionVendedor> {
   return callFunction("getResumenComisionVendedor", { mes, vendedorUid }, 170000);
+}
+
+// Excel de un mes puntual (Resumen + Viajes + Ventas) para descargar.
+export async function descargarResumenVendedorExcel(
+  mes: string,
+  vendedorUid?: string
+): Promise<{ ok: true; base64: string; filename: string }> {
+  return callFunction("descargarResumenVendedorExcel", { mes, vendedorUid }, 170000);
 }
 
 // Carga a mano cuántos viajes (Lavalle → su depósito) hizo en ese mes —
@@ -1375,6 +1387,8 @@ export async function cargarCobranzaACuentaManual(params: {
   forma?: string;
   banco?: string;
   idBanco?: number;
+  caja?: string;
+  idCaja?: number;
   nroRef?: string;
   observaciones?: string;
 }): Promise<{ ok: true; nroComprobante: string; idBanco: number; bancoNombre: string | null }> {

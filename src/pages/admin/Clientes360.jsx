@@ -10,6 +10,7 @@ import ChequeRow from "../../components/crm/ChequeRow";
 import { db, auth } from "../../firebase";
 import { useAuth } from "../../auth/AuthContext";
 import { subscribeCobranzas } from "../../services/cobranzas";
+import { subscribeBusinessDashboardDetail } from "../../services/comprobantes";
 import { nombreBanco, listaBancos } from "../../services/bancos";
 import { listAuditsByDeposito, getAuditProgramStart, nextAuditDate, isAuditOverdue, isAuditDueSoon, contarVistas } from "../../services/stockAudits";
 import AuditVideoPlayer from "../../components/stock/AuditVideoPlayer";
@@ -916,6 +917,10 @@ function RedDeVendedores({ distribuidorContabiliumId, actualizadoPorNombre }) {
   );
 }
 
+// Único uid para el que hoy existe la excepción de "Ocultar cuenta" — no es
+// una función general para cualquier cliente, ver el comentario donde se usa.
+const CELIA_UID_OCULTAR_CUENTA = "XPVE3KleRJhHY6OdLMssCKgJM0w2";
+
 export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
   const { user, profile } = useAuth();
   const puedeEditarNotas = puedeEditarNotasCheck(user?.email);
@@ -932,6 +937,12 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
   const [atribuyendoKey, setAtribuyendoKey] = useState(null); // `${facturaId}_${sku}` en curso
   const [atribuirError, setAtribuirError] = useState("");
   const [saldoTotal, setSaldoTotal] = useState(0);
+  // Ocultar saldo/facturas en Samurai mientras se corrige algo a mano en
+  // Contabilium (ej. un crédito que ya se resolvió por fuera del sistema
+  // pero todavía no se cargó ahí) — es solo una tapa visual en este panel,
+  // no toca ni corrige Contabilium, que sigue siendo la fuente real.
+  const [ocultarCuenta, setOcultarCuenta] = useState(null); // null=cargando, false=visible, {motivo,...}=oculto
+  const [businessDetail, setBusinessDetail] = useState(null); // porFactura con bicis por factura, para el contador de "Bicis vendidas"
   const [error, setError] = useState("");
   const [showCobranzas, setShowCobranzas] = useState(false);
   const [depositos, setDepositos] = useState([]);
@@ -977,6 +988,21 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
     getContabiliumDepositos()
       .then(setDepositos)
       .catch((e) => console.error("Error cargando depósitos:", e));
+  }, []);
+
+  useEffect(() => {
+    if (!cliente.id) {
+      setOcultarCuenta(false);
+      return;
+    }
+    const unsub = onSnapshot(doc(db, "users", cliente.id), (snap) => {
+      setOcultarCuenta(snap.data()?.ocultarCuentaEnSamurai || false);
+    });
+    return unsub;
+  }, [cliente.id]);
+
+  useEffect(() => {
+    return subscribeBusinessDashboardDetail(setBusinessDetail);
   }, []);
 
   const depositoDeCliente = useMemo(
@@ -1595,8 +1621,21 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
   }
 
   const loading = comprobantes === null || stock === null;
-  const saldoPendiente = saldoTotal;
-  const totalFacturado = (comprobantes || []).reduce((acc, c) => acc + Number(c.Total || 0), 0);
+  const saldoPendiente = ocultarCuenta?.activo ? 0 : saldoTotal;
+  const totalFacturado = ocultarCuenta?.activo ? 0 : (comprobantes || []).reduce((acc, c) => acc + Number(c.Total || 0), 0);
+  // Bicis vendidas: suma de la cantidad de bicis de cada factura real
+  // (FCA/FCB/FCC) de este cliente — sale del mismo detalle que ya usan
+  // Resumen Mensual y Contador Diario (meta/businessDashboardDetail,
+  // sincronizado), no hay que pedirle de nuevo los ítems a Contabilium
+  // factura por factura acá.
+  const bicisVendidas = ocultarCuenta?.activo
+    ? 0
+    : (businessDetail?.porFactura || [])
+        .filter((f) => f.idCliente === cliente.contabiliumId)
+        .reduce((acc, f) => acc + Number(f.bicis || 0), 0);
+  const cantidadFacturas = ocultarCuenta?.activo ? 0 : (comprobantes || []).length;
+  const totalCobranzas = ocultarCuenta?.activo ? 0 : cliente.pagado || 0;
+  const cobranzasListVisible = ocultarCuenta?.activo ? [] : cliente.cobranzasList || [];
   const stockBicis = (stock || []).filter((s) => (s.category || "").toUpperCase() === "BICICLETAS");
   // stockDisponible ya viene del backend restando las ventas reportadas
   // todavía no facturadas (getPendingSoldBySku) — usarlo acá evita que este
@@ -1904,6 +1943,40 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
                 📦 Pedir bici
               </a>
             )}
+            {/* "Ocultar cuenta" no se muestra en todas las fichas — es una
+                excepción puntual (hoy solo Celia Antonella Acosta, mientras
+                se corrige su saldo en Contabilium), no un botón genérico
+                para cualquier cliente. */}
+            {!soloLectura && (cliente.id === CELIA_UID_OCULTAR_CUENTA || ocultarCuenta?.activo) && (
+              <button
+                onClick={async () => {
+                  if (ocultarCuenta?.activo) {
+                    await updateDoc(doc(db, "users", cliente.id), { ocultarCuentaEnSamurai: { activo: false } });
+                    return;
+                  }
+                  const motivo = window.prompt(
+                    "¿Por qué ocultás el saldo y las facturas de este cliente en Samurai? (queda registrado, Contabilium no se toca)"
+                  );
+                  if (motivo === null) return;
+                  await updateDoc(doc(db, "users", cliente.id), {
+                    ocultarCuentaEnSamurai: {
+                      activo: true,
+                      motivo: motivo.trim(),
+                      creadoPorNombre: profile?.name || user?.email || "Admin",
+                      createdAt: serverTimestamp(),
+                    },
+                  });
+                }}
+                title={ocultarCuenta?.activo ? `Oculto desde Samurai — motivo: ${ocultarCuenta.motivo || "(sin motivo)"}` : "Mostrar en Samurai saldo $0 y sin facturas, mientras se corrige en Contabilium"}
+                className={`rounded-xl px-3 py-1.5 text-xs font-semibold transition ${
+                  ocultarCuenta?.activo
+                    ? "bg-rose-100 text-rose-700 hover:bg-rose-200 dark:bg-rose-500/10 dark:text-rose-400"
+                    : "border border-slate-200 text-slate-500 hover:border-slate-300 dark:border-neutral-700 dark:text-neutral-400"
+                }`}
+              >
+                {ocultarCuenta?.activo ? "👁️ Cuenta oculta" : "🙈 Ocultar cuenta"}
+              </button>
+            )}
             <button
               onClick={onClose}
               className="rounded-full p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:text-neutral-500 dark:hover:bg-neutral-800 dark:hover:text-neutral-300"
@@ -1947,6 +2020,12 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
                 source="Suma de facturas (Contabilium), historial completo"
               />
               <SummaryTile
+                label="Bicis vendidas"
+                value={bicisVendidas}
+                accent="sky"
+                source="Suma de bicis en todas las facturas reales, historial completo"
+              />
+              <SummaryTile
                 label={saldoPendiente > 0 ? "Debe" : saldoPendiente < 0 ? "Saldo" : "Al día"}
                 value={money(saldoPendiente)}
                 accent={saldoPendiente > 0 ? "red" : "green"}
@@ -1958,11 +2037,11 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
                     : "Sin saldo pendiente en ningún sentido"
                 }
               />
-              <SummaryTile label="Facturas" value={(comprobantes || []).length} source="Cantidad de facturas, historial completo" />
+              <SummaryTile label="Facturas" value={cantidadFacturas} source="Cantidad de facturas, historial completo" />
               <button onClick={() => setShowCobranzas((v) => !v)} className="w-full text-left">
                 <SummaryTile
                   label={`Cobranzas ${showCobranzas ? "▲" : "▼"}`}
-                  value={money(cliente.pagado || 0)}
+                  value={money(totalCobranzas)}
                   accent="sky"
                   source="Tocá para ver cada cobranza — historial independiente, no descuenta contra las facturas de arriba"
                   clickable
@@ -2131,12 +2210,12 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
 
             {showCobranzas && (
               <div className="mt-3">
-                <p className="mb-2 text-sm font-semibold text-slate-900 dark:text-white">Cobranzas ({cliente.cobranzasList?.length || 0})</p>
-                {(cliente.cobranzasList || []).length === 0 ? (
+                <p className="mb-2 text-sm font-semibold text-slate-900 dark:text-white">Cobranzas ({cobranzasListVisible.length})</p>
+                {cobranzasListVisible.length === 0 ? (
                   <p className="text-sm text-slate-400 dark:text-neutral-500">Sin cobranzas sincronizadas para este CUIT.</p>
                 ) : (
                   <div className="space-y-1.5">
-                    {cliente.cobranzasList.map((c) => (
+                    {cobranzasListVisible.map((c) => (
                       <div
                         key={c.id}
                         className="rounded-xl border border-sky-100 bg-sky-50/50 px-3 py-2 text-sm dark:border-sky-900/50 dark:bg-sky-950/20"
@@ -2257,7 +2336,9 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
                   }}
                 />
               )}
-              {(comprobantes || []).length === 0 ? (
+              {ocultarCuenta?.activo ? (
+                <p className="text-sm text-slate-400 dark:text-neutral-500">Sin facturas.</p>
+              ) : (comprobantes || []).length === 0 ? (
                 <p className="text-sm text-slate-400 dark:text-neutral-500">Sin facturas en los últimos 2 años.</p>
               ) : (soloImpagas ? comprobantes.filter((c) => c.Saldo > 0) : comprobantes).length === 0 ? (
                 <p className="text-sm text-slate-400 dark:text-neutral-500">No hay facturas impagas.</p>
@@ -3192,8 +3273,14 @@ function ConfirmarPagoForm({ pago, contabiliumId, facturasAbiertas, onClose, onD
 function CobranzaACuentaForm({ contabiliumId, onClose, onDone }) {
   const [importe, setImporte] = useState("");
   const [fecha, setFecha] = useState(() => new Date().toISOString().slice(0, 10));
-  const { bancos, cargando: cargandoBancos } = useBancosYCajasPropios();
+  const { bancos, cajas, cargando: cargandoBancos } = useBancosYCajasPropios();
+  // Misma distinción que tiene Contabilium en "Forma de cobro": si es
+  // Efectivo pide una Caja propia, si es Transferencia (o cualquier otra
+  // forma con cuenta) pide un Banco propio — antes esto solo tenía el
+  // selector de banco, sin la opción de efectivo/caja.
+  const [formaDeCobro, setFormaDeCobro] = useState("Transferencia");
   const [idBanco, setIdBanco] = useState("");
+  const [idCaja, setIdCaja] = useState("");
   const [nroRef, setNroRef] = useState("");
   const [observaciones, setObservaciones] = useState("");
   const [enviando, setEnviando] = useState(false);
@@ -3201,11 +3288,20 @@ function CobranzaACuentaForm({ contabiliumId, onClose, onDone }) {
   const [resultado, setResultado] = useState(null);
   const [leyendoComprobante, setLeyendoComprobante] = useState(false);
   const [lecturaComprobante, setLecturaComprobante] = useState(null);
+  const [chequesDisponibles, setChequesDisponibles] = useState(null);
+  const [chequeRefId, setChequeRefId] = useState("");
 
   useEffect(() => {
     if (!cargandoBancos && !idBanco && bancos.length) setIdBanco(String(bancos[0].id));
+    if (!cargandoBancos && !idCaja && cajas.length) setIdCaja(String(cajas[0].id));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cargandoBancos, bancos]);
+  }, [cargandoBancos, bancos, cajas]);
+
+  useEffect(() => {
+    listarChequesDisponiblesContabilium()
+      .then((r) => setChequesDisponibles(r.cheques))
+      .catch(() => setChequesDisponibles([]));
+  }, []);
 
   // Subís la foto/captura de la transferencia y se lee sola para
   // precargar importe/fecha/banco/referencia — igual que en el recibo de
@@ -3245,8 +3341,10 @@ function CobranzaACuentaForm({ contabiliumId, onClose, onDone }) {
       setError("Este cliente no está vinculado a Contabilium.");
       return;
     }
-    if (!importe || Number(importe) <= 0 || !fecha || !idBanco) {
-      setError("Completá importe, fecha y banco propio.");
+    const esEfectivo = formaDeCobro === "Efectivo";
+    const esCheque = formaDeCobro === "Cheque";
+    if (!importe || Number(importe) <= 0 || !fecha || (esEfectivo && !idCaja) || (!esEfectivo && !esCheque && !idBanco)) {
+      setError(esEfectivo ? "Completá importe, fecha y caja propia." : esCheque ? "Completá importe, fecha y N° de cheque." : "Completá importe, fecha y banco propio.");
       return;
     }
     setEnviando(true);
@@ -3255,7 +3353,9 @@ function CobranzaACuentaForm({ contabiliumId, onClose, onDone }) {
         idPersona: contabiliumId,
         importe: Number(importe),
         fecha,
-        idBanco: Number(idBanco),
+        forma: formaDeCobro,
+        idBanco: esEfectivo || esCheque ? undefined : Number(idBanco),
+        idCaja: esEfectivo ? Number(idCaja) : undefined,
         nroRef: nroRef.trim() || undefined,
         observaciones: observaciones.trim() || undefined,
       });
@@ -3291,7 +3391,7 @@ function CobranzaACuentaForm({ contabiliumId, onClose, onDone }) {
           </span>
           <input
             type="file"
-            accept="image/*"
+            accept="image/*,application/pdf"
             disabled={leyendoComprobante}
             onChange={(e) => handleCargarComprobante(e.target.files?.[0] || null)}
             className="hidden"
@@ -3322,16 +3422,60 @@ function CobranzaACuentaForm({ contabiliumId, onClose, onDone }) {
         <input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-emerald-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white" />
       </div>
       <div>
-        <label className="mb-1 block text-slate-500 dark:text-neutral-400">Banco propio *</label>
-        <select value={idBanco} onChange={(e) => setIdBanco(e.target.value)} disabled={cargandoBancos} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-emerald-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white">
-          {cargandoBancos && <option value="">Cargando…</option>}
-          {bancos.map((b) => (
-            <option key={b.id} value={b.id}>{b.nombre}</option>
-          ))}
+        <label className="mb-1 block text-slate-500 dark:text-neutral-400">Forma de cobro *</label>
+        <select value={formaDeCobro} onChange={(e) => setFormaDeCobro(e.target.value)} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-emerald-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white">
+          <option value="Transferencia">Transferencia</option>
+          <option value="Depósito">Depósito</option>
+          <option value="Débito">Débito</option>
+          <option value="Cheque">Cheque</option>
+          <option value="Efectivo">Efectivo</option>
         </select>
       </div>
+      {formaDeCobro === "Efectivo" && (
+        <div>
+          <label className="mb-1 block text-slate-500 dark:text-neutral-400">Caja propia *</label>
+          <select value={idCaja} onChange={(e) => setIdCaja(e.target.value)} disabled={cargandoBancos} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-emerald-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white">
+            {cargandoBancos && <option value="">Cargando…</option>}
+            {cajas.map((c) => (
+              <option key={c.id} value={c.id}>{c.nombre}</option>
+            ))}
+          </select>
+        </div>
+      )}
+      {formaDeCobro !== "Efectivo" && formaDeCobro !== "Cheque" && (
+        <div>
+          <label className="mb-1 block text-slate-500 dark:text-neutral-400">Banco propio *</label>
+          <select value={idBanco} onChange={(e) => setIdBanco(e.target.value)} disabled={cargandoBancos} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-emerald-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white">
+            {cargandoBancos && <option value="">Cargando…</option>}
+            {bancos.map((b) => (
+              <option key={b.id} value={b.id}>{b.nombre}</option>
+            ))}
+          </select>
+        </div>
+      )}
+      {formaDeCobro === "Cheque" && chequesDisponibles && chequesDisponibles.length > 0 && (
+        <div className="sm:col-span-2">
+          <label className="mb-1 block text-slate-500 dark:text-neutral-400">
+            Cheque real de Contabilium (opcional — solo para dejar la referencia, no lo aplica de verdad)
+          </label>
+          <select
+            value={chequeRefId}
+            onChange={(e) => {
+              setChequeRefId(e.target.value);
+              const ch = chequesDisponibles.find((c) => String(c.id) === e.target.value);
+              if (ch) setNroRef(`Proviene del cheque ${ch.codigo} — ${ch.banco}`);
+            }}
+            className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-emerald-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+          >
+            <option value="">Sin referenciar ningún cheque</option>
+            {chequesDisponibles.map((c) => (
+              <option key={c.id} value={c.id}>{c.banco} — Nro:{c.codigo} — {money(c.importe)}</option>
+            ))}
+          </select>
+        </div>
+      )}
       <div>
-        <label className="mb-1 block text-slate-500 dark:text-neutral-400">Referencia</label>
+        <label className="mb-1 block text-slate-500 dark:text-neutral-400">{formaDeCobro === "Cheque" ? "N° de cheque *" : "Referencia"}</label>
         <input type="text" value={nroRef} onChange={(e) => setNroRef(e.target.value)} className="w-full rounded-lg border border-slate-200 px-2 py-1.5 outline-none focus:border-emerald-400 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white" />
       </div>
       <div className="sm:col-span-2">
@@ -3706,7 +3850,7 @@ function ReciboForm({ factura, contabiliumId, clienteName, clienteId, vendedor, 
           </span>
           <input
             type="file"
-            accept="image/*"
+            accept="image/*,application/pdf"
             disabled={leyendoComprobante}
             onChange={(e) => handleCargarComprobante(e.target.files?.[0] || null)}
             className="hidden"
@@ -4249,7 +4393,7 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
                             {p.imageUrl && <img src={p.imageUrl} alt="" className="h-full w-full object-contain" />}
                           </div>
                           <div className="min-w-0 flex-1">
-                            <p className="truncate font-medium text-slate-900 dark:text-white">{p.name}</p>
+                            <p className="break-words font-medium text-slate-900 dark:text-white">{p.name}</p>
                             <p className="text-xs text-slate-400 dark:text-neutral-500">SKU {p.sku} · {money(p.priceArs)}</p>
                           </div>
                           {stockPorSku && (
