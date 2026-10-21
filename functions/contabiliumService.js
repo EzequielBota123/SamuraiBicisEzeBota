@@ -213,7 +213,7 @@ async function getComprobantesByClientId(email, apiKey, contabiliumId, {
   // Incluye las variantes B y C de factura/nota, no solo A — Contabilium a
   // veces emite Factura B (ver diagTiposComprobante), y quedaban afuera del
   // saldo de cuenta corriente si solo se pedía FCA.
-  tipos = ["FCA", "FCB", "FCC", "NCA", "NCB", "NCC", "NDA", "NDB", "NDC"],
+  tipos = ["FCA", "FCB", "FCC", "NCA", "NCB", "NCC", "NCT", "NDA", "NDB", "NDC"],
   desde = null,
   hasta = null,
 } = {}) {
@@ -320,7 +320,7 @@ async function debugSaldoByCuit(email, apiKey, cuit) {
   const parseAr = (v) => Number(String(v || "0").replace(/\./g, "").replace(",", "."));
   const saldoTotal = comprobantes.reduce((acc, c) => {
     const saldoAbs = parseAr(c.Saldo);
-    return acc + (c.TipoFc === "NCA" ? -saldoAbs : saldoAbs);
+    return acc + (["NCA", "NCB", "NCC", "NCT"].includes(c.TipoFc) ? -saldoAbs : saldoAbs);
   }, 0);
   return {
     contabiliumId: cliente.Id,
@@ -548,6 +548,37 @@ async function probeMovimientosDepositoEndpoints(email, apiKey) {
       const res = await fetch(`${API_BASE}/${path}`, { headers: { Authorization: `Bearer ${token}` } });
       const text = await res.text();
       out.get[path] = { status: res.status, body: text.slice(0, 300) };
+    } catch (err) {
+      out.get[path] = { error: String(err) };
+    }
+  }
+  return out;
+}
+
+// Sondeo de endpoints de compras/proveedores/alta de stock inicial — para
+// investigar si Contabilium registra en algún lado el precio con el que
+// entró cada unidad (necesario para reconstruir una valorización de stock
+// histórica a una fecha pasada, pedido 21/10/2026).
+async function probeComprasEndpoints(email, apiKey) {
+  const token = await getAccessToken(email, apiKey);
+  const candidatosGet = [
+    "compras", "compras/search",
+    "ordenescompra", "ordenescompra/search", "ordenesdecompra", "ordenesdecompra/search",
+    "facturascompra", "facturascompra/search", "facturasdecompra", "facturasdecompra/search",
+    "comprobantescompra", "comprobantescompra/search",
+    "proveedores", "proveedores/search",
+    "ingresos", "ingresos/search", "ingresosdestock", "ingresosdestock/search",
+    "altastock", "altastock/search", "altadestock", "altadestock/search",
+    "remitoscompra", "remitoscompra/search",
+    "stock/ingreso", "stock/ingresos", "stock/altas", "stock/alta",
+    "inventarios/compras", "inventarios/ingresos", "inventarios/altas",
+  ];
+  const out = { get: {} };
+  for (const path of candidatosGet) {
+    try {
+      const res = await fetch(`${API_BASE}/${path}`, { headers: { Authorization: `Bearer ${token}` } });
+      const text = await res.text();
+      out.get[path] = { status: res.status, body: text.slice(0, 400) };
     } catch (err) {
       out.get[path] = { error: String(err) };
     }
@@ -1075,4 +1106,4 @@ async function updateConcepto(email, apiKey, id, concepto) {
   return body;
 }
 
-module.exports = { getAllConceptos, getClientById, searchClientByDoc, getComprobantesByClientId, getAllComprobantes, getComprobanteById, getStockByDeposito, getDepositosViaStockBySKU, searchClientesByFiltro, getAllClientes, getCobranzasList, getCobranzaById, getStockDisponibleBySKU, getStockDesglosadoBySKU, buscarCobranzasPorClientePaginado, testPageIndexRaw, probeBancosEndpoints, probeMovimientosDepositoEndpoints, probeChequesEndpoints, debugComprobantesPaging, debugSaldoByCuit, debugClienteSearchRaw, debugProbeCcEndpoints, debugProbeRemitosEndpoints, debugProbeCrearComprobanteEndpoints, debugProbeCrearComprobantePayload, debugProbeStockDescuento, emitirFacturaElectronica, cobrarComprobante, crearComprobante, getDatosAfip, deleteComprobante, updateCliente, crearCliente, updateConcepto };
+module.exports = { getAllConceptos, getClientById, searchClientByDoc, getComprobantesByClientId, getAllComprobantes, getComprobanteById, getStockByDeposito, getDepositosViaStockBySKU, searchClientesByFiltro, getAllClientes, getCobranzasList, getCobranzaById, getStockDisponibleBySKU, getStockDesglosadoBySKU, buscarCobranzasPorClientePaginado, testPageIndexRaw, probeBancosEndpoints, probeMovimientosDepositoEndpoints, probeChequesEndpoints, probeComprasEndpoints, debugComprobantesPaging, debugSaldoByCuit, debugClienteSearchRaw, debugProbeCcEndpoints, debugProbeRemitosEndpoints, debugProbeCrearComprobanteEndpoints, debugProbeCrearComprobantePayload, debugProbeStockDescuento, emitirFacturaElectronica, cobrarComprobante, crearComprobante, getDatosAfip, deleteComprobante, updateCliente, crearCliente, updateConcepto };

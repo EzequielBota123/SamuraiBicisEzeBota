@@ -907,8 +907,15 @@ exports.syncClientProfile = onRequest(
 // (confirmado con diagTiposComprobante: 11 FCB entre 703 comprobantes), y
 // durante un tiempo esas facturas quedaron afuera de todos estos cálculos
 // (bug detectado en Clientes 360 con Nicolás Román Paradiso, sept/2026).
-const TIPOS_FACTURA_NOTA = ["FCA", "FCB", "FCC", "NCA", "NCB", "NCC", "NDA", "NDB", "NDC"];
+// NCT = nota de crédito sobre una Cotización (COT), no sobre una factura real
+// (NCA/B/C) — mismo concepto, tipo de documento distinto. Faltaba en todos
+// lados: una NC hecha sobre un COT quedaba afuera de los cálculos de "vendido"
+// y no restaba nada (bug detectado 20/10/2026, Juliana Peralta López).
+const TIPOS_FACTURA_NOTA = ["FCA", "FCB", "FCC", "NCA", "NCB", "NCC", "NCT", "NDA", "NDB", "NDC"];
 const TIPOS_SALDO_CON_COT = [...TIPOS_FACTURA_NOTA, "COT"];
+// Toda nota de crédito (sobre factura real o sobre cotización) resta —
+// antes solo se negaba "NCA", dejando NCB/NCC/NCT contando en positivo.
+const TIPOS_NC_NEGATIVOS = ["NCA", "NCB", "NCC", "NCT"];
 
 async function computeSaldoTotal(db, contabiliumId, rawComprobantes) {
   const parseAr = (v) => Number(String(v || "0").replace(/\./g, "").replace(",", "."));
@@ -985,7 +992,7 @@ exports.getClientComprobantes = onRequest(
           Tipo:  c.TipoFc,
           Fecha: c.FechaEmision,
           Total: parseArNumber(c.ImporteTotalNeto),
-          Saldo: c.TipoFc === "NCA" ? -saldoAbs : saldoAbs,
+          Saldo: TIPOS_NC_NEGATIVOS.includes(c.TipoFc) ? -saldoAbs : saldoAbs,
         };
       });
 
@@ -1538,11 +1545,40 @@ exports.adminCrearClienteContabilium = onRequest(
     const staffUid = await requireStaff(req, res);
     if (!staffUid) return;
     try {
-      const { documento, telefono, email } = req.body || {};
-      if (!documento) return res.status(400).json({ error: "documento (CUIT) requerido" });
-
+      const { documento, telefono, email, nombre } = req.body || {};
       const contabiliumEmail = CONTABILIUM_EMAIL.value();
       const apiKey = CONTABILIUM_API_KEY.value();
+
+      // Sin CUIT: alta manual mínima (consumidor final), sin pasar por AFIP —
+      // para depósitos/clientes sin documento fiscal (ej. puntos de venta
+      // propios de la marca, como "Samurai Adrogue"). `crearCliente` no
+      // devuelve un Id consistente, así que se lo busca después por nombre.
+      if (!documento) {
+        if (!nombre || !String(nombre).trim()) {
+          return res.status(400).json({ error: "Sin documento, falta nombre (RazonSocial) para el alta manual" });
+        }
+        const razonSocial = String(nombre).trim();
+        const payload = {
+          RazonSocial: razonSocial,
+          NombreFantasia: razonSocial,
+          CondicionIva: "CF",
+          TipoDoc: "DNI",
+          NroDoc: "",
+          Pais: "Argentina",
+          Telefono: telefono || "",
+          Email: email || "",
+          Personeria: "F",
+        };
+        await crearCliente(contabiliumEmail, apiKey, payload);
+        await new Promise((r) => setTimeout(r, 1500));
+        const candidatos = await searchClientesByFiltro(contabiliumEmail, apiKey, razonSocial);
+        const creado = candidatos.find((c) => (c.RazonSocial || "").trim().toUpperCase() === razonSocial.toUpperCase());
+        if (!creado) {
+          return res.status(500).json({ error: "El cliente se creó pero no se pudo confirmar su Id — revisalo a mano en Contabilium", payload });
+        }
+        return res.json({ ok: true, payload, contabiliumId: creado.Id });
+      }
+
       const afip = await getDatosAfip(contabiliumEmail, apiKey, documento);
       if (!afip || !afip.RazonSocial) {
         return res.status(404).json({ error: "AFIP no devolvió datos para ese CUIT" });
@@ -2412,7 +2448,7 @@ async function buildVendedorResumen(db, email, apiKey, vendedorUid) {
   if (v.contabiliumId) {
     saldoTotal = comprobantesInfo.reduce((acc, c) => {
       const saldoAbs = parseArNumber(c.Saldo);
-      return acc + (c.TipoFc === "NCA" ? -saldoAbs : saldoAbs);
+      return acc + (TIPOS_NC_NEGATIVOS.includes(c.TipoFc) ? -saldoAbs : saldoAbs);
     }, 0);
     facturasRecientes = comprobantesInfo
       .slice()
@@ -2577,8 +2613,12 @@ async function buildResumenComision(db, email, apiKey, webEmail, webPassword, ta
   const comisionPorcentaje = Number(target.comisionPorcentaje ?? 5);
   const tarifaFletePorViaje = Number(target.tarifaFletePorViaje ?? 10000);
 
-  const desde = `${mes}-01`;
-  const hasta = ultimoDiaDelMes(mes);
+  // "todo" = sin recorte de fecha, para pedir el historial completo en vez
+  // de un mes puntual (ej. "todas las bicis que Cuchi le entregó a sus
+  // clientes en general").
+  const esTodoElHistorial = mes === "todo";
+  const desde = esTodoElHistorial ? "2000-01-01" : `${mes}-01`;
+  const hasta = esTodoElHistorial ? new Date().toISOString().slice(0, 10) : ultimoDiaDelMes(mes);
 
   // Viajes del mes: ya no se cargan a mano — se cuentan solos los
   // movimientos de stock reales de Contabilium (la misma fuente que usa el
@@ -2598,11 +2638,24 @@ async function buildResumenComision(db, email, apiKey, webEmail, webPassword, ta
   // cargado, se sigue derivando del nombre del vendedor como antes (caso
   // Cuchi, que sí sale de su propio depósito).
   const nombreVendedor = (target.contabiliumDepositoNombre || target.name || "").trim();
-  const palabraClave = nombreVendedor.split(/\s+/).filter((w) => w.length >= 5)[0] || nombreVendedor;
-  const palabrasOrigen = Array.isArray(target.origenesViajes) && target.origenesViajes.filter(Boolean).length
-    ? target.origenesViajes.filter(Boolean)
-    : [palabraClave];
+  // Palabra MÁS LARGA del nombre (en general el apellido), no la primera —
+  // un nombre de pila corto y común puede coincidir con el nombre de un
+  // cliente/depósito de otra persona y generar falsos positivos.
+  const palabraClave = nombreVendedor.split(/\s+/).filter((w) => w.length >= 5).sort((a, b) => b.length - a.length)[0] || nombreVendedor;
+  const origenesExplicitos = Array.isArray(target.origenesViajes) ? target.origenesViajes.filter(Boolean) : [];
+  const palabrasOrigen = origenesExplicitos.length ? origenesExplicitos : [palabraClave];
+  // Si el vendedor tiene `origenesViajes` cargado a mano (Jíbaro, Credifin,
+  // Vito — el grupo "solo flete" de la grilla de logística), es porque su
+  // trabajo es mover stock ENTRE depósitos propios de Samurai (ej. Cañuelas
+  // → Lavalle) — ahí no hay que excluir el destino aunque sea otro depósito
+  // propio, o se pierden viajes reales (confirmado el 19/10/2026: un viaje
+  // Cañuelas → Lavalle no se contaba). Para el resto (ej. Cuchi, que deriva
+  // su palabra clave del propio nombre) sí corresponde excluir destino
+  // propio, porque ahí sí distingue una entrega real a un cliente de un
+  // reacomodo interno.
+  const esLogisticaSoloFlete = origenesExplicitos.length > 0;
   let viajes = 0;
+  let unidadesEntregadas = 0;
   if (palabrasOrigen.length && webEmail && webPassword) {
     try {
       const { obtenerMovimientosStock } = require("./contabiliumWebAutomation");
@@ -2611,19 +2664,30 @@ async function buildResumenComision(db, email, apiKey, webEmail, webPassword, ta
       const movimientos = await obtenerMovimientosStock({
         db, email: webEmail, password: webPassword, fechaDesde: desde, fechaHasta: hasta,
       });
+      // Se agrupa por el "id" real del movimiento en Contabilium (varios
+      // productos de un mismo viaje comparten id) — "observaciones" no es un
+      // campo real de la respuesta (el que sí viene es "descripcion"), así
+      // que agrupar por fecha+observaciones como antes subcontaba/sobrecontaba
+      // viajes.
       const viajesUnicos = new Set();
       for (const m of movimientos) {
         const origen = (m.origen || "").trim();
         const destino = (m.destino || "").trim();
-        if (!origenVendedorRe.test(origen) || depositoPropioRe.test(destino)) continue;
-        viajesUnicos.add(`${m.fecha || ""}__${m.observaciones || ""}`);
+        if (!origenVendedorRe.test(origen)) continue;
+        if (!esLogisticaSoloFlete && depositoPropioRe.test(destino)) continue;
+        viajesUnicos.add(m.id);
+        if (/BIC\b/i.test(m.codigoNombre || "")) unidadesEntregadas += Number(m.cantidad || 0);
       }
       viajes = viajesUnicos.size;
     } catch (err) {
       console.error("[buildResumenComision] no se pudo traer movimientos de stock para contar viajes:", err.message);
     }
   }
-  const fleteTotal = viajes * tarifaFletePorViaje;
+  // Flete por UNIDAD entregada (bicicleta), no por viaje — $10.000 por
+  // bici, confirmado 21/10/2026 (antes se cobraba por viaje, que era
+  // incorrecto: un viaje puede llevar varias bicis y cobraba lo mismo que
+  // uno con una sola).
+  const fleteTotal = unidadesEntregadas * tarifaFletePorViaje;
 
   let ventasTotal = 0;
   // Detalle bici por bici (modelo + cliente + comisión de esa venta puntual)
@@ -2644,20 +2708,26 @@ async function buildResumenComision(db, email, apiKey, webEmail, webPassword, ta
     if (contabiliumIds.size > 0) {
       const comprobantes = await getAllComprobantes(email, apiKey, { desde, hasta });
       const relevantes = comprobantes.filter(
-        (c) => contabiliumIds.has(c.IdCliente) && ["FCA", "FCB", "FCC", "NCA", "NCB", "NCC"].includes(c.TipoFc)
+        (c) => contabiliumIds.has(c.IdCliente) && ["FCA", "FCB", "FCC", "COT", "NCA", "NCB", "NCC", "NCT"].includes(c.TipoFc)
       );
-      for (const c of relevantes) {
-        const signo = c.TipoFc === "NCA" ? -1 : 1;
+      // Antes pedía el detalle de cada comprobante UNO POR UNO con 150ms de
+      // pausa fija entre cada uno — con muchos comprobantes (ej. "Informe
+      // completo" de varios meses) eso solo ya tardaba más de un minuto.
+      // Contabilium rate-limita fuerte este endpoint (confirmado en otros
+      // lugares del código), así que en vez de sacar la pausa del todo se
+      // baja a una concurrencia chica (3 a la vez) con una pausa corta —
+      // sigue siendo mucho más rápido pero sin arriesgarse a tirar 429.
+      const resultadosComprobantes = await mapWithConcurrency(relevantes, 3, async (c) => {
+        const signo = TIPOS_NC_NEGATIVOS.includes(c.TipoFc) ? -1 : 1;
         const montoComprobante = parseArNumber(c.ImporteTotalNeto) * signo;
-        ventasTotal += montoComprobante;
-
         const nombreCliente = nombrePorContabiliumId.get(c.IdCliente) || c.RazonSocial || "(sin nombre)";
+        const entries = [];
         try {
           const full = await getComprobanteById(email, apiKey, c.Id);
           const items = full?.Items || [];
           for (const it of items) {
             const montoItem = (Number(it.Total ?? (Number(it.PrecioUnitario) || 0) * (Number(it.Cantidad) || 0)) || 0) * signo;
-            detalle.push({
+            entries.push({
               cliente: nombreCliente,
               modelo: it.Concepto || it.Descripcion || "—",
               cantidad: Number(it.Cantidad || 0),
@@ -2671,9 +2741,9 @@ async function buildResumenComision(db, email, apiKey, webEmail, webPassword, ta
         } catch (err) {
           console.warn("[buildResumenComision] no se pudo traer el detalle del comprobante", c.Id, err.message);
           // Sin el detalle de items no queda registro bici por bici, pero el
-          // comprobante entero ya se sumó a ventasTotal — al menos el total
+          // comprobante entero ya se suma a ventasTotal — al menos el total
           // agregado no queda mal, solo el desglose de esa factura puntual.
-          detalle.push({
+          entries.push({
             cliente: nombreCliente,
             modelo: `(no se pudo traer el detalle de ${c.Numero})`,
             cantidad: null,
@@ -2684,7 +2754,12 @@ async function buildResumenComision(db, email, apiKey, webEmail, webPassword, ta
             fecha: c.FechaEmision,
           });
         }
-        await new Promise((r) => setTimeout(r, 150));
+        await new Promise((r) => setTimeout(r, 50));
+        return { montoComprobante, entries };
+      });
+      for (const r of resultadosComprobantes) {
+        ventasTotal += r.montoComprobante;
+        detalle.push(...r.entries);
       }
     }
   }
@@ -2697,6 +2772,7 @@ async function buildResumenComision(db, email, apiKey, webEmail, webPassword, ta
   return {
     mes,
     viajes,
+    unidadesEntregadas,
     tarifaFletePorViaje,
     fleteTotal,
     comisionPorcentaje,
@@ -2712,7 +2788,7 @@ exports.getResumenComisionVendedor = onRequest(
   // El desglose bici por bici pide el detalle de cada comprobante por
   // separado (getComprobanteById) — con varias facturas en el mes puede
   // tardar más que el timeout corto original.
-  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 180 },
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 180, memory: "1GiB", concurrency: 1 },
   async (req, res) => {
     setCorsHeaders(req, res);
     if (req.method === "OPTIONS") return res.status(204).send("");
@@ -2730,7 +2806,7 @@ exports.getResumenComisionVendedor = onRequest(
 
     try {
       const { mes, vendedorUid } = req.body || {};
-      if (!mes || !/^\d{4}-\d{2}$/.test(mes)) return res.status(400).json({ error: "Falta mes (formato YYYY-MM)" });
+      if (!mes || (mes !== "todo" && !/^\d{4}-\d{2}$/.test(mes))) return res.status(400).json({ error: "Falta mes (formato YYYY-MM, o todo para el historial completo)" });
 
       const db = admin.firestore();
       let targetUid = uid;
@@ -2772,7 +2848,7 @@ exports.getResumenComisionVendedor = onRequest(
 // — el campo "observaciones" que usaba buildResumenComision para contar
 // viajes no existe en la respuesta real, el que sí viene es "descripcion").
 exports.descargarResumenVendedorExcel = onRequest(
-  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 180 },
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 180, memory: "1GiB", concurrency: 1 },
   async (req, res) => {
     setCorsHeaders(req, res);
     if (req.method === "OPTIONS") return res.status(204).send("");
@@ -2790,7 +2866,7 @@ exports.descargarResumenVendedorExcel = onRequest(
 
     try {
       const { mes, vendedorUid } = req.body || {};
-      if (!mes || !/^\d{4}-\d{2}$/.test(mes)) return res.status(400).json({ error: "Falta mes (formato YYYY-MM)" });
+      if (!mes || (mes !== "todo" && !/^\d{4}-\d{2}$/.test(mes))) return res.status(400).json({ error: "Falta mes (formato YYYY-MM, o todo para el historial completo)" });
 
       const db = admin.firestore();
       let targetUid = uid;
@@ -2820,10 +2896,16 @@ exports.descargarResumenVendedorExcel = onRequest(
       const { obtenerMovimientosStock } = require("./contabiliumWebAutomation");
       const movimientos = await obtenerMovimientosStock({ db, email: webEmail, password: webPassword, fechaDesde: desde, fechaHasta: hasta });
 
-      const palabraClave = nombreVendedor.split(/\s+/).filter((w) => w.length >= 5)[0] || nombreVendedor;
-      const palabrasOrigen = Array.isArray(target.origenesViajes) && target.origenesViajes.filter(Boolean).length
-        ? target.origenesViajes.filter(Boolean)
-        : [palabraClave];
+      // Palabra MÁS LARGA del nombre (en general el apellido), no la primera —
+  // un nombre de pila corto y común puede coincidir con el nombre de un
+  // cliente/depósito de otra persona y generar falsos positivos.
+  const palabraClave = nombreVendedor.split(/\s+/).filter((w) => w.length >= 5).sort((a, b) => b.length - a.length)[0] || nombreVendedor;
+      const origenesExplicitos = Array.isArray(target.origenesViajes) ? target.origenesViajes.filter(Boolean) : [];
+      const palabrasOrigen = origenesExplicitos.length ? origenesExplicitos : [palabraClave];
+      // Ver comentario en buildResumenComision: con origenesViajes cargado
+      // (grupo "solo flete" de la grilla de logística) no se excluye destino
+      // propio, porque ahí el trabajo es mover entre depósitos de Samurai.
+      const esLogisticaSoloFlete = origenesExplicitos.length > 0;
       const origenRe = new RegExp(palabrasOrigen.map(escapeRegExpBackend).join("|"), "i");
       const depositoPropioRe = /lavalle|temperley|ca[ñn]uelas|credifin/i;
 
@@ -2831,7 +2913,8 @@ exports.descargarResumenVendedorExcel = onRequest(
       for (const m of movimientos) {
         const origen = (m.origen || "").trim();
         const destino = (m.destino || "").trim();
-        if (!origenRe.test(origen) || depositoPropioRe.test(destino)) continue;
+        if (!origenRe.test(origen)) continue;
+        if (!esLogisticaSoloFlete && depositoPropioRe.test(destino)) continue;
         const key = m.id;
         if (!viajesMap.has(key)) {
           viajesMap.set(key, { fecha: m.fecha || "", destino, descripcion: m.descripcion || "", items: [] });
@@ -2839,16 +2922,23 @@ exports.descargarResumenVendedorExcel = onRequest(
         viajesMap.get(key).items.push({ producto: m.codigoNombre || "", cantidad: m.cantidad != null ? Number(m.cantidad) : null });
       }
       const viajes = Array.from(viajesMap.values()).sort((a, b) => (a.fecha || "").localeCompare(b.fecha || ""));
+      // Flete por UNIDAD entregada (bicicleta), no por viaje — ver comentario
+      // en buildResumenComision.
+      const unidadesEntregadas = viajes.reduce(
+        (acc, v) => acc + v.items.reduce((a, it) => a + (/BIC\b/i.test(it.producto || "") ? Number(it.cantidad || 0) : 0), 0),
+        0
+      );
 
       const XLSX = require("xlsx");
       const wb = XLSX.utils.book_new();
 
-      const fleteTotal = viajes.length * resumen.tarifaFletePorViaje;
+      const fleteTotal = unidadesEntregadas * resumen.tarifaFletePorViaje;
       const resumenRows = [
         { Campo: "Vendedor", Valor: nombreVendedor },
         { Campo: "Mes", Valor: mes },
         { Campo: "Viajes", Valor: viajes.length },
-        { Campo: "Tarifa flete por viaje", Valor: resumen.tarifaFletePorViaje },
+        { Campo: "Unidades entregadas (bicis)", Valor: unidadesEntregadas },
+        { Campo: "Tarifa flete por unidad", Valor: resumen.tarifaFletePorViaje },
         { Campo: "Flete total", Valor: fleteTotal },
         { Campo: "Ventas (neto)", Valor: Math.round(resumen.ventasTotal) },
         { Campo: "% comisión", Valor: resumen.comisionPorcentaje },
@@ -2905,6 +2995,515 @@ exports.descargarResumenVendedorExcel = onRequest(
   }
 );
 
+// Panel "en vivo" de clientes de un vendedor con `vendedoresAsignados` (ej.
+// Cuchi) — a diferencia de buildResumenComision (que cuenta "viajes" rastreando
+// el origen del movimiento, con todos los problemas de atribución que eso
+// trae: devoluciones, entregas directas desde Lavalle sin pasar por su
+// depósito, origen mal cargado), acá la regla es mucho más simple y a
+// prueba de esos casos (decidido 19/10/2026 después de confirmarlo con
+// varios clientes reales): no importa por dónde entró la mercadería,
+//   ENTREGADO (por cliente) = stock actual consignado + vendido
+// "Vendido" incluye COT (Contabilium los usa como venta informal sin CAE,
+// antes se excluían y el total daba mal) y se cuenta desde `desde` (default:
+// la fecha de alta del propio vendedor, o se puede pasar explícito). Un
+// comprobante cuenta "pagado" solo si su Saldo es exactamente 0 — si hay un
+// pago parcial no se da por pagado solo, queda pendiente.
+async function buildPanelClientesVendedor(db, email, apiKey, targetUid, desdeOverride) {
+  const targetSnap = await db.doc(`users/${targetUid}`).get();
+  if (!targetSnap.exists) throw new Error("Usuario no encontrado");
+  const target = targetSnap.data();
+  const asignados = Array.isArray(target.vendedoresAsignados) ? target.vendedoresAsignados : [];
+
+  const desde = desdeOverride || (target.createdAt?.toDate ? target.createdAt.toDate().toISOString().slice(0, 10) : "2000-01-01");
+
+  const clientesSnaps = await Promise.all(asignados.map((u) => db.doc(`users/${u}`).get()));
+  const clientes = clientesSnaps
+    .filter((s) => s.exists)
+    .map((s) => s.data())
+    .filter((d) => d.contabiliumId && d.contabiliumDepositoId);
+
+  // Confirmación manual de cobros que Contabilium no vincula explícito a la
+  // factura (ej. un cobro que cubre el total pero quedó cargado como pago a
+  // cuenta corriente general, no aplicado factura por factura) — cargado a
+  // mano por el dueño del negocio, nunca se adivina ni se asume solo. Si un
+  // comprobante está en esta lista cuenta como pagado aunque su Saldo en
+  // Contabilium no sea $0.
+  const pagosManualesSnap = await db.doc(`pagosManualesConfirmados/${targetUid}`).get();
+  const numerosConfirmados = new Set(pagosManualesSnap.exists ? pagosManualesSnap.data().numeros || [] : []);
+
+  const resultados = [];
+  let totalEntregado = 0, totalVendido = 0, totalPagado = 0;
+
+  for (const cliente of clientes) {
+    let stockTotal = 0;
+    for (let intento = 1; intento <= 3; intento++) {
+      try {
+        const stockRaw = await getStockByDepositoWithRetry(email, apiKey, cliente.contabiliumDepositoId);
+        const items = await buildDepositoStockItems(db, email, apiKey, stockRaw);
+        stockTotal = items
+          .filter((it) => (it.category || "").toUpperCase() === "BICICLETAS")
+          .reduce((a, b) => a + (Number(b.stockActual) || 0), 0);
+        break;
+      } catch (err) {
+        if (intento === 3) console.error("[buildPanelClientesVendedor] stock falló", cliente.name, err.message);
+        else await sleep(1500 * intento);
+      }
+    }
+
+    const comprobantes = await getComprobantesByClientId(email, apiKey, cliente.contabiliumId, {
+      tipos: ["FCA", "FCB", "FCC", "COT", "NCA", "NCB", "NCC", "NCT"],
+      desde,
+    });
+
+    // Concurrencia chica (3) en vez de uno por uno con pausa — mismo
+    // criterio que en buildResumenComision, para no tardar tanto en
+    // clientes con muchos comprobantes sin arriesgarse a un 429.
+    let vendidoCliente = 0, pagadoCliente = 0;
+    const resultadosComprobantesCliente = await mapWithConcurrency(comprobantes, 3, async (c) => {
+      let cant = 0;
+      try {
+        const full = await getComprobanteById(email, apiKey, c.Id);
+        cant = (full?.Items || []).reduce((a, it) => a + (Number(it.Cantidad) || 0), 0);
+      } catch (err) {
+        console.error("[buildPanelClientesVendedor] detalle comprobante falló", c.Id, err.message);
+      }
+      await new Promise((r) => setTimeout(r, 40));
+      return { c, cant };
+    });
+    for (const { c, cant } of resultadosComprobantesCliente) {
+      const signo = (c.TipoFc || "").startsWith("NC") ? -1 : 1;
+      vendidoCliente += signo * cant;
+      if (parseArNumber(c.Saldo) === 0 || numerosConfirmados.has(c.Numero)) pagadoCliente += signo * cant;
+    }
+
+    const entregadoCliente = stockTotal + vendidoCliente;
+    totalEntregado += entregadoCliente;
+    totalVendido += vendidoCliente;
+    totalPagado += pagadoCliente;
+
+    resultados.push({
+      cliente: cliente.contabiliumDepositoNombre || cliente.name || "(sin nombre)",
+      stock: stockTotal,
+      vendido: vendidoCliente,
+      pagado: pagadoCliente,
+      pendiente: vendidoCliente - pagadoCliente,
+      entregado: entregadoCliente,
+    });
+  }
+
+  resultados.sort((a, b) => b.entregado - a.entregado);
+
+  return {
+    vendedor: target.contabiliumDepositoNombre || target.name || "Vendedor",
+    desde,
+    totalEntregado,
+    totalVendido,
+    totalPagado,
+    totalPendiente: totalVendido - totalPagado,
+    clientes: resultados,
+  };
+}
+
+exports.getPanelClientesVendedor = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 300, memory: "512MiB" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "No autorizado" });
+    let uid;
+    try {
+      uid = (await admin.auth().verifyIdToken(idToken)).uid;
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+
+    try {
+      const { vendedorUid, desde } = req.body || {};
+      const db = admin.firestore();
+      let targetUid = uid;
+      if (vendedorUid && vendedorUid !== uid) {
+        const callerSnap = await db.doc(`users/${uid}`).get();
+        const caller = callerSnap.exists ? callerSnap.data() : null;
+        if (!caller || !["admin", "chofer"].includes(caller.role)) {
+          return res.status(403).json({ error: "No tenés permiso para ver la cuenta de otro vendedor" });
+        }
+        targetUid = vendedorUid;
+      }
+
+      const panel = await buildPanelClientesVendedor(
+        db,
+        CONTABILIUM_EMAIL.value(),
+        CONTABILIUM_API_KEY.value(),
+        targetUid,
+        desde
+      );
+      return res.json(panel);
+    } catch (err) {
+      console.error("[getPanelClientesVendedor] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+function mesesEntre(desdeISO, hastaISO) {
+  const meses = [];
+  let [y, m] = desdeISO.slice(0, 7).split("-").map(Number);
+  const [yHasta, mHasta] = hastaISO.slice(0, 7).split("-").map(Number);
+  while (y < yHasta || (y === yHasta && m <= mHasta)) {
+    meses.push(`${y}-${String(m).padStart(2, "0")}`);
+    m++;
+    if (m > 12) { m = 1; y++; }
+  }
+  return meses;
+}
+
+// Informe completo descargable: todo lo que ya existe por separado
+// (buildResumenComision por mes, los viajes agrupados por id, y el panel
+// de "entregado = stock + vendido" por cliente) junto en un solo Excel, con
+// un total general y el desglose mes a mes — a pedido explícito del
+// 19/10/2026 ("hace un total y el por mes").
+// Junta todo lo que antes vivía repartido en varios endpoints (panel por
+// cliente, resumen de comisión por mes, viajes agrupados) en un solo lugar
+// — lo usan tanto la pantalla (JSON liviano) como el Excel descargable
+// (mismo cálculo, solo cambia el formato de salida).
+async function buildInformeCompletoVendedor(db, email, apiKey, webEmail, webPassword, targetUid) {
+  const targetSnap = await db.doc(`users/${targetUid}`).get();
+  if (!targetSnap.exists) throw new Error("Usuario no encontrado");
+  const target = targetSnap.data();
+  const nombreVendedor = target.contabiliumDepositoNombre || target.name || "Vendedor";
+
+  // `fechaInicioActividad` (opcional, cargado a mano en el doc del vendedor)
+  // pisa la fecha de alta del usuario — para el caso real de Cuchi, empezó a
+  // trabajar antes de que se le creara la cuenta en el sistema (una venta
+  // suya del 07/08 quedaba afuera usando solo la fecha de alta del 29/08).
+  const desdeISO = target.fechaInicioActividad
+    || (target.createdAt?.toDate ? target.createdAt.toDate().toISOString().slice(0, 10) : "2026-08-01");
+  const hoyISOVal = new Date().toISOString().slice(0, 10);
+  const meses = mesesEntre(desdeISO, hoyISOVal);
+
+  const panel = await buildPanelClientesVendedor(db, email, apiKey, targetUid, desdeISO);
+
+  // Stock que el vendedor tiene hoy en SU PROPIO depósito, todavía sin pasar
+  // a ningún cliente (panel.totalEntregado ya cuenta lo que está en stock
+  // de sus clientes + lo vendido, pero no esto) — a pedido explícito del
+  // 19/10/2026, para reemplazar el tile de "retirado de Lavalle" por
+  // "entregado + stock propio", que es el número que de verdad cierra con
+  // lo que Cuchi tiene anotado a mano.
+  let stockPropio = 0;
+  if (target.contabiliumDepositoId) {
+    for (let intento = 1; intento <= 3; intento++) {
+      try {
+        const stockRaw = await getStockByDepositoWithRetry(email, apiKey, target.contabiliumDepositoId);
+        const items = await buildDepositoStockItems(db, email, apiKey, stockRaw);
+        stockPropio = items
+          .filter((it) => (it.category || "").toUpperCase() === "BICICLETAS")
+          .reduce((a, b) => a + (Number(b.stockActual) || 0), 0);
+        break;
+      } catch (err) {
+        if (intento === 3) console.error("[buildInformeCompletoVendedor] stock propio falló", nombreVendedor, err.message);
+        else await sleep(1500 * intento);
+      }
+    }
+  }
+
+  const resumenesPorMes = [];
+  for (const mes of meses) {
+    try {
+      const r = await buildResumenComision(db, email, apiKey, webEmail, webPassword, targetUid, mes);
+      resumenesPorMes.push({ mes, ...r });
+    } catch (err) {
+      console.error("[buildInformeCompletoVendedor] falló mes", mes, err.message);
+      resumenesPorMes.push({ mes, viajes: 0, fleteTotal: 0, ventasTotal: 0, comisionTotal: 0, totalACobrar: 0, detalle: [] });
+    }
+  }
+
+  const { obtenerMovimientosStock } = require("./contabiliumWebAutomation");
+  const movimientos = await obtenerMovimientosStock({ db, email: webEmail, password: webPassword, fechaDesde: desdeISO, fechaHasta: hoyISOVal });
+  // Palabra MÁS LARGA del nombre (en general el apellido), no la primera —
+  // un nombre de pila corto y común puede coincidir con el nombre de un
+  // cliente/depósito de otra persona y generar falsos positivos.
+  const palabraClave = nombreVendedor.split(/\s+/).filter((w) => w.length >= 5).sort((a, b) => b.length - a.length)[0] || nombreVendedor;
+  const origenesExplicitos = Array.isArray(target.origenesViajes) ? target.origenesViajes.filter(Boolean) : [];
+  const palabrasOrigen = origenesExplicitos.length ? origenesExplicitos : [palabraClave];
+  const esLogisticaSoloFlete = origenesExplicitos.length > 0;
+  const origenRe = new RegExp(palabrasOrigen.map(escapeRegExpBackend).join("|"), "i");
+  const depositoPropioRe = /lavalle|temperley|ca[ñn]uelas|credifin/i;
+  const viajesMap = new Map();
+  for (const m of movimientos) {
+    const origen = (m.origen || "").trim();
+    const destino = (m.destino || "").trim();
+    if (!origenRe.test(origen)) continue;
+    if (!esLogisticaSoloFlete && depositoPropioRe.test(destino)) continue;
+    const key = m.id;
+    if (!viajesMap.has(key)) viajesMap.set(key, { fecha: m.fecha || "", destino, descripcion: m.descripcion || "", items: [] });
+    viajesMap.get(key).items.push({ producto: m.codigoNombre || "", cantidad: m.cantidad != null ? Number(m.cantidad) : null });
+  }
+  const viajes = Array.from(viajesMap.values()).sort((a, b) => (a.fecha || "").localeCompare(b.fecha || ""));
+
+  // Retiros: el otro sentido — movimientos que ENTRAN al depósito propio del
+  // vendedor, sin importar de dónde salgan (Lavalle la mayoría, pero también
+  // puede ser otro depósito o cliente devolviendo mercadería). Separado de
+  // "viajes" (que son las entregas DESDE su depósito hacia un cliente) a
+  // pedido explícito del 19/10/2026 — Cuchi quiere ver también cuánto retira
+  // en total, no solo cuánto entrega.
+  const destinoVendedorRe = new RegExp(palabrasOrigen.map(escapeRegExpBackend).join("|"), "i");
+  const retirosMap = new Map();
+  for (const m of movimientos) {
+    const origen = (m.origen || "").trim();
+    const destino = (m.destino || "").trim();
+    if (!destinoVendedorRe.test(destino)) continue;
+    const key = m.id;
+    if (!retirosMap.has(key)) retirosMap.set(key, { fecha: m.fecha || "", origen, descripcion: m.descripcion || "", items: [] });
+    retirosMap.get(key).items.push({ producto: m.codigoNombre || "", cantidad: m.cantidad != null ? Number(m.cantidad) : null });
+  }
+  const retiros = Array.from(retirosMap.values()).sort((a, b) => (a.fecha || "").localeCompare(b.fecha || ""));
+  const totalRetirado = retiros.reduce((a, v) => a + v.items.reduce((x, it) => x + (it.cantidad || 0), 0), 0);
+  // Devoluciones: el caso particular donde el vendedor manda mercadería DE
+  // VUELTA a un depósito propio de Samurai (resta del total retirado neto).
+  const devolucionesMap = new Map();
+  for (const m of movimientos) {
+    const origen = (m.origen || "").trim();
+    const destino = (m.destino || "").trim();
+    if (!origenRe.test(origen) || !depositoPropioRe.test(destino)) continue;
+    const key = m.id;
+    if (!devolucionesMap.has(key)) devolucionesMap.set(key, { fecha: m.fecha || "", destino, items: [] });
+    devolucionesMap.get(key).items.push({ producto: m.codigoNombre || "", cantidad: m.cantidad != null ? Number(m.cantidad) : null });
+  }
+  const devoluciones = Array.from(devolucionesMap.values());
+  const totalDevuelto = devoluciones.reduce((a, v) => a + v.items.reduce((x, it) => x + (it.cantidad || 0), 0), 0);
+
+  const totalFlete = resumenesPorMes.reduce((a, r) => a + (r.fleteTotal || 0), 0);
+  const totalComision = resumenesPorMes.reduce((a, r) => a + (r.comisionTotal || 0), 0);
+  const totalViajesComision = resumenesPorMes.reduce((a, r) => a + (r.viajes || 0), 0);
+  const totalUnidadesComision = resumenesPorMes.reduce((a, r) => a + (r.unidadesEntregadas || 0), 0);
+
+  return {
+    nombreVendedor, desdeISO, hoyISOVal, panel, resumenesPorMes, viajes,
+    totalFlete, totalComision, totalViajesComision, totalUnidadesComision,
+    retiros, totalRetirado, devoluciones, totalDevuelto,
+    stockPropio, totalEntregadoMasStock: panel.totalEntregado + stockPropio,
+  };
+}
+
+exports.getInformeCompletoVendedor = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 540, memory: "1GiB" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "No autorizado" });
+    let uid;
+    try {
+      uid = (await admin.auth().verifyIdToken(idToken)).uid;
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+
+    try {
+      const { vendedorUid } = req.body || {};
+      const db = admin.firestore();
+      let targetUid = uid;
+      if (vendedorUid && vendedorUid !== uid) {
+        const callerSnap = await db.doc(`users/${uid}`).get();
+        const caller = callerSnap.exists ? callerSnap.data() : null;
+        if (!caller || !["admin", "chofer"].includes(caller.role)) {
+          return res.status(403).json({ error: "No tenés permiso para ver la cuenta de otro vendedor" });
+        }
+        targetUid = vendedorUid;
+      }
+
+      const informe = await buildInformeCompletoVendedor(
+        db,
+        CONTABILIUM_EMAIL.value(),
+        CONTABILIUM_API_KEY.value(),
+        CONTABILIUM_WEB_EMAIL.value(),
+        CONTABILIUM_WEB_PASSWORD.value(),
+        targetUid
+      );
+      return res.json({ ok: true, ...informe });
+    } catch (err) {
+      console.error("[getInformeCompletoVendedor] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+exports.descargarInformeCompletoVendedor = onRequest(
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 540, memory: "1GiB" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "No autorizado" });
+    let uid;
+    try {
+      uid = (await admin.auth().verifyIdToken(idToken)).uid;
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+
+    try {
+      const { vendedorUid } = req.body || {};
+      const db = admin.firestore();
+      let targetUid = uid;
+      if (vendedorUid && vendedorUid !== uid) {
+        const callerSnap = await db.doc(`users/${uid}`).get();
+        const caller = callerSnap.exists ? callerSnap.data() : null;
+        if (!caller || !["admin", "chofer"].includes(caller.role)) {
+          return res.status(403).json({ error: "No tenés permiso para ver la cuenta de otro vendedor" });
+        }
+        targetUid = vendedorUid;
+      }
+
+      const { nombreVendedor, desdeISO, hoyISOVal, panel, resumenesPorMes, viajes, totalFlete, totalComision, totalViajesComision, totalUnidadesComision, retiros, totalRetirado, devoluciones, totalDevuelto, stockPropio, totalEntregadoMasStock } =
+        await buildInformeCompletoVendedor(
+          db,
+          CONTABILIUM_EMAIL.value(),
+          CONTABILIUM_API_KEY.value(),
+          CONTABILIUM_WEB_EMAIL.value(),
+          CONTABILIUM_WEB_PASSWORD.value(),
+          targetUid
+        );
+
+      // ─── Armado del Excel ───
+      const XLSX = require("xlsx");
+      const wb = XLSX.utils.book_new();
+
+      const wsGeneral = XLSX.utils.json_to_sheet([
+        { Campo: "Vendedor", Valor: nombreVendedor },
+        { Campo: "Desde", Valor: desdeISO },
+        { Campo: "Hasta", Valor: hoyISOVal },
+        { Campo: "Entregado total (stock + vendido, todos los clientes)", Valor: panel.totalEntregado },
+        { Campo: "Vendido total", Valor: panel.totalVendido },
+        { Campo: "Cobrado total", Valor: panel.totalPagado },
+        { Campo: "Vendido sin cobrar", Valor: panel.totalPendiente },
+        { Campo: "Viajes totales", Valor: totalViajesComision },
+        { Campo: "Unidades entregadas (bicis, para flete)", Valor: totalUnidadesComision },
+        { Campo: "Flete total", Valor: totalFlete },
+        { Campo: "Comisión total", Valor: totalComision },
+        { Campo: "Total a cobrar (flete + comisión)", Valor: totalFlete + totalComision },
+        { Campo: "Stock propio (sin pasar a ningún cliente)", Valor: stockPropio },
+        { Campo: "Entregado + stock propio", Valor: totalEntregadoMasStock },
+        { Campo: "Retirado de Lavalle/otros (bruto)", Valor: totalRetirado },
+        { Campo: "Devuelto a depósito propio", Valor: totalDevuelto },
+        { Campo: "Retirado neto (retirado - devuelto)", Valor: totalRetirado - totalDevuelto },
+      ], { header: ["Campo", "Valor"] });
+      wsGeneral["!cols"] = [{ wch: 42 }, { wch: 24 }];
+      XLSX.utils.book_append_sheet(wb, wsGeneral, "Resumen General");
+
+      const wsPorMes = XLSX.utils.json_to_sheet(
+        resumenesPorMes.map((r) => ({
+          Mes: r.mes,
+          Viajes: r.viajes,
+          "Unidades (bicis)": r.unidadesEntregadas || 0,
+          "Flete total": r.fleteTotal,
+          "Ventas (neto)": Math.round(r.ventasTotal || 0),
+          "% Comisión": r.comisionPorcentaje,
+          Comisión: Math.round(r.comisionTotal || 0),
+          "Total a cobrar": Math.round((r.fleteTotal || 0) + (r.comisionTotal || 0)),
+        })),
+        { header: ["Mes", "Viajes", "Unidades (bicis)", "Flete total", "Ventas (neto)", "% Comisión", "Comisión", "Total a cobrar"] }
+      );
+      wsPorMes["!cols"] = [{ wch: 9 }, { wch: 8 }, { wch: 14 }, { wch: 12 }, { wch: 14 }, { wch: 11 }, { wch: 12 }, { wch: 15 }];
+      XLSX.utils.book_append_sheet(wb, wsPorMes, "Resumen por Mes");
+
+      const wsClientes = XLSX.utils.json_to_sheet(
+        panel.clientes.map((c) => ({
+          Cliente: c.cliente,
+          "Stock actual": c.stock,
+          Reportado: c.vendido,
+          Cobrado: c.pagado,
+          "Vendido sin cobrar": c.pendiente,
+          "Entregado (stock+vendido)": c.entregado,
+        })),
+        { header: ["Cliente", "Stock actual", "Reportado", "Cobrado", "Vendido sin cobrar", "Entregado (stock+vendido)"] }
+      );
+      wsClientes["!cols"] = [{ wch: 32 }, { wch: 12 }, { wch: 10 }, { wch: 10 }, { wch: 16 }, { wch: 22 }];
+      XLSX.utils.book_append_sheet(wb, wsClientes, "Entregas por Cliente");
+
+      const viajesRows = [];
+      viajes.forEach((v, idx) => {
+        v.items.forEach((it, j) => {
+          viajesRows.push({
+            "N° Viaje": j === 0 ? idx + 1 : "",
+            Mes: (v.fecha || "").slice(0, 7),
+            "Fecha y hora": v.fecha,
+            "Cliente destino": v.destino,
+            Producto: it.producto,
+            Cantidad: it.cantidad,
+            Descripción: v.descripcion,
+          });
+        });
+      });
+      const wsViajes = XLSX.utils.json_to_sheet(viajesRows, {
+        header: ["N° Viaje", "Mes", "Fecha y hora", "Cliente destino", "Producto", "Cantidad", "Descripción"],
+      });
+      wsViajes["!cols"] = [{ wch: 9 }, { wch: 9 }, { wch: 20 }, { wch: 28 }, { wch: 42 }, { wch: 10 }, { wch: 40 }];
+      XLSX.utils.book_append_sheet(wb, wsViajes, "Viajes");
+
+      const retirosRows = [];
+      retiros.forEach((v, idx) => {
+        v.items.forEach((it, j) => {
+          retirosRows.push({
+            "N° Retiro": j === 0 ? idx + 1 : "",
+            Mes: (v.fecha || "").slice(0, 7),
+            "Fecha y hora": v.fecha,
+            Origen: v.origen,
+            Producto: it.producto,
+            Cantidad: it.cantidad,
+            Descripción: v.descripcion,
+          });
+        });
+      });
+      const wsRetiros = XLSX.utils.json_to_sheet(retirosRows, {
+        header: ["N° Retiro", "Mes", "Fecha y hora", "Origen", "Producto", "Cantidad", "Descripción"],
+      });
+      wsRetiros["!cols"] = [{ wch: 9 }, { wch: 9 }, { wch: 20 }, { wch: 28 }, { wch: 42 }, { wch: 10 }, { wch: 40 }];
+      XLSX.utils.book_append_sheet(wb, wsRetiros, "Retiros");
+
+      const ventasRows = [];
+      for (const r of resumenesPorMes) {
+        for (const d of r.detalle || []) {
+          ventasRows.push({
+            Mes: r.mes,
+            Fecha: d.fecha,
+            Cliente: d.cliente,
+            "N° Factura": d.numero,
+            Tipo: d.tipo,
+            Producto: d.modelo,
+            Cantidad: d.cantidad,
+            Monto: Math.round(d.monto || 0),
+            Comisión: Math.round(d.comision || 0),
+          });
+        }
+      }
+      const wsVentas = XLSX.utils.json_to_sheet(ventasRows, {
+        header: ["Mes", "Fecha", "Cliente", "N° Factura", "Tipo", "Producto", "Cantidad", "Monto", "Comisión"],
+      });
+      wsVentas["!cols"] = [{ wch: 9 }, { wch: 20 }, { wch: 26 }, { wch: 15 }, { wch: 7 }, { wch: 42 }, { wch: 9 }, { wch: 14 }, { wch: 13 }];
+      XLSX.utils.book_append_sheet(wb, wsVentas, "Comprobantes emitidos");
+
+      const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+      const base64 = buf.toString("base64");
+
+      return res.json({ ok: true, base64, filename: `${nombreVendedor} - Informe completo.xlsx` });
+    } catch (err) {
+      console.error("[descargarInformeCompletoVendedor] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
 // Carga a mano cuántos viajes (Lavalle → su depósito) hizo un vendedor en un
 // mes puntual — Contabilium no lo registra, así que es la única forma de
 // contarlo para calcular el flete. Lo puede cargar el propio vendedor (su
@@ -2928,7 +3527,7 @@ exports.setViajesVendedorMes = onRequest(
 
     try {
       const { mes, viajes, vendedorUid } = req.body || {};
-      if (!mes || !/^\d{4}-\d{2}$/.test(mes)) return res.status(400).json({ error: "Falta mes (formato YYYY-MM)" });
+      if (!mes || (mes !== "todo" && !/^\d{4}-\d{2}$/.test(mes))) return res.status(400).json({ error: "Falta mes (formato YYYY-MM, o todo para el historial completo)" });
       if (!(Number(viajes) >= 0)) return res.status(400).json({ error: "viajes tiene que ser un número >= 0" });
 
       const db = admin.firestore();
@@ -3091,33 +3690,119 @@ exports.getMiDepositoPropio = onRequest(
 // el CAE por la API REST de siempre (mismo objeto de Contabilium, da igual
 // por qué canal se creó). COT y REM no son documentos AFIP y no llevan
 // IVA discriminado — esos siguen por la API REST vieja, sin cambios.
+// Si AFIP rechaza el CAE por "Condicion IVA receptor no es valido para la
+// clase de comprobante informado" (visto primero con Calderaro, 21/10/2026),
+// se intenta resolver solo, en el momento, en vez de solo mostrar el error:
+//   1) Se revisa si la CondicionIva que Contabilium tiene cargada para el
+//      cliente quedó desactualizada contra el padrón real de AFIP — si es
+//      así, se corrige en Contabilium y se reintenta UNA vez con el mismo
+//      tipo de comprobante pedido.
+//   2) Si eso no alcanza (el dato ya estaba bien, como le pasó a Calderaro:
+//      AFIP y Contabilium ya decían "MO" los dos) y lo que falló fue
+//      puntualmente una Factura B, se reintenta automáticamente como
+//      Factura C — igual de válida para un receptor que no es Responsable
+//      Inscripto — y se avisa en la respuesta que se emitió con otro tipo
+//      al pedido. Si lo que falló fue una Factura A, no se reintenta con
+//      otro tipo (ahí sí puede corresponder revisar la condición a mano).
+// En los dos pasos se borra primero el borrador sin CAE que quedó colgado
+// (crearComprobanteWeb ya lo creó como "0001-00000000" antes de fallar en
+// AFIP), para no acumular comprobantes huérfanos.
 async function emitirComprobanteConIva({ idCliente, idDeposito, tipoFc, items, fechaEmision }) {
   if (!["FCA", "FCB", "FCC"].includes(tipoFc)) {
     return crearComprobante(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value(), { idCliente, idDeposito, tipoFc, items, fechaEmision });
   }
 
-  const { crearComprobanteWeb } = require("./contabiliumWebAutomation");
-  const idComprobante = await crearComprobanteWeb({
-    db: admin.firestore(),
-    email: CONTABILIUM_WEB_EMAIL.value(),
-    password: CONTABILIUM_WEB_PASSWORD.value(),
-    restEmail: CONTABILIUM_EMAIL.value(),
-    restApiKey: CONTABILIUM_API_KEY.value(),
-    idPersona: idCliente,
-    idInventario: idDeposito || undefined,
-    tipoFc,
-    fechaEmision,
-    items: items.map((it) => ({
-      sku: it.sku,
-      descripcion: it.descripcion,
-      cantidad: it.cantidad,
-      precioUnitarioConIva: it.precioUnitario,
-      iva: 21,
-    })),
-  });
+  const email = CONTABILIUM_EMAIL.value();
+  const apiKey = CONTABILIUM_API_KEY.value();
+  const itemsWeb = items.map((it) => ({
+    sku: it.sku,
+    descripcion: it.descripcion,
+    cantidad: it.cantidad,
+    precioUnitarioConIva: it.precioUnitario,
+    iva: 21,
+  }));
 
-  const fe = await emitirFacturaElectronica(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value(), idComprobante);
-  return { Id: idComprobante, ...fe };
+  async function crearYEmitir(tipo) {
+    const { crearComprobanteWeb } = require("./contabiliumWebAutomation");
+    // crearComprobanteWeb ya hace las dos cosas: crea el borrador Y pide el
+    // CAE por el webmethod real de la consola clásica (ver el comentario
+    // grande ahí mismo). Si falla, el error trae idComprobanteBorrador
+    // adjunto (el catch de abajo lo reusa).
+    const { idComprobante } = await crearComprobanteWeb({
+      db: admin.firestore(),
+      email: CONTABILIUM_WEB_EMAIL.value(),
+      password: CONTABILIUM_WEB_PASSWORD.value(),
+      restEmail: email,
+      restApiKey: apiKey,
+      idPersona: idCliente,
+      idInventario: idDeposito || undefined,
+      tipoFc: tipo,
+      fechaEmision,
+      items: itemsWeb,
+    });
+    // Se relee por REST (solo lectura, eso sí anduvo siempre bien) para
+    // devolver el objeto completo y actualizado — Numero real, Cae, etc.
+    const comprobante = await getComprobanteById(email, apiKey, idComprobante);
+    return { Id: idComprobante, ...(comprobante || {}) };
+  }
+
+  try {
+    return await crearYEmitir(tipoFc);
+  } catch (err) {
+    const msg = err.message || String(err);
+    if (!/Condicion IVA receptor/i.test(msg)) throw err;
+    console.warn("[emitirComprobanteConIva] Error de condición IVA de AFIP, intentando resolver automáticamente:", msg);
+
+    let condicionCorregida = false;
+    try {
+      const cliente = await getClientById(email, apiKey, idCliente);
+      if (cliente?.NroDoc) {
+        const afip = await getDatosAfip(email, apiKey, cliente.NroDoc);
+        if (afip?.CategoriaImpositiva && afip.CategoriaImpositiva !== cliente.CondicionIva) {
+          await updateCliente(email, apiKey, idCliente, { ...cliente, CondicionIva: afip.CategoriaImpositiva });
+          condicionCorregida = true;
+        }
+      }
+    } catch (syncErr) {
+      console.warn("[emitirComprobanteConIva] No se pudo verificar/sincronizar CondicionIva:", syncErr.message || syncErr);
+    }
+
+    if (err.idComprobanteBorrador) {
+      try {
+        const { deleteComprobante } = require("./contabiliumService");
+        await deleteComprobante(email, apiKey, err.idComprobanteBorrador);
+      } catch (delErr) {
+        console.warn("[emitirComprobanteConIva] No se pudo borrar el borrador huérfano:", delErr.message || delErr);
+      }
+    }
+
+    if (condicionCorregida) {
+      try {
+        return await crearYEmitir(tipoFc);
+      } catch (retryErr) {
+        err = retryErr;
+        if (err.idComprobanteBorrador) {
+          try {
+            const { deleteComprobante } = require("./contabiliumService");
+            await deleteComprobante(email, apiKey, err.idComprobanteBorrador);
+          } catch (delErr) {
+            console.warn("[emitirComprobanteConIva] No se pudo borrar el borrador huérfano del reintento:", delErr.message || delErr);
+          }
+        }
+      }
+    }
+
+    if (tipoFc === "FCB") {
+      const resultado = await crearYEmitir("FCC");
+      return {
+        ...resultado,
+        tipoDocumentoEmitido: "FCC",
+        avisoCambioTipo: "AFIP rechazó la Factura B por la condición de IVA del receptor — se emitió como Factura C en su lugar.",
+      };
+    }
+
+    throw err;
+  }
 }
 // Compartida entre ajustarStockManual y resolveSaleRequest (marcar
 // "facturado" a mano) — resuelve el idConcepto por SKU, el idCC guardado
@@ -4143,6 +4828,90 @@ exports.diagObtenerRemito = onRequest(
 // Contabilium) — busca en el sitio clásico algún módulo de "depósitos" que
 // permita renombrarlos, para poder mostrar el mismo código propio (1-80)
 // de Samurai también ahí. Se borra una vez que se resuelva.
+// Investiga si Contabilium tiene en algún lado un registro de compras /
+// ingreso de stock con precio por unidad — necesario para reconstruir una
+// valorización de stock a una fecha pasada (pedido 21/10/2026, Ezequiel
+// preguntó "no se puede ver en ctb cuándo se agregó stock y con qué
+// precio?"). Prueba tanto la API REST oficial (candidatos de endpoint tipo
+// /compras, /proveedores, etc.) como el sitio clásico (links/menú que
+// mencionen "compra"/"proveedor"/"ingreso de stock"). Solo lectura, no
+// escribe nada en Contabilium. Guarda el resultado en Firestore
+// (internalData/diagCompras) para poder revisarlo sin tener que repetir la
+// llamada HTTP.
+exports.diagExplorarCompras = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 180 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { probeComprasEndpoints } = require("./contabiliumService");
+      const { explorarModuloCompras } = require("./contabiliumWebAutomation");
+      const db = admin.firestore();
+
+      const [rest, web] = await Promise.all([
+        probeComprasEndpoints(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value()).catch((e) => ({ error: e.message })),
+        explorarModuloCompras({ db, email: CONTABILIUM_WEB_EMAIL.value(), password: CONTABILIUM_WEB_PASSWORD.value() }).catch((e) => ({ error: e.message })),
+      ]);
+
+      const resultado = { rest, web, checkedAt: new Date().toISOString() };
+      await db.doc("internalData/diagCompras").set(resultado);
+      return res.json(resultado);
+    } catch (err) {
+      console.error("[diagExplorarCompras] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+exports.diagExplorarHistoricoStock = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 120 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { explorarHistoricoStock } = require("./contabiliumWebAutomation");
+      const resultado = await explorarHistoricoStock({
+        db: admin.firestore(),
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+        fecha: req.body?.fecha,
+      });
+      return res.json(resultado);
+    } catch (err) {
+      console.error("[diagExplorarHistoricoStock] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+exports.diagHistoricoStockReal = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 180, memory: "1GiB" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { obtenerHistoricoStockReal } = require("./contabiliumWebAutomation");
+      const resultado = await obtenerHistoricoStockReal({
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+        depositoNombre: req.body?.depositoNombre,
+        fechaDesde: req.body?.fechaDesde,
+        fechaHasta: req.body?.fechaHasta,
+      });
+      return res.json(resultado);
+    } catch (err) {
+      console.error("[diagHistoricoStockReal] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
 exports.diagExplorarModuloDepositos = onRequest(
   { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 120 },
   async (req, res) => {
@@ -5618,7 +6387,7 @@ exports.adminGetClientComprobantes = onRequest(
           Tipo:  c.TipoFc,
           Fecha: c.FechaEmision,
           Total: parseArNumber(c.ImporteTotalNeto),
-          Saldo: c.TipoFc === "NCA" ? -saldoAbs : saldoAbs,
+          Saldo: TIPOS_NC_NEGATIVOS.includes(c.TipoFc) ? -saldoAbs : saldoAbs,
         };
       });
 
@@ -6599,7 +7368,7 @@ exports.diagRawClient = onRequest(
         const { getComprobantesByClientId } = require("./contabiliumService");
         const items = await getComprobantesByClientId(
           CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value(), Number(contabiliumId),
-          { tipos: ["FCA", "FCB", "FCC", "NCA", "NCB", "NCC", "NDA", "NDB", "NDC", "COT"] }
+          { tipos: ["FCA", "FCB", "FCC", "NCA", "NCB", "NCC", "NCT", "NDA", "NDB", "NDC", "COT"] }
         );
         return res.json({ items });
       }
@@ -6724,23 +7493,29 @@ exports.reportSale = onRequest(
       }
       const tipoFcElegido = tipoDocumento === "COT" ? "COT" : "FCA";
 
-      // Evita reportar la misma venta dos veces por error (p.ej. tocando el
-      // botón de nuevo sin darse cuenta de que ya se registró): si hay un
-      // reporte pendiente del mismo producto en los últimos 30 minutos, se
-      // bloquea en vez de crear otro duplicado.
-      const reciente = new Date(Date.now() - 30 * 60 * 1000);
-      const dupSnap = await db.collection("saleRequests")
-        .where("distributorUid", "==", uid)
-        .where("sku", "==", String(sku).trim())
-        .where("status", "==", "pendiente")
-        .get();
-      const yaReportado = dupSnap.docs.some((d) => {
-        const createdAt = d.data().createdAt?.toDate?.();
-        return createdAt && createdAt > reciente;
-      });
-      if (yaReportado) {
+      // Antes bloqueaba por TIEMPO (30 min sin importar nada) — eso
+      // rechazaba ventas genuinas de una segunda unidad del mismo modelo
+      // vendida poco después de la primera, mientras esa primera seguía
+      // "pendiente" sin facturar todavía (caso real: Pedal House, 21/10/2026).
+      // Ahora valida contra el stock real, con el mismo cálculo que ya usa
+      // la propia pantalla del distribuidor para mostrar "Disponibles"
+      // (stock real de Contabilium menos lo ya reportado y todavía
+      // pendiente de facturar) — si ahí mostraba 1 disponible es porque
+      // físicamente queda 1 para reportar, y no hay motivo para bloquearlo.
+      const skuLimpio = String(sku).trim();
+      let disponibleReal = null;
+      try {
+        const pendingSoldBySku = await getPendingSoldBySku(db, { distributorUid: uid });
+        const stockRaw = await getStockByDepositoWithRetry(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value(), user.contabiliumDepositoId);
+        const items = await buildDepositoStockItems(db, CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value(), stockRaw, { includeZeroStock: true, pendingSoldBySku });
+        const item = items.find((it) => it.sku === skuLimpio);
+        disponibleReal = item ? item.stockDisponible : 0;
+      } catch (err) {
+        console.error("[reportSale] no se pudo verificar el stock real, se deja pasar sin bloquear:", err.message);
+      }
+      if (disponibleReal != null && disponibleReal < qty) {
         return res.status(409).json({
-          error: "Ya reportaste la venta de este producto hace poco. Si vendiste más de una unidad, avisale a Samurai directamente para que lo corrijan.",
+          error: `No queda stock suficiente para reportar esta venta (disponible: ${disponibleReal}). Si es un error, avisale a Samurai directamente para que lo corrijan.`,
         });
       }
 
@@ -7039,9 +7814,19 @@ exports.resolveSaleRequest = onRequest(
       const montoReal = parseAr(facturaReal.ImporteTotalNeto);
       const montoCoincide = Math.abs(montoReal - montoEsperado) < 1;
 
-      let stockAjustadoManualmente = false;
+      // Si la factura se cargó con el depósito bien vinculado, Contabilium
+      // ya descontó el stock real solo al emitirla — ajustarlo de nuevo acá
+      // lo descontaría DOS VECES (bug reportado 19/10/2026). Pero si se
+      // cargó SIN vincular el depósito, Contabilium nunca se entera de
+      // descontarlo (bug real distinto, detectado 28/9/2026) y hace falta
+      // este ajuste manual como red de contención. Como el sistema no tiene
+      // forma de saber cuál de los dos pasó, lo decide quien cargó la
+      // factura: `stockYaDescontado` (true = no tocar nada más, false/no
+      // mandado = ajustar acá, como antes).
+      const stockYaDescontado = req.body?.stockYaDescontado === true;
+      let stockAjustadoManualmente = stockYaDescontado;
       let stockAjusteError = null;
-      if (saleData.depositoId && saleData.sku) {
+      if (!stockYaDescontado && saleData.depositoId && saleData.sku) {
         try {
           await ajustarStockInterno({
             depositoId: saleData.depositoId,

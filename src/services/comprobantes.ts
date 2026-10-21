@@ -91,6 +91,13 @@ export type GetComprobantesParams = {
   hasta?: string;
 };
 
+// Diagnóstico temporal (21/10/2026): investiga si Contabilium tiene algún
+// registro de compras/ingreso de stock con precio por unidad. Se borra una
+// vez que se resuelva.
+export async function diagExplorarCompras(): Promise<any> {
+  return callFunction("diagExplorarCompras", {}, 180000);
+}
+
 export async function getClientComprobantes(
   params: GetComprobantesParams = {}
 ): Promise<{ items: Comprobante[]; total: number; saldoTotal: number }> {
@@ -240,6 +247,71 @@ export async function descargarResumenVendedorExcel(
   vendedorUid?: string
 ): Promise<{ ok: true; base64: string; filename: string }> {
   return callFunction("descargarResumenVendedorExcel", { mes, vendedorUid }, 170000);
+}
+
+export type ClientePanelVendedor = {
+  cliente: string;
+  stock: number;
+  vendido: number;
+  pagado: number;
+  pendiente: number;
+  entregado: number;
+};
+
+export type PanelClientesVendedor = {
+  vendedor: string;
+  desde: string;
+  totalEntregado: number;
+  totalVendido: number;
+  totalPagado: number;
+  totalPendiente: number;
+  clientes: ClientePanelVendedor[];
+};
+
+// Panel en vivo: por cada cliente asignado, "entregado" = stock actual +
+// vendido (sin importar de qué depósito salió la mercadería) — ver el
+// comentario largo en buildPanelClientesVendedor (backend) sobre por qué
+// esta regla reemplaza al rastreo de movimientos por origen.
+export async function getPanelClientesVendedor(vendedorUid?: string, desde?: string): Promise<PanelClientesVendedor> {
+  return callFunction("getPanelClientesVendedor", { vendedorUid, desde }, 280000);
+}
+
+export type InformeCompletoVendedor = {
+  nombreVendedor: string;
+  desdeISO: string;
+  hoyISOVal: string;
+  panel: PanelClientesVendedor;
+  resumenesPorMes: Array<{
+    mes: string;
+    viajes: number;
+    fleteTotal: number;
+    ventasTotal: number;
+    comisionPorcentaje: number;
+    comisionTotal: number;
+    totalACobrar: number;
+    detalle: DetalleVentaComision[];
+  }>;
+  viajes: Array<{ fecha: string; destino: string; descripcion: string; items: Array<{ producto: string; cantidad: number | null }> }>;
+  totalFlete: number;
+  totalComision: number;
+  totalViajesComision: number;
+  retiros: Array<{ fecha: string; origen: string; descripcion: string; items: Array<{ producto: string; cantidad: number | null }> }>;
+  totalRetirado: number;
+  devoluciones: Array<{ fecha: string; destino: string; items: Array<{ producto: string; cantidad: number | null }> }>;
+  totalDevuelto: number;
+};
+
+// Todo junto (panel por cliente + resumen mes a mes + viajes detallados),
+// para mostrar en pantalla sin tener que pedir cada cosa por separado.
+export async function getInformeCompletoVendedor(vendedorUid?: string): Promise<InformeCompletoVendedor> {
+  return callFunction("getInformeCompletoVendedor", { vendedorUid }, 280000);
+}
+
+// El mismo informe de arriba, pero como Excel descargable.
+export async function descargarInformeCompletoVendedor(
+  vendedorUid?: string
+): Promise<{ ok: true; base64: string; filename: string }> {
+  return callFunction("descargarInformeCompletoVendedor", { vendedorUid }, 280000);
 }
 
 // Carga a mano cuántos viajes (Lavalle → su depósito) hizo en ese mes —
@@ -647,7 +719,8 @@ export async function listVentasFacturadasSinCobrar(): Promise<{
 
 export async function resolveSaleRequest(
   id: string,
-  facturaNumero: string
+  facturaNumero: string,
+  stockYaDescontado: boolean
 ): Promise<{
   ok: true;
   stockAjustadoManualmente: boolean;
@@ -656,7 +729,7 @@ export async function resolveSaleRequest(
   montoEsperado: number;
   montoReal: number;
 }> {
-  return callFunction("resolveSaleRequest", { id, facturaNumero }, 60000);
+  return callFunction("resolveSaleRequest", { id, facturaNumero, stockYaDescontado }, 60000);
 }
 
 // Emite una factura REAL en Contabilium (con CAE) para una o más ventas

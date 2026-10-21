@@ -4067,6 +4067,7 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
   const [products, setProducts] = useState(null);
   const [stockPorSku, setStockPorSku] = useState(null); // Map sku -> stockDisponible, null = no aplica (sin depósito)
   const [search, setSearch] = useState("");
+  const [filtroModeloFacturar, setFiltroModeloFacturar] = useState(null);
   const [lines, setLines] = useState(() => initialLines || []);
   const [tipoFc, setTipoFc] = useState(() => initialTipoFc || sugerirTipoFc(condicionIva));
   const hoyISO = new Date().toISOString().slice(0, 10);
@@ -4218,19 +4219,31 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
     })();
   }, [depositoId]);
 
+  // Modelos disponibles para los chips de filtro rápido (2.0, 3.0, GOZEN,
+  // BOWIE, SHONEN...) — se arman a partir de TODO el catálogo, no solo lo que
+  // tiene stock, así se puede elegir un modelo y ver también lo que está en 0
+  // (pedido explícito: "que aparezcan si no hay disponible con 0").
+  const modelosFacturar = useMemo(() => {
+    if (!products) return [];
+    return [...new Set(products.map((p) => extraerModelo(p.name)).filter(Boolean))].sort();
+  }, [products]);
+
   const results = useMemo(() => {
-    if (!products || !search.trim()) return [];
+    if (!products) return [];
+    const tokens = search.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0 && !filtroModeloFacturar) return [];
     // Cada palabra escrita tiene que aparecer en alguna parte del nombre/SKU,
     // sin importar el orden — así "negro xl" encuentra "...T.XL...NEGRO..."
     // aunque en el nombre real el talle venga antes del color.
-    const tokens = search.trim().toLowerCase().split(/\s+/).filter(Boolean);
-    return products
+    let base = products;
+    if (filtroModeloFacturar) base = base.filter((p) => extraerModelo(p.name) === filtroModeloFacturar);
+    return base
       .filter((p) => {
         const haystack = `${p.name || ""} ${p.sku || ""}`.toLowerCase();
         return tokens.every((t) => haystack.includes(t));
       })
-      .slice(0, 12);
-  }, [products, search]);
+      .slice(0, filtroModeloFacturar && tokens.length === 0 ? 40 : 12);
+  }, [products, search, filtroModeloFacturar]);
 
   function addProduct(p) {
     setLines((prev) => {
@@ -4316,7 +4329,14 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
 
         {result ? (
           <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-400">
-            <p className="font-semibold">✓ {TIPO_LABELS[tipoFc] || tipoFc} emitida{result?.Numero ? `: ${result.Numero}` : ""}</p>
+            <p className="font-semibold">
+              ✓ {TIPO_LABELS[result?.tipoDocumentoEmitido] || TIPO_LABELS[tipoFc] || tipoFc} emitida{result?.Numero ? `: ${result.Numero}` : ""}
+            </p>
+            {result?.avisoCambioTipo && (
+              <p className="mt-1.5 rounded-lg border border-amber-300 bg-amber-50 px-2.5 py-1.5 text-xs text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400">
+                ⚠️ {result.avisoCambioTipo}
+              </p>
+            )}
             <p className="mt-1 text-xs">Revisala en Contabilium para confirmar el CAE y el descuento de stock.</p>
             <div className="mt-3 flex flex-wrap gap-2">
               <button
@@ -4371,6 +4391,24 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
           </div>
         ) : (
           <>
+            {modelosFacturar.length > 1 && (
+              <div className="mb-2 flex flex-wrap gap-1">
+                {modelosFacturar.map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => setFiltroModeloFacturar((prev) => (prev === m ? null : m))}
+                    className={`rounded-full px-2.5 py-1 text-[11px] font-semibold transition ${
+                      filtroModeloFacturar === m
+                        ? "bg-slate-900 text-white dark:bg-neutral-700"
+                        : "bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-neutral-800 dark:text-neutral-300 dark:hover:bg-neutral-700"
+                    }`}
+                  >
+                    {m}
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="relative">
               <input
                 type="search"

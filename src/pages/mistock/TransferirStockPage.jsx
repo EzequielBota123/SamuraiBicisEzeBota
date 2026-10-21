@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { getMiDepositoPropio, getMyDepositoStock, getMisVendedores, transferirStockManual, generarRemitoRealManual } from "../../services/comprobantes";
+import { extraerModelo } from "../../utils/bikeName";
 
 // Pantalla simple para mover stock — pensada para usarse sin ayuda, con
 // pasos grandes y pocas decisiones por vez: primero elegís QUÉ hacer
@@ -169,6 +170,7 @@ export function PasoTransferencia({ titulo, origenId, origenNombre, destinoId, d
   const [loadingItems, setLoadingItems] = useState(true);
   const [errorItems, setErrorItems] = useState("");
   const [query, setQuery] = useState("");
+  const [modeloElegido, setModeloElegido] = useState(null);
   const [carrito, setCarrito] = useState([]); // [{sku, name, cantidad, stockActual}]
   const [nota, setNota] = useState("");
   const [conRemito, setConRemito] = useState(true);
@@ -204,14 +206,20 @@ export function PasoTransferencia({ titulo, origenId, origenNombre, destinoId, d
   // más abajo quedaban invisibles a menos que supieras exactamente qué
   // escribir para encontrarlos (bug real: a Alfredo no le aparecía stock
   // que sí tenía cargado, sept 2026).
+  const modelosDisponibles = useMemo(() => {
+    const conStock = (items || []).filter((it) => Number(it.stockActual || 0) > 0);
+    return [...new Set(conStock.map((it) => extraerModelo(it.name)).filter(Boolean))].sort();
+  }, [items]);
+
   const resultados = useMemo(() => {
     const q = query.trim().toLowerCase();
-    const conStock = (items || []).filter((it) => Number(it.stockActual || 0) > 0 && !carrito.some((c) => c.sku === it.sku));
+    let conStock = (items || []).filter((it) => Number(it.stockActual || 0) > 0 && !carrito.some((c) => c.sku === it.sku));
+    if (modeloElegido) conStock = conStock.filter((it) => extraerModelo(it.name) === modeloElegido);
     if (!q) return conStock;
     return conStock.filter(
       (it) => (it.name || "").toLowerCase().includes(q) || (it.sku || "").toLowerCase().includes(q)
     );
-  }, [items, query, carrito]);
+  }, [items, query, carrito, modeloElegido]);
 
   function agregarUnaUnidad(item) {
     setCarrito((prev) => {
@@ -495,6 +503,24 @@ export function PasoTransferencia({ titulo, origenId, origenNombre, destinoId, d
             placeholder={carrito.length > 0 ? "Agregar otra bici a la lista…" : "Buscar bicicleta por nombre o código…"}
             className="w-full rounded-2xl border border-slate-300 bg-white py-3 pl-14 pr-4 text-lg text-slate-700 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40 dark:border-neutral-700 dark:bg-neutral-900 dark:text-white"
           />
+          {modelosDisponibles.length > 1 && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {modelosDisponibles.map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setModeloElegido((prev) => (prev === m ? null : m))}
+                  className={`rounded-full px-3 py-1 text-sm font-semibold transition ${
+                    modeloElegido === m
+                      ? "bg-slate-900 text-white dark:bg-neutral-700"
+                      : "bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-neutral-800 dark:text-neutral-300 dark:hover:bg-neutral-700"
+                  }`}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          )}
           <div className="mt-3 space-y-2">
             {resultados.length === 0 && (
               <p className="text-slate-400">{carrito.length > 0 ? "No hay más unidades disponibles ahí." : "No hay unidades disponibles ahí."}</p>

@@ -9,6 +9,7 @@ import {
   triggerBusinessDashboardSync,
   adminObtenerRemitoDetalle,
   adminEditarObservacionRemito,
+  diagExplorarCompras,
 } from "../../services/comprobantes";
 import { subscribeCobranzas } from "../../services/cobranzas";
 import { movimientosPorChofer, salidasPorDeposito, detectarChoferesEnTexto } from "../../utils/movimientosChofer";
@@ -180,6 +181,8 @@ export default function RemitosReporte() {
   const fileInputRef = useRef(null);
   const porClienteRef = useRef(null);
   const [sincronizando, setSincronizando] = useState(false);
+  const [diagCargando, setDiagCargando] = useState(false);
+  const [diagResultado, setDiagResultado] = useState(null);
   const [syncError, setSyncError] = useState("");
   const [syncResult, setSyncResult] = useState(null);
   const [mostrarImportManual, setMostrarImportManual] = useState(false);
@@ -265,6 +268,23 @@ export default function RemitosReporte() {
       setSyncError(err.message || "No se pudo sincronizar con Contabilium");
     } finally {
       setSincronizando(false);
+    }
+  }
+
+  // Botón de diagnóstico temporal (21/10/2026) — investiga si Contabilium
+  // tiene algún registro de compras/ingreso de stock con precio, para poder
+  // reconstruir una valorización de stock histórica. Se borra una vez
+  // resuelto.
+  async function handleDiagCompras() {
+    setDiagCargando(true);
+    setDiagResultado(null);
+    try {
+      const r = await diagExplorarCompras();
+      setDiagResultado(r);
+    } catch (err) {
+      setDiagResultado({ error: err.message || "No se pudo investigar" });
+    } finally {
+      setDiagCargando(false);
     }
   }
 
@@ -878,6 +898,19 @@ export default function RemitosReporte() {
           >
             {sincronizando ? "Sincronizando…" : "🔄 Actualizar desde Contabilium"}
           </button>
+          <button
+            type="button"
+            onClick={handleDiagCompras}
+            disabled={diagCargando}
+            className="ml-2 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-700 transition hover:bg-amber-100 disabled:opacity-60 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-400"
+          >
+            {diagCargando ? "Investigando…" : "🔍 Buscar compras en CTB (diagnóstico)"}
+          </button>
+          {diagResultado && (
+            <div className="mt-2 max-h-96 max-w-2xl overflow-auto rounded-xl border border-amber-200 bg-amber-50/60 p-3 text-left text-[10px] text-slate-700 dark:border-amber-900 dark:bg-amber-950/10 dark:text-neutral-300">
+              <pre className="whitespace-pre-wrap">{JSON.stringify(diagResultado, null, 2)}</pre>
+            </div>
+          )}
           {remitosDetail?.updatedAt?.toDate && (
             <p className="mt-1 text-[11px] text-slate-400 dark:text-neutral-500">
               Última actualización: {remitosDetail.updatedAt.toDate().toLocaleString("es-AR")} (remitos se actualizan solos cada 2hs, facturas cada 24hs — este

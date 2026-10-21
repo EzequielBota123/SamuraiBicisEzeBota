@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { subscribeProducts } from "../../services/products";
 import { filterBySearch } from "../../utils/colorSearch";
+import { extraerModelo } from "../../utils/bikeName";
 
 const money = (n) =>
   Number(n || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 });
@@ -10,6 +11,7 @@ export default function RequestStockModal({ open, onClose, onSubmit }) {
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [cat, setCat] = useState("all");
+  const [modelo, setModelo] = useState(null);
   const [cart, setCart] = useState({}); // { productId: qty }
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState("");
@@ -31,6 +33,7 @@ export default function RequestStockModal({ open, onClose, onSubmit }) {
     if (open) {
       setSearch("");
       setCat("all");
+      setModelo(null);
       setCart({});
       setSubmitError("");
       setDone(false);
@@ -38,11 +41,17 @@ export default function RequestStockModal({ open, onClose, onSubmit }) {
     }
   }, [open]);
 
+  const modelosDisponibles = useMemo(() => {
+    const bicis = cat === "all" ? products : products.filter((p) => (p.category || "").toUpperCase() === cat);
+    return [...new Set(bicis.map((p) => extraerModelo(p.name)).filter(Boolean))].sort();
+  }, [products, cat]);
+
   const filtered = useMemo(() => {
     let list = products;
     if (cat !== "all") list = list.filter((p) => (p.category || "").toUpperCase() === cat);
+    if (modelo) list = list.filter((p) => extraerModelo(p.name) === modelo);
     return filterBySearch(list, search);
-  }, [products, cat, search]);
+  }, [products, cat, modelo, search]);
 
   const cartItems = useMemo(
     () =>
@@ -154,7 +163,10 @@ export default function RequestStockModal({ open, onClose, onSubmit }) {
               ].map((c) => (
                 <button
                   key={c.id}
-                  onClick={() => setCat(c.id)}
+                  onClick={() => {
+                    setCat(c.id);
+                    setModelo(null);
+                  }}
                   className={`shrink-0 rounded-2xl px-4 py-2 text-sm font-semibold transition ${
                     cat === c.id ? "bg-slate-900 text-white" : "border border-slate-200 text-slate-600 hover:bg-slate-100"
                   }`}
@@ -164,6 +176,21 @@ export default function RequestStockModal({ open, onClose, onSubmit }) {
               ))}
             </div>
           </div>
+          {modelosDisponibles.length > 1 && (
+            <div className="flex gap-2 overflow-x-auto border-b border-slate-200 px-4 py-3 sm:flex-wrap sm:overflow-visible sm:px-6">
+              {modelosDisponibles.map((m) => (
+                <button
+                  key={m}
+                  onClick={() => setModelo((prev) => (prev === m ? null : m))}
+                  className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-semibold transition ${
+                    modelo === m ? "bg-slate-900 text-white" : "border border-slate-200 text-slate-600 hover:bg-slate-100"
+                  }`}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          )}
 
           <div className="flex-1 overflow-y-auto px-4 py-5 sm:px-6">
             {loading && <p className="py-10 text-center text-sm text-slate-500">Cargando catálogo…</p>}

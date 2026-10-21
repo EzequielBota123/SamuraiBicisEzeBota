@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { getContabiliumDepositos } from "../../services/contabiliumDepositos";
 import { getDepositoStockAdmin } from "../../services/comprobantes";
 import { filterBySearch } from "../../utils/colorSearch";
+import { extraerModelo } from "../../utils/bikeName";
 
 function isBici(item) {
   return (item.category || "").toUpperCase() === "BICICLETAS";
@@ -27,6 +28,7 @@ export default function DepositosFepaPanel() {
   const [error, setError] = useState("");
   const [modo, setModo] = useState("combinado"); // "combinado" | "separado"
   const [queryCombinado, setQueryCombinado] = useState("");
+  const [modeloCombinado, setModeloCombinado] = useState(null);
   const [queriesPorDeposito, setQueriesPorDeposito] = useState({});
 
   useEffect(() => {
@@ -81,7 +83,15 @@ export default function DepositosFepaPanel() {
     [itemsConOrigen]
   );
 
-  const resultadosCombinado = useMemo(() => filterBySearch(itemsConOrigen, queryCombinado), [itemsConOrigen, queryCombinado]);
+  const modelosCombinado = useMemo(
+    () => [...new Set(itemsConOrigen.filter(isBici).map((it) => extraerModelo(it.name)).filter(Boolean))].sort(),
+    [itemsConOrigen]
+  );
+
+  const resultadosCombinado = useMemo(() => {
+    const base = modeloCombinado ? itemsConOrigen.filter((it) => extraerModelo(it.name) === modeloCombinado) : itemsConOrigen;
+    return filterBySearch(base, queryCombinado);
+  }, [itemsConOrigen, queryCombinado, modeloCombinado]);
 
   if (loadingItems && !deposits) {
     return (
@@ -146,6 +156,24 @@ export default function DepositosFepaPanel() {
             placeholder="Buscar bicicleta por nombre, SKU o color…"
             className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-indigo-400 dark:border-neutral-700 dark:bg-neutral-900 dark:text-white"
           />
+          {modelosCombinado.length > 1 && (
+            <div className="mt-2 flex flex-wrap gap-1">
+              {modelosCombinado.map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setModeloCombinado((prev) => (prev === m ? null : m))}
+                  className={`rounded-full px-2.5 py-1 text-[11px] font-semibold transition ${
+                    modeloCombinado === m
+                      ? "bg-indigo-600 text-white"
+                      : "bg-indigo-100 text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-950/40 dark:text-indigo-400"
+                  }`}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          )}
           <div className="mt-3 space-y-1.5">
             {resultadosCombinado.length === 0 && (
               <p className="rounded-xl border border-dashed border-slate-300 p-3 text-center text-xs text-slate-400 dark:border-neutral-700">

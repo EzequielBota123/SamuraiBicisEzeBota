@@ -515,9 +515,12 @@ async function crearDepositoWeb({ db, email, password, nombre, direccion, telefo
 // de sesión (mismo sessionId en todos los pedidos) donde primero se van
 // agregando los ítems uno por uno (agregarItem, con el IVA adentro) y
 // recién al final se confirma todo junto (guardar). El CAE (autorización
-// AFIP) se sigue pidiendo por la API REST ya existente
-// (emitirFacturaElectronica) — el comprobante que crea este flujo web es el
-// mismo objeto de Contabilium, se puede seguir operando por REST después.
+// AFIP) también se pide acá mismo, por el webmethod real "generarCae" (ver
+// más abajo) — NO por la API REST (emitirFacturaElectronica), que calcula
+// mal la condición de IVA del receptor en algunos casos (visto con
+// Calderaro, 21/10/2026: la REST rechazaba, la consola clásica facturaba
+// bien con los mismos datos). El comprobante que crea este flujo web es el
+// mismo objeto de Contabilium, se puede seguir leyendo por REST después.
 //
 // Constantes fijas de la cuenta (sacadas de la captura, confirmadas con
 // Ezequiel 1/10/2026):
@@ -649,13 +652,68 @@ async function crearComprobanteWeb({
     return idComprobante;
   };
 
+  let idComprobante;
   try {
-    return await intentar();
+    idComprobante = await intentar();
   } catch (err) {
     console.warn("[contabiliumWebAutomation] crearComprobanteWeb: primer intento falló, reintentando con sesión nueva:", err.message);
     await invalidarCookie(db);
     cookie = await getCookieValida(db, email, password);
-    return await intentar();
+    idComprobante = await intentar();
+  }
+
+  // Pide el CAE por el MISMO camino que usa un humano clickeando "Emitir
+  // factura eléctronica" en la consola clásica (webmethod "generarCae" de
+  // comprobantese.aspx) — NO por la API REST pública (emitirFacturaElectronica
+  // en contabiliumService.js, que sigue existiendo para casos viejos/COT).
+  // Confirmado por captura real (21/10/2026, caso Calderaro): la REST
+  // rechazaba con "Condicion IVA receptor no es valido para la clase de
+  // comprobante informado" un comprobante que la consola clásica facturaba
+  // sin problema con los mismos datos — la REST calcula ese código distinto
+  // (y peor) que el webmethod real, no es un problema del dato cargado.
+  //
+  // A propósito, este paso queda AFUERA del reintento-con-sesión-nueva de
+  // arriba: si generarCae falla, no tiene sentido volver a crear TODO el
+  // borrador de cero (agregarItem + guardar) — eso solo dejaría un segundo
+  // borrador huérfano. El llamador (emitirComprobanteConIva en index.js) es
+  // quien decide qué hacer con un error acá (reintentar con otro tipo de
+  // comprobante, limpiar el huérfano, etc.), usando el idComprobante que le
+  // adjuntamos al error.
+  try {
+    const cae = await postWebMethod(
+      cookie,
+      "generarCae",
+      {
+        sessionId,
+        id: idComprobante,
+        idPersona,
+        tipo: tipoFc,
+        modo: "E",
+        fecha: fechaStr,
+        condicionVenta: String(condicionVenta),
+        tipoConcepto: 3,
+        fechaVencimiento: fechaVtoStr,
+        fechaServDesde: "",
+        fechaServHasta: "",
+        idPuntoVenta: CONTABILIUM_ID_PUNTO_VENTA,
+        nroComprobante: "",
+        obs: observaciones || "",
+        idMoneda: CONTABILIUM_ID_MONEDA_ARS,
+        tipoDeCambio: "1",
+        fceMiPYME: false,
+        motivoNC: "",
+        cancelaEnMismaMoneda: false,
+        // Solo relevante cuando se factura a un cliente RI tildando
+        // "Emitir como consumidor final" en la consola — no es un flujo que
+        // usemos acá, siempre false.
+        forzarCF: false,
+      },
+      COMPROBANTE_EDITAR_PAGE
+    );
+    return { idComprobante, cae };
+  } catch (err) {
+    err.idComprobanteBorrador = idComprobante;
+    throw err;
   }
 }
 
@@ -1556,11 +1614,334 @@ async function probarWebmethodsMovimientos({ db, email, password }) {
   return resultados;
 }
 
+// Investigación puntual (SOLO LECTURA): el usuario encontró a mano
+// /modulos/reportes/historicoStock.aspx, un reporte de Contabilium que
+// podría traer el stock a una fecha pasada — justo lo que hace falta para
+// valorizar el stock al 31/12/2025 (pedido 21/10/2026). Baja el HTML de esa
+// página (para ver inputs/fecha/JS) y después prueba webmethods candidatos
+// típicos de ASP.NET con un rango de fechas, a ver si alguno responde JSON.
+const HISTORICO_STOCK_PAGE = `${BASE}/modulos/reportes/historicoStock.aspx`;
+
+async function explorarHistoricoStock({ db, email, password, fecha }) {
+  const cookie = await getCookieValida(db, email, password);
+  // Un GET directo a esta URL devolvía la página de login aunque el cookie
+  // es válido (confirmado: otra página con el mismo cookie sí funciona) —
+  // probablemente chequea el Referer para confirmar que se navega "desde
+  // adentro" del sitio, no una entrada directa.
+  const res = await fetch(HISTORICO_STOCK_PAGE, {
+    headers: { Cookie: cookie, "User-Agent": "Mozilla/5.0", Referer: `${BASE}/modulos/home/home.aspx` },
+  });
+  const html = await res.text();
+
+  // Junta nombres de webmethods mencionados en el HTML/JS de la página
+  // (patrón "PageMethods.Nombre(" o similar) para no tener que adivinar
+  // completamente a ciegas.
+  const webmethodsEnHtml = [...new Set(
+    [...html.matchAll(/PageMethods\.(\w+)\(/g)].map((m) => m[1])
+  )];
+
+  const apiHeaders = (extra = {}) => ({
+    Accept: "application/json, text/plain, */*",
+    Origin: BASE,
+    Referer: HISTORICO_STOCK_PAGE,
+    Cookie: cookie,
+    ...extra,
+  });
+  const candidatos = [
+    ...webmethodsEnHtml,
+    "ObtenerHistoricoStock", "BuscarHistoricoStock", "GetHistoricoStock",
+    "ObtenerStockHistorico", "BuscarStockHistorico", "ObtenerStockAFecha",
+    "ObtenerReporte", "BuscarReporte", "ObtenerDatos", "Buscar",
+  ];
+  const fechaUsar = fecha || "2025-12-31";
+  const bodiesAProbar = [
+    { fecha: fechaUsar },
+    { fechaHasta: fechaUsar },
+    { fechaDesde: fechaUsar, fechaHasta: fechaUsar },
+    { page: 1, pageSize: 20 },
+    {},
+  ];
+  const resultados = [];
+  for (const metodo of [...new Set(candidatos)]) {
+    for (const body of bodiesAProbar) {
+      try {
+        const r = await fetch(`${HISTORICO_STOCK_PAGE}/${metodo}`, {
+          method: "POST",
+          headers: apiHeaders({ "Content-Type": "application/json;charset=UTF-8" }),
+          body: JSON.stringify(body),
+        });
+        const text = await r.text();
+        let esJson = false;
+        try { JSON.parse(text); esJson = true; } catch {}
+        if (r.ok && esJson) {
+          resultados.push({ metodo, body, status: r.status, muestra: text.slice(0, 500) });
+          break;
+        }
+      } catch {}
+    }
+  }
+
+  return {
+    htmlLength: html.length,
+    webmethodsEncontradosEnHtml: webmethodsEnHtml,
+    webmethodsQueRespondenJson: resultados,
+    htmlMuestra: html.slice(0, 2000),
+  };
+}
+
+// El GET directo con cookie reusada a historicoStock.aspx siempre volvía al
+// login (confirmado: el mismo cookie SÍ funciona en otras páginas clásicas)
+// — esta pantalla parece necesitar una sesión de navegador real, no solo el
+// cookie. Acá se abre Puppeteer, se loguea de cero, y se navega/completa el
+// formulario como lo haría una persona (depósito + fechas + Buscar), para
+// después leer la tabla resultante directo del DOM. Solo lectura.
+async function obtenerHistoricoStockReal({ email, password, depositoNombre, fechaDesde, fechaHasta }) {
+  const browser = await puppeteer.launch({
+    args: chromium.args,
+    executablePath: await chromium.executablePath(),
+    headless: true,
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    );
+    await page.goto(`${BASE}/`, { waitUntil: "networkidle2", timeout: 60000 });
+
+    const emailSelector = 'input[placeholder*="mail" i]';
+    const passSelector = 'input[type="password"]';
+    await page.waitForSelector(emailSelector, { timeout: 45000 });
+    await page.type(emailSelector, email, { delay: 20 });
+    await page.type(passSelector, password, { delay: 20 });
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 60000 }).catch(() => {}),
+      page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll("button"));
+        const ingresar = btns.find((b) => /ingresar/i.test(b.textContent || ""));
+        if (ingresar) ingresar.click();
+      }),
+    ]);
+    if (/\/login/i.test(page.url())) {
+      throw new Error(`El login no avanzó, seguimos en ${page.url()}`);
+    }
+
+    // Igual que en loginYSacarCookie: la cookie clásica se termina de armar
+    // recién al visitar una pantalla del módulo viejo.
+    await page.goto(STOCK_PAGE, { waitUntil: "networkidle2", timeout: 60000 });
+
+    await page.goto(HISTORICO_STOCK_PAGE, { waitUntil: "networkidle2", timeout: 60000 });
+    if (/\/login/i.test(page.url())) {
+      const bodySnippet = await page.evaluate(() => document.body?.innerText?.slice(0, 400) || "").catch(() => "");
+      return { ok: false, error: `Navegando de verdad igual terminó en login (url=${page.url()}). Extracto: ${bodySnippet}` };
+    }
+
+    // Si no piden filtrar nada, devolvemos solo el diagnóstico de la
+    // estructura del formulario (selectores reales), sin tocar nada más.
+    if (!depositoNombre && !fechaDesde && !fechaHasta) {
+      const estructuraFormulario = await page.evaluate(() => {
+        const campos = [];
+        document.querySelectorAll("label").forEach((lbl) => {
+          const texto = (lbl.textContent || "").trim();
+          if (texto) campos.push({ label: texto });
+        });
+        const inputs = Array.from(document.querySelectorAll("input")).map((i) => ({
+          tag: "input", type: i.type, id: i.id, name: i.name, placeholder: i.placeholder, value: i.value,
+        }));
+        const selects = Array.from(document.querySelectorAll("select")).map((s) => ({
+          tag: "select", id: s.id, name: s.name,
+          opciones: Array.from(s.options).map((o) => o.textContent.trim()).slice(0, 10),
+        }));
+        return { labels: campos, inputs, selects, bodyTextSample: document.body.innerText.slice(0, 500) };
+      });
+      return { ok: true, url: page.url(), estructuraFormulario };
+    }
+
+    // Depósito: <select id="ddlInventarios"> con el nombre tal cual figura
+    // en Contabilium — se elige por texto visible, no por value (no lo
+    // conocemos de antemano).
+    if (depositoNombre) {
+      const elegido = await page.evaluate((nombre) => {
+        const sel = document.getElementById("ddlInventarios");
+        if (!sel) return { ok: false, error: "No se encontró el select de depósito (ddlInventarios)" };
+        const opt = Array.from(sel.options).find(
+          (o) => o.textContent.trim().toUpperCase() === nombre.trim().toUpperCase()
+        );
+        if (!opt) {
+          return { ok: false, error: `No se encontró el depósito "${nombre}" en el select`, opciones: Array.from(sel.options).map((o) => o.textContent.trim()) };
+        }
+        sel.value = opt.value;
+        sel.dispatchEvent(new Event("change", { bubbles: true }));
+        return { ok: true };
+      }, depositoNombre);
+      if (!elegido.ok) return elegido;
+    }
+
+    // Fechas: inputs de texto dd/mm/yyyy con máscara/datepicker propio —
+    // hay que limpiar el campo de verdad (seleccionar todo + borrar) antes
+    // de tipear, y disparar los eventos que la máscara espera.
+    async function setFecha(selectorId, ddmmyyyy) {
+      if (!ddmmyyyy) return;
+      await page.click(`#${selectorId}`);
+      // La máscara del campo no se vacía con un simple "select all + borrar"
+      // (quedaba una mezcla del valor viejo con el nuevo) — se borra de a un
+      // caracter por vez con Backspace hasta vaciarlo de verdad.
+      await page.evaluate((id) => document.getElementById(id)?.focus(), selectorId);
+      for (let i = 0; i < 15; i++) {
+        await page.keyboard.press("End");
+        await page.keyboard.press("Backspace");
+      }
+      await page.type(`#${selectorId}`, ddmmyyyy, { delay: 40 });
+      await page.evaluate((id) => {
+        const el = document.getElementById(id);
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        el.dispatchEvent(new Event("blur", { bubbles: true }));
+      }, selectorId);
+    }
+    await setFecha("txtFechaDesde", fechaDesde);
+    await setFecha("txtFechaHasta", fechaHasta);
+
+    const debugAntesDeBuscar = await page.evaluate(() => ({
+      fechaDesdeDOM: document.getElementById("txtFechaDesde")?.value,
+      fechaHastaDOM: document.getElementById("txtFechaHasta")?.value,
+      depositoDOM: document.getElementById("ddlInventarios")?.value,
+      depositoTextoDOM: document.getElementById("ddlInventarios")?.selectedOptions?.[0]?.textContent,
+      erroresVisibles: Array.from(document.querySelectorAll("*"))
+        .filter((e) => /es mayor a la fecha/i.test(e.textContent || "") && e.children.length === 0 && e.offsetParent !== null)
+        .map((e) => e.textContent.trim()),
+    }));
+
+    // Botón "Buscar" — no es un <input>, es un <button> con ese texto.
+    const clickeoBuscar = await page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll("button, a, input[type=button]"));
+      const buscar = btns.find((b) => /^buscar$/i.test((b.textContent || b.value || "").trim()));
+      if (!buscar) return { ok: false, error: "No se encontró el botón Buscar", textosVistos: btns.map((b) => (b.textContent || b.value || "").trim()).filter(Boolean).slice(0, 30) };
+      buscar.click();
+      return { ok: true };
+    });
+    if (!clickeoBuscar.ok) return clickeoBuscar;
+
+    await page.waitForNetworkIdle({ idleTime: 1000, timeout: 30000 }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 1500));
+
+    // Scrapea la tabla de resultados + pagina hasta el final (botón → al
+    // lado de "Mostrando X-Y de Z"), juntando todas las filas.
+    async function leerFilasTabla() {
+      return page.evaluate(() => {
+        const filas = [];
+        const tablas = Array.from(document.querySelectorAll("table"));
+        // La tabla de resultados es la que tiene headers tipo "Fecha"/"Depósito"/"Stock actualizado".
+        const tabla = tablas.find((t) => /stock actualizado/i.test(t.innerText));
+        if (!tabla) return filas;
+        const filasTr = Array.from(tabla.querySelectorAll("tbody tr"));
+        for (const tr of filasTr) {
+          const celdas = Array.from(tr.querySelectorAll("td")).map((td) => td.innerText.trim());
+          if (celdas.length >= 8) {
+            filas.push({
+              fecha: celdas[0], deposito: celdas[1], accion: celdas[2], codigo: celdas[3],
+              producto: celdas[4], cantidadModificada: celdas[5], stockActualizado: celdas[6],
+              observaciones: celdas[7], modificadoPor: celdas[8] || "",
+            });
+          }
+        }
+        return filas;
+      });
+    }
+
+    const todasLasFilas = [];
+    let totalTexto = await page.evaluate(() => {
+      const el = Array.from(document.querySelectorAll("*")).find((e) => /Mostrando \d+/i.test(e.textContent || "") && e.children.length === 0);
+      return el ? el.textContent.trim() : null;
+    });
+    let seguir = true;
+    let vueltas = 0;
+    while (seguir && vueltas < 500) {
+      vueltas++;
+      const filas = await leerFilasTabla();
+      todasLasFilas.push(...filas);
+      const avanzo = await page.evaluate(() => {
+        const candidatos = Array.from(document.querySelectorAll("button, a"));
+        const siguiente = candidatos.find((b) => {
+          const t = (b.getAttribute("aria-label") || b.title || b.textContent || "").trim();
+          return /^(→|siguiente|next|>)$/i.test(t) || t === "›";
+        });
+        if (!siguiente || siguiente.disabled || siguiente.classList.contains("disabled")) return false;
+        siguiente.click();
+        return true;
+      });
+      if (!avanzo) seguir = false;
+      else await new Promise((r) => setTimeout(r, 1200));
+    }
+
+    return { ok: true, debugAntesDeBuscar, totalTexto, totalFilas: todasLasFilas.length, filas: todasLasFilas };
+  } catch (err) {
+    return { ok: false, error: err.message || String(err) };
+  } finally {
+    await browser.close();
+  }
+}
+
 // Investigación puntual (solo lectura, no escribe nada): busca en el HTML
 // de varias pantallas del sitio clásico algún link o referencia a un
 // módulo de "depósitos" (para poder eventualmente renombrarlos), y en las
 // páginas candidatas que encuentra, junta los nombres de webmethods que el
 // propio HTML/JS menciona (patrón típico de ASP.NET: "Pagina.aspx/Metodo").
+// Investigación puntual (SOLO LECTURA): busca en el HTML de varias
+// pantallas del sitio clásico algún link o mención a compras/proveedores/
+// ingreso de stock — para encontrar dónde (si existe) Contabilium guarda el
+// precio con el que entró cada unidad al stock, necesario para reconstruir
+// una valorización histórica a una fecha pasada (pedido 21/10/2026).
+async function explorarModuloCompras({ db, email, password }) {
+  const cookie = await getCookieValida(db, email, password);
+  const paginasBase = [
+    `${BASE}/`,
+    `${BASE}/modulos/home/home.aspx`,
+    `${BASE}/modulos/inventarios/inventarios.aspx`,
+    `${BASE}/modulos/inventarios/movimientosDeStocke.aspx`,
+  ];
+  const htmlsPorPagina = {};
+  for (const url of paginasBase) {
+    try {
+      const res = await fetch(url, { headers: { Cookie: cookie, "User-Agent": "Mozilla/5.0" } });
+      htmlsPorPagina[url] = { status: res.status, html: await res.text() };
+    } catch (e) {
+      htmlsPorPagina[url] = { status: null, error: e.message };
+    }
+  }
+
+  const palabrasClave = /compra|proveedor|ingreso\s*de\s*stock|alta\s*de\s*stock|orden\s*de\s*compra/i;
+  const linkConTextoRegex = /<a[^>]*href=["']([^"']+)["'][^>]*>([^<]{0,80})<\/a>/gi;
+  const menuCandidatos = new Set();
+  for (const [, { html }] of Object.entries(htmlsPorPagina)) {
+    if (!html) continue;
+    let m;
+    while ((m = linkConTextoRegex.exec(html))) {
+      const [, href, texto] = m;
+      if (palabrasClave.test(texto)) menuCandidatos.add(`${texto.trim()} -> ${href}`);
+    }
+  }
+
+  // Texto plano del cuerpo (por si el menú arma la navegación por JS y el
+  // texto no está en un <a href>).
+  const contextoPorPagina = {};
+  for (const [pagina, { html }] of Object.entries(htmlsPorPagina)) {
+    if (!html) continue;
+    const textoPlano = html.replace(/\s+/g, " ");
+    const hits = [];
+    let mh;
+    const buscador = /compra\w*|proveedor\w*/gi;
+    while ((mh = buscador.exec(textoPlano)) && hits.length < 15) {
+      hits.push(textoPlano.slice(Math.max(0, mh.index - 60), mh.index + 60));
+    }
+    if (hits.length) contextoPorPagina[pagina] = hits;
+  }
+
+  return {
+    paginasCandidatasPorTextoDeMenu: [...menuCandidatos].sort(),
+    contextoDeMencionesEnElCuerpo: contextoPorPagina,
+    tamañosHtmlBase: Object.fromEntries(Object.entries(htmlsPorPagina).map(([k, v]) => [k, v.html ? v.html.length : v.error])),
+  };
+}
+
 async function explorarModuloDepositos({ db, email, password }) {
   const cookie = await getCookieValida(db, email, password);
 
@@ -2072,6 +2453,9 @@ module.exports = {
   diagObtenerRemito,
   probarWebmethodsMovimientos,
   explorarModuloDepositos,
+  explorarModuloCompras,
+  explorarHistoricoStock,
+  obtenerHistoricoStockReal,
   renombrarDepositoWeb,
   crearDepositoWeb,
   crearComprobanteWeb,

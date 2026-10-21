@@ -4,7 +4,8 @@
 // es texto de observación de remito adivinado, es el movimiento de stock
 // tal cual quedó cargado.
 import { Fragment, useEffect, useMemo, useState } from "react";
-import { obtenerMovimientosStock } from "../../services/comprobantes";
+import { obtenerMovimientosStock, searchContabiliumClientes, adminGetClientPhone } from "../../services/comprobantes";
+import { generateEtiquetasPdf } from "../../utils/generateEtiquetasPdf";
 
 const MESES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
 const DIAS_SEMANA = ["L", "M", "X", "J", "V", "S", "D"];
@@ -118,6 +119,8 @@ export default function SectorMovimientoStock() {
 
   return (
     <div>
+      <GeneradorEtiquetaRapido />
+
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-lg font-bold text-slate-900 dark:text-white">🚚 Movimiento de stock (en vivo, directo de Contabilium)</h2>
@@ -170,6 +173,128 @@ export default function SectorMovimientoStock() {
           <MovimientosEntreDeposito bicis={bicis} />
         </>
       )}
+    </div>
+  );
+}
+
+// Panel bien visible arriba de todo: tipear cliente + destino y bajar la
+// hoja de etiquetas al toque, sin tener que ir a buscar el remito puntual
+// en la lista de abajo (pedido explícito 21/10/2026 — antes solo se podía
+// generar desde el botón al lado de cada remito).
+function GeneradorEtiquetaRapido() {
+  const [query, setQuery] = useState("");
+  const [cliente, setCliente] = useState("");
+  const [destino, setDestino] = useState("");
+  const [resultados, setResultados] = useState([]);
+  const [buscando, setBuscando] = useState(false);
+  const [buscandoDireccion, setBuscandoDireccion] = useState(false);
+  const [mostrarLista, setMostrarLista] = useState(false);
+
+  useEffect(() => {
+    const q = query.trim();
+    if (q.length < 3 || q === cliente) {
+      setResultados([]);
+      return;
+    }
+    let cancelado = false;
+    setBuscando(true);
+    const timer = setTimeout(() => {
+      searchContabiliumClientes(q)
+        .then((r) => {
+          if (!cancelado) setResultados(r.resultados || []);
+        })
+        .catch(() => {
+          if (!cancelado) setResultados([]);
+        })
+        .finally(() => {
+          if (!cancelado) setBuscando(false);
+        });
+    }, 350);
+    return () => {
+      cancelado = true;
+      clearTimeout(timer);
+    };
+  }, [query, cliente]);
+
+  async function elegirCliente(r) {
+    setCliente(r.razonSocial);
+    setQuery(r.razonSocial);
+    setMostrarLista(false);
+    setResultados([]);
+    setDestino("Buscando dirección…");
+    setBuscandoDireccion(true);
+    try {
+      const d = await adminGetClientPhone(r.contabiliumId);
+      const partes = [d.direccion, d.ciudad, d.provincia].filter(Boolean);
+      setDestino(partes.join(", ") || "");
+    } catch {
+      setDestino("");
+    } finally {
+      setBuscandoDireccion(false);
+    }
+  }
+
+  function generar() {
+    if (!cliente.trim() || !destino.trim()) return;
+    generateEtiquetasPdf(
+      { cliente: cliente.trim(), destino: destino.trim() },
+      { fileName: `Etiquetas ${cliente.trim()}.pdf` }
+    );
+  }
+
+  return (
+    <div className="mb-5 rounded-2xl border border-indigo-200 bg-indigo-50/60 p-4 dark:border-indigo-900 dark:bg-indigo-950/10">
+      <h2 className="text-sm font-bold text-indigo-800 dark:text-indigo-400">🏷️ Generar etiqueta de envío</h2>
+      <div className="mt-2 flex flex-wrap items-end gap-2">
+        <div className="relative min-w-[220px] flex-1">
+          <label className="mb-1 block text-[11px] font-medium text-slate-500 dark:text-neutral-400">Cliente</label>
+          <input
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setCliente("");
+              setMostrarLista(true);
+            }}
+            onFocus={() => setMostrarLista(true)}
+            placeholder="Escribí para buscar…"
+            className="w-full rounded-lg border border-indigo-200 bg-white px-2.5 py-1.5 text-sm dark:border-indigo-900 dark:bg-neutral-900 dark:text-white"
+          />
+          {mostrarLista && (buscando || resultados.length > 0) && (
+            <div className="absolute z-10 mt-1 max-h-64 w-full overflow-y-auto rounded-lg border border-indigo-200 bg-white shadow-lg dark:border-indigo-900 dark:bg-neutral-900">
+              {buscando && <p className="px-3 py-2 text-xs text-slate-400 dark:text-neutral-500">Buscando…</p>}
+              {!buscando &&
+                resultados.map((r) => (
+                  <button
+                    key={r.contabiliumId}
+                    onClick={() => elegirCliente(r)}
+                    className="block w-full px-3 py-2 text-left text-xs text-slate-700 hover:bg-indigo-50 dark:text-neutral-200 dark:hover:bg-indigo-950/30"
+                  >
+                    {r.razonSocial}
+                    {r.cuit && <span className="ml-1 text-slate-400 dark:text-neutral-500">({r.cuit})</span>}
+                  </button>
+                ))}
+            </div>
+          )}
+        </div>
+        <div className="min-w-[260px] flex-[2]">
+          <label className="mb-1 block text-[11px] font-medium text-slate-500 dark:text-neutral-400">
+            Dirección de destino {buscandoDireccion && "(buscando…)"}
+          </label>
+          <input
+            value={destino}
+            onChange={(e) => setDestino(e.target.value)}
+            placeholder="Calle, número, localidad, provincia"
+            className="w-full rounded-lg border border-indigo-200 bg-white px-2.5 py-1.5 text-sm dark:border-indigo-900 dark:bg-neutral-900 dark:text-white"
+          />
+        </div>
+        <button
+          onClick={generar}
+          disabled={!cliente.trim() || !destino.trim()}
+          className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-700 disabled:opacity-50"
+        >
+          📥 Generar PDF
+        </button>
+      </div>
     </div>
   );
 }

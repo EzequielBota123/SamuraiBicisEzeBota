@@ -9,6 +9,7 @@ import { transferirStockManual, generarRemitoRealManual, descargarRemitoPorArchi
 import { crearViaje } from "../../services/logisticaViajes";
 import { useAuth } from "../../auth/AuthContext";
 import { BusyButtonContent, LoadingOverlay } from "../../components/ui/LoadingIndicators";
+import { extraerModelo } from "../../utils/bikeName";
 
 // Baja un PDF ya en base64 (sin pedirlo de nuevo al servidor) con el nombre
 // de archivo que se le pase.
@@ -1249,6 +1250,28 @@ function ConfirmarEnvioPanel({ order, onEnvioConfirmado }) {
                         placeholder="Buscar bici por nombre o SKU…"
                         className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs dark:border-neutral-700 dark:bg-neutral-800"
                       />
+                      {(() => {
+                        const modelos = [...new Set(catalogoDeposito.map((p) => extraerModelo(p.name)).filter(Boolean))].sort();
+                        if (modelos.length < 2) return null;
+                        return (
+                          <div className="flex flex-wrap gap-1">
+                            {modelos.map((m) => (
+                              <button
+                                type="button"
+                                key={m}
+                                onClick={() => setFiltroSustituto((prev) => (prev === m ? "" : m))}
+                                className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                                  filtroSustituto === m
+                                    ? "bg-slate-900 text-white dark:bg-neutral-700"
+                                    : "bg-slate-100 text-slate-600 dark:bg-neutral-800 dark:text-neutral-300"
+                                }`}
+                              >
+                                {m}
+                              </button>
+                            ))}
+                          </div>
+                        );
+                      })()}
                       <div className="max-h-40 overflow-y-auto rounded-lg border border-slate-200 dark:border-neutral-700">
                         {catalogoDeposito.length === 0 && (
                           <p className="px-2 py-1.5 text-slate-400">Cargando catálogo…</p>

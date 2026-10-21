@@ -151,13 +151,23 @@ export default function SaleRequests() {
     if (!facturaNumero) return;
     if (
       !confirm(
-        "Al marcarla, el sistema va a verificar que esa factura exista de verdad en Contabilium y va a intentar descontar el stock real del depósito automáticamente. ¿Confirmás?"
+        "Primero se verifica que esa factura exista de verdad en Contabilium para este cliente. ¿Confirmás?"
       )
     )
       return;
+    // Lo decide quien cargó la factura en Contabilium, no el sistema: si
+    // quedó vinculada a un depósito, Contabilium ya descontó el stock solo
+    // (descontarlo de nuevo acá lo restaría dos veces). Si se cargó sin
+    // depósito vinculado, Contabilium nunca se enteró y hace falta este
+    // ajuste manual como respaldo.
+    const stockYaDescontado = confirm(
+      "¿La factura quedó vinculada a un depósito en Contabilium?\n\n" +
+        "Aceptar = Sí, ya descontó el stock solo (no tocar nada más).\n" +
+        "Cancelar = No / no estoy seguro — que Samurai descuente el stock a mano."
+    );
     setResolvingId(id);
     try {
-      const result = await resolveSaleRequest(id, facturaNumero);
+      const result = await resolveSaleRequest(id, facturaNumero, stockYaDescontado);
       const avisos = [];
       if (!result.montoCoincide) {
         avisos.push(

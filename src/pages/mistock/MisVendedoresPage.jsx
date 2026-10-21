@@ -7,6 +7,7 @@ import {
   distribuidorCrearDepositoCliente,
 } from "../../services/comprobantes";
 import ClientesDeDistribuidorPanel from "../../components/admin/ClientesDeDistribuidorPanel";
+import InformeCompletoVendedorPanel from "../../components/admin/InformeCompletoVendedorPanel";
 
 function descargarBase64Xlsx(base64, filename) {
   const bytes = atob(base64);
@@ -103,7 +104,7 @@ function ResumenComision() {
         <>
           <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
             <div className="rounded-xl border border-sky-100 bg-white p-3 dark:border-sky-900/50 dark:bg-neutral-900">
-              <p className="text-[11px] text-slate-500 dark:text-neutral-400">Flete ({resumen.viajes} viaje{resumen.viajes === 1 ? "" : "s"} de tu depósito a un cliente × {money(resumen.tarifaFletePorViaje)})</p>
+              <p className="text-[11px] text-slate-500 dark:text-neutral-400">Flete ({resumen.unidadesEntregadas ?? 0} bici{(resumen.unidadesEntregadas ?? 0) === 1 ? "" : "s"} entregadas × {money(resumen.tarifaFletePorViaje)})</p>
               <p className="mt-1 text-base font-bold text-slate-900 dark:text-white">{money(resumen.fleteTotal)}</p>
             </div>
             <div className="rounded-xl border border-sky-100 bg-white p-3 dark:border-sky-900/50 dark:bg-neutral-900">
@@ -410,6 +411,8 @@ export default function MisVendedoresPage() {
       {tieneDepositoPropio && <GenerarClientePanel onCreado={recargarLista} />}
 
       <ResumenComision />
+
+      <InformeCompletoVendedorPanel />
 
       <ClientesDeDistribuidorPanel key={refreshKey} />
     </div>

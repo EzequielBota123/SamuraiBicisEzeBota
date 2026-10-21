@@ -1,4 +1,5 @@
 // src/App.jsx
+import { lazy, Suspense } from 'react'
 import { Switch, Route, Redirect } from 'react-router-dom'
 import ProtectedRoute from "./routes/ProtectedRoute";
 import Layout from './components/layout/Layout';
@@ -9,52 +10,59 @@ import InstallPWAButton from './components/pwa/InstallPWAButton'
 import UpdateToast from './components/pwa/UpdateToast'
 import AccessTracker from './components/tracking/AccessTracker'
 import ForegroundPushListener from './components/notifications/ForegroundPushListener'
+import { LoadingOverlay } from './components/ui/LoadingIndicators'
 
-import Home from './pages/home/Home'
-import CatalogPage from "./pages/catalog/CatalogPage";
-import QuieroSerClienteForm from "./pages/nuevocliente/QuieroSerClienteForm";
-import OrderStatusPage from "./pages/orderstatus/OrderStatusPage"; // fusiona "Mis pedidos" y "Mis comprobantes" en pestañas
-import MiStockPage from "./pages/mistock/MiStockPage";
-import MisVendedoresPage from "./pages/mistock/MisVendedoresPage";
-import DepositoPage from "./pages/mistock/DepositoPage";
-import MapaVendedoresPage from "./pages/mistock/MapaVendedoresPage";
-import TransferirStockPage from "./pages/mistock/TransferirStockPage";
-import StreetHome from "./pages/mistock/StreetHome";
-import MiCuentaPage from "./pages/micuenta/MiCuentaPage";
-import Login from "./pages/auth/Login";
-import ResetPassword from "./pages/auth/ResetPassword";
+// Cada página pasa a cargarse sola, al toque, en vez de venir todas
+// empaquetadas juntas en un solo archivo gigante — antes, alguien que
+// entraba solo al catálogo público igual descargaba el código de todo el
+// panel admin, el CRM, el sector chofer, etc. (más de 1MB de JS de más).
+// Con React.lazy cada ruta es su propio archivo, así que el navegador solo
+// baja el código de la pantalla que realmente se está mirando.
+const Home = lazy(() => import('./pages/home/Home'))
+const CatalogPage = lazy(() => import("./pages/catalog/CatalogPage"))
+const QuieroSerClienteForm = lazy(() => import("./pages/nuevocliente/QuieroSerClienteForm"))
+const OrderStatusPage = lazy(() => import("./pages/orderstatus/OrderStatusPage")) // fusiona "Mis pedidos" y "Mis comprobantes" en pestañas
+const MiStockPage = lazy(() => import("./pages/mistock/MiStockPage"))
+const MisVendedoresPage = lazy(() => import("./pages/mistock/MisVendedoresPage"))
+const DepositoPage = lazy(() => import("./pages/mistock/DepositoPage"))
+const MapaVendedoresPage = lazy(() => import("./pages/mistock/MapaVendedoresPage"))
+const TransferirStockPage = lazy(() => import("./pages/mistock/TransferirStockPage"))
+const StreetHome = lazy(() => import("./pages/mistock/StreetHome"))
+const MiCuentaPage = lazy(() => import("./pages/micuenta/MiCuentaPage"))
+const Login = lazy(() => import("./pages/auth/Login"))
+const ResetPassword = lazy(() => import("./pages/auth/ResetPassword"))
 
 // ADMIN pages
-import AdminDashboard from './pages/admin/AdminDashboard'
-import Users from './pages/admin/Users'
-import StockConsignado from './pages/admin/StockConsignado'
-import SaleRequests from './pages/admin/SaleRequests'
-import Cobranzas from './pages/admin/Cobranzas'
-import MovimientosBancarios from './pages/admin/MovimientosBancarios'
-import Clientes360 from './pages/admin/Clientes360'
-import ClientesReporte from './pages/admin/ClientesReporte'
-import DashboardNegocio from './pages/admin/DashboardNegocio'
-import ContadorDiario from './pages/admin/ContadorDiario'
-import ReporteSemanal from './pages/admin/ReporteSemanal'
-import RemitosReporte from './pages/admin/RemitosReporte'
-import PedidosPendientes from './pages/admin/PedidosPendientes'
-import Vendedores from './pages/admin/Vendedores'
-import Products from './pages/admin/Products'
-import Orders from './pages/admin/Orders'
-import COTs from './pages/admin/COTs'
-import CustomerTypes from "./pages/admin/CustomerTypes";
-import ProductTypes from "./pages/admin/ProductTypes";
-import Settings from "./pages/admin/Settings";
-import AdminNotFound from './pages/admin/AdminNotFound'
-import CrmLayout from "./pages/admin/crm/CrmLayout";
+const AdminDashboard = lazy(() => import('./pages/admin/AdminDashboard'))
+const Users = lazy(() => import('./pages/admin/Users'))
+const StockConsignado = lazy(() => import('./pages/admin/StockConsignado'))
+const SaleRequests = lazy(() => import('./pages/admin/SaleRequests'))
+const Cobranzas = lazy(() => import('./pages/admin/Cobranzas'))
+const MovimientosBancarios = lazy(() => import('./pages/admin/MovimientosBancarios'))
+const Clientes360 = lazy(() => import('./pages/admin/Clientes360'))
+const ClientesReporte = lazy(() => import('./pages/admin/ClientesReporte'))
+const DashboardNegocio = lazy(() => import('./pages/admin/DashboardNegocio'))
+const ContadorDiario = lazy(() => import('./pages/admin/ContadorDiario'))
+const ReporteSemanal = lazy(() => import('./pages/admin/ReporteSemanal'))
+const RemitosReporte = lazy(() => import('./pages/admin/RemitosReporte'))
+const PedidosPendientes = lazy(() => import('./pages/admin/PedidosPendientes'))
+const Vendedores = lazy(() => import('./pages/admin/Vendedores'))
+const Products = lazy(() => import('./pages/admin/Products'))
+const Orders = lazy(() => import('./pages/admin/Orders'))
+const COTs = lazy(() => import('./pages/admin/COTs'))
+const CustomerTypes = lazy(() => import("./pages/admin/CustomerTypes"))
+const ProductTypes = lazy(() => import("./pages/admin/ProductTypes"))
+const Settings = lazy(() => import("./pages/admin/Settings"))
+const AdminNotFound = lazy(() => import('./pages/admin/AdminNotFound'))
+const CrmLayout = lazy(() => import("./pages/admin/crm/CrmLayout"))
 
 // CHOFER pages
-import ChoferMapa from "./pages/chofer/ChoferMapa";
-import ChoferNotas from "./pages/chofer/ChoferNotas";
-import ChoferChequeoVehiculo from "./pages/chofer/ChoferChequeoVehiculo";
-import ChoferGrillaLogistica from "./pages/chofer/ChoferGrillaLogistica";
-import ChoferSector from "./pages/admin/ChoferSector";
-import ChoferHome from "./pages/chofer/ChoferHome";
+const ChoferMapa = lazy(() => import("./pages/chofer/ChoferMapa"))
+const ChoferNotas = lazy(() => import("./pages/chofer/ChoferNotas"))
+const ChoferChequeoVehiculo = lazy(() => import("./pages/chofer/ChoferChequeoVehiculo"))
+const ChoferGrillaLogistica = lazy(() => import("./pages/chofer/ChoferGrillaLogistica"))
+const ChoferSector = lazy(() => import("./pages/admin/ChoferSector"))
+const ChoferHome = lazy(() => import("./pages/chofer/ChoferHome"))
 
 
 export default function App() {
@@ -65,6 +73,7 @@ export default function App() {
     <IntroSplash />
     <InstallPWAButton />
     <UpdateToast />
+    <Suspense fallback={<LoadingOverlay className="min-h-screen" />}>
     <Switch>
       {/* Bloque ADMIN con su layout */}
       <ProtectedRoute
@@ -147,6 +156,7 @@ export default function App() {
         )}
       />
     </Switch>
+    </Suspense>
     </>
   )
 }

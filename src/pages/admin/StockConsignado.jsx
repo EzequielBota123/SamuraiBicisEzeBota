@@ -65,6 +65,7 @@ export default function StockConsignado() {
   const [loadingItems, setLoadingItems] = useState(false);
   const [error, setError] = useState("");
   const [itemSearch, setItemSearch] = useState("");
+  const [filtroModeloGrilla, setFiltroModeloGrilla] = useState(null);
   const [selectedItem, setSelectedItem] = useState(null);
   const [audits, setAudits] = useState([]);
   const [auditIntervalDays, setAuditIntervalDays] = useState(undefined);
@@ -156,10 +157,16 @@ export default function StockConsignado() {
       .reduce((acc, it) => acc + Number(it.priceArs || 0) * Number(it.stockDisponible || 0), 0);
   }, [items]);
 
+  const modelosGrilla = useMemo(() => {
+    if (!items) return [];
+    return [...new Set(items.map((it) => extraerModelo(it.name)).filter(Boolean))].sort();
+  }, [items]);
+
   const filteredItems = useMemo(() => {
     if (!items) return null;
-    return filterBySearch(items, itemSearch);
-  }, [items, itemSearch]);
+    const base = filtroModeloGrilla ? items.filter((it) => extraerModelo(it.name) === filtroModeloGrilla) : items;
+    return filterBySearch(base, itemSearch);
+  }, [items, itemSearch, filtroModeloGrilla]);
 
   // La grilla principal solo muestra lo que hay disponible ahora — los
   // productos en 0 se buscan aparte, en el panel de ajuste de stock.
@@ -184,6 +191,7 @@ export default function StockConsignado() {
     setSelected(d);
     setItems(null);
     setItemSearch("");
+    setFiltroModeloGrilla(null);
     setError("");
     setSelectedItem(null);
     setLoadingItems(true);
@@ -433,13 +441,33 @@ export default function StockConsignado() {
               )}
 
               {!loadingItems && !error && items && items.length > 0 && (
-                <input
-                  type="search"
-                  placeholder="Buscar por bicicleta, color o SKU..."
-                  value={itemSearch}
-                  onChange={(e) => setItemSearch(e.target.value)}
-                  className="mt-4 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white dark:placeholder:text-neutral-500 sm:py-2.5"
-                />
+                <>
+                  <input
+                    type="search"
+                    placeholder="Buscar por bicicleta, color o SKU..."
+                    value={itemSearch}
+                    onChange={(e) => setItemSearch(e.target.value)}
+                    className="mt-4 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40 dark:border-neutral-700 dark:bg-neutral-800 dark:text-white dark:placeholder:text-neutral-500 sm:py-2.5"
+                  />
+                  {modelosGrilla.length > 1 && (
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      {modelosGrilla.map((m) => (
+                        <button
+                          key={m}
+                          type="button"
+                          onClick={() => setFiltroModeloGrilla((prev) => (prev === m ? null : m))}
+                          className={`rounded-full px-2.5 py-1 text-[11px] font-semibold transition ${
+                            filtroModeloGrilla === m
+                              ? "bg-slate-900 text-white dark:bg-neutral-700"
+                              : "bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-neutral-800 dark:text-neutral-300 dark:hover:bg-neutral-700"
+                          }`}
+                        >
+                          {m}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </>
               )}
 
               {!loadingItems && !error && items && conStock.length === 0 && !itemSearch && (
