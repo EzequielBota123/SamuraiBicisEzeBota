@@ -345,6 +345,41 @@ export async function adminSetTarifasVendedor(
   return callFunction("adminSetTarifasVendedor", { vendedorUid, ...params });
 }
 
+// Confirma a mano que una venta puntual ya se cobró (completa o parcial,
+// si se manda `monto` menor a `montoTotal`). Guarda cliente/producto en el
+// momento de confirmar, para no tener que re-buscarlos después.
+export async function adminConfirmarCobroManual(
+  vendedorUid: string,
+  numero: string,
+  monto: number | undefined,
+  montoTotal: number | undefined,
+  cliente: string,
+  producto: string
+): Promise<{ ok: true }> {
+  return callFunction("adminConfirmarCobroManual", { vendedorUid, numero, monto, montoTotal, cliente, producto });
+}
+
+export async function adminQuitarCobroManual(vendedorUid: string, numero: string): Promise<{ ok: true }> {
+  return callFunction("adminQuitarCobroManual", { vendedorUid, numero });
+}
+
+// Cierra el período actual del vendedor: guarda un histórico de lo
+// liquidado, marca `fechaUltimaLiquidacion` (para que el próximo informe
+// arranque de cero, cobrando flete solo por movimientos nuevos) y limpia
+// los cobros manuales confirmados (ya quedaron saldados en este cierre).
+export async function adminCerrarLiquidacionVendedor(params: {
+  vendedorUid: string;
+  desde: string;
+  hasta: string;
+  totalFlete: number;
+  totalComision: number;
+  totalCobradoPorVendedor: number;
+  totalNetoAPagar: number;
+  pagosManuales: unknown[];
+}): Promise<{ ok: true }> {
+  return callFunction("adminCerrarLiquidacionVendedor", params);
+}
+
 // Detalle completo (modelos, colores, cantidades) del depósito propio de
 // Samurai en Lavalle — mismo permiso que getMisVendedores.
 export async function getMiDepositoPropio(): Promise<{
@@ -360,6 +395,31 @@ export async function getDepositoStockAdmin(depositoId: number): Promise<{
   items: DepositoStockItem[];
 }> {
   return callFunction("getDepositoStockAdmin", { depositoId });
+}
+
+export type RodadosSectorItem = {
+  sku: string;
+  name: string;
+  category: string | null;
+  imageUrl: string;
+  stockActual: number;
+  stockDisponible: number;
+};
+
+// Rodados Argentinos es un solo depósito en Contabilium, pero físicamente
+// son 2 (Adrogué y Temperley) — esto separa el stock "a mano" clasificando
+// cada movimiento histórico por lo que dice su observación.
+export async function getStockRodadosPorSector(): Promise<{
+  ok: true;
+  sectores: {
+    adrogue: { items: RodadosSectorItem[]; total: number };
+    temperley: { items: RodadosSectorItem[]; total: number };
+    sinClasificar: { items: RodadosSectorItem[]; total: number };
+  };
+  stockTotalReal: number | null;
+  totalFilasLeidas: number;
+}> {
+  return callFunction("getStockRodadosPorSector", {});
 }
 
 export async function adminGetClientComprobantes(contabiliumId: number): Promise<{ items: ComprobanteDetalle[]; total: number; saldoTotal: number }> {

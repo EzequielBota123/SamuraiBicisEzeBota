@@ -2351,6 +2351,116 @@ async function getPendingSoldBySku(db, { distributorUid, depositoId } = {}) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Rodados Argentinos opera con 2 depósitos físicos (Adrogué y
+// Temperley) pero en Contabilium es un solo cliente/depósito (id
+// 134795) — no se le crea un depósito nuevo. Para separarlo
+// "virtualmente" por sector se lee el historial completo de
+// movimientos de ESE depósito (trae la observación de cada remito o
+// transferencia) y se clasifica cada movimiento según si su
+// observación menciona "adrogué" o "temperley". Lo que no menciona
+// ninguno de los dos cae en "sin clasificar" — para que un movimiento
+// nuevo caiga bien hay que escribir esa palabra en la observación al
+// hacer la transferencia.
+// ─────────────────────────────────────────────────────────────
+const RODADOS_ARGENTINOS_DEPOSITO_ID = 134795;
+const RODADOS_ARGENTINOS_DEPOSITO_NOMBRE = "RODADOS ARGENTINOS S.A";
+const RODADOS_SECTOR_ADROGUE_RE = /adrogu[eé]/i;
+const RODADOS_SECTOR_TEMPERLEY_RE = /temperley/i;
+
+function claveSectorRodados(observaciones) {
+  const t = observaciones || "";
+  if (RODADOS_SECTOR_ADROGUE_RE.test(t)) return "adrogue";
+  if (RODADOS_SECTOR_TEMPERLEY_RE.test(t)) return "temperley";
+  return "sinClasificar";
+}
+
+// La columna "cantidad modificada" de la tabla de movimientos no
+// siempre trae el signo explícito — si no lo trae, se infiere de la
+// acción (alta/entrada suma, baja/salida/venta/retiro resta).
+function parseCantidadModificadaConSigno(cantidadTexto, accionTexto) {
+  const str = String(cantidadTexto || "").trim();
+  const tieneSignoNegativo = /^-/.test(str);
+  const tieneSignoPositivo = /^\+/.test(str);
+  const magnitud = Math.abs(Number(str.replace(/\./g, "").replace(",", ".").replace(/[^0-9.-]/g, "")) || 0);
+  if (tieneSignoNegativo) return -magnitud;
+  if (tieneSignoPositivo) return magnitud;
+  const accion = (accionTexto || "").toLowerCase();
+  const esSalida = /baja|salida|venta|retiro|egreso/.test(accion);
+  return esSalida ? -magnitud : magnitud;
+}
+
+async function buildStockRodadosPorSector(db, email, apiKey, webEmail, webPassword) {
+  const { obtenerHistoricoStockReal } = require("./contabiliumWebAutomation");
+  const hoy = new Date();
+  const fechaHastaStr = `${String(hoy.getDate()).padStart(2, "0")}/${String(hoy.getMonth() + 1).padStart(2, "0")}/${hoy.getFullYear()}`;
+  const resultado = await obtenerHistoricoStockReal({
+    email: webEmail,
+    password: webPassword,
+    depositoNombre: RODADOS_ARGENTINOS_DEPOSITO_NOMBRE,
+    fechaDesde: "01/01/2020",
+    fechaHasta: fechaHastaStr,
+    leerTodo: true,
+  });
+  if (!resultado.ok) {
+    throw new Error(resultado.error || "No se pudo leer el historial de movimientos de Rodados Argentinos");
+  }
+
+  const filas = resultado.todasLasFilas || [];
+  const cantidadPorSectorYCodigo = { adrogue: {}, temperley: {}, sinClasificar: {} };
+  for (const fila of filas) {
+    const sector = claveSectorRodados(fila.observaciones);
+    const delta = parseCantidadModificadaConSigno(fila.cantidadModificada, fila.accion);
+    const codigo = (fila.codigo || "").trim();
+    if (!codigo) continue;
+    cantidadPorSectorYCodigo[sector][codigo] = (cantidadPorSectorYCodigo[sector][codigo] || 0) + delta;
+  }
+
+  const productsSnap = await db.collection("products").where("active", "==", true).get();
+  const productoPorSku = {};
+  productsSnap.docs.forEach((d) => {
+    const p = d.data();
+    const sku = (p.sku || "").toString().trim();
+    if (sku) productoPorSku[sku] = p;
+  });
+
+  function armarItems(cantidadPorCodigo) {
+    const items = [];
+    let total = 0;
+    for (const [codigo, cantidad] of Object.entries(cantidadPorCodigo)) {
+      if (!cantidad) continue;
+      const p = productoPorSku[codigo];
+      items.push({
+        sku: codigo,
+        name: p?.name || codigo,
+        category: p?.category || null,
+        imageUrl: p?.imageUrl || (p?.images && p.images[0]) || "",
+        stockActual: cantidad,
+        stockDisponible: cantidad,
+      });
+      total += cantidad;
+    }
+    items.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+    return { items, total };
+  }
+
+  const sectores = {
+    adrogue: armarItems(cantidadPorSectorYCodigo.adrogue),
+    temperley: armarItems(cantidadPorSectorYCodigo.temperley),
+    sinClasificar: armarItems(cantidadPorSectorYCodigo.sinClasificar),
+  };
+
+  let stockTotalReal = null;
+  try {
+    const stockRaw = await getStockByDepositoWithRetry(email, apiKey, RODADOS_ARGENTINOS_DEPOSITO_ID);
+    stockTotalReal = stockRaw.reduce((a, it) => a + Number(it.StockActual || 0), 0);
+  } catch (e) {
+    console.error("[buildStockRodadosPorSector] no se pudo cruzar contra el stock real:", e);
+  }
+
+  return { sectores, stockTotalReal, totalFilasLeidas: filas.length };
+}
+
+// ─────────────────────────────────────────────────────────────
 // M7 — Stock consignado por depósito
 // Devuelve el stock real (Contabilium) del depósito asignado al
 // cliente autenticado, cruzado con el catálogo de productos por SKU.
@@ -3027,12 +3137,18 @@ async function buildPanelClientesVendedor(db, email, apiKey, targetUid, desdeOve
   // cuenta corriente general, no aplicado factura por factura) — cargado a
   // mano por el dueño del negocio, nunca se adivina ni se asume solo. Si un
   // comprobante está en esta lista cuenta como pagado aunque su Saldo en
-  // Contabilium no sea $0.
+  // Contabilium no sea $0. `montosParciales` cubre el caso de un pago
+  // PARCIAL confirmado a mano (ej. una cotización de $342.000 de la que
+  // solo se cobraron $305.000) — ahí se usa ese monto exacto en vez de
+  // "todo o nada" (pedido explícito 21/10/2026).
   const pagosManualesSnap = await db.doc(`pagosManualesConfirmados/${targetUid}`).get();
-  const numerosConfirmados = new Set(pagosManualesSnap.exists ? pagosManualesSnap.data().numeros || [] : []);
+  const pagosManualesData = pagosManualesSnap.exists ? pagosManualesSnap.data() : {};
+  const numerosConfirmados = new Set(pagosManualesData.numeros || []);
+  const montosParciales = pagosManualesData.montosParciales || {};
+  const pagosPorNumero = pagosManualesData.pagosPorNumero || {}; // formato nuevo, con cliente/producto ya guardados
 
   const resultados = [];
-  let totalEntregado = 0, totalVendido = 0, totalPagado = 0;
+  let totalEntregado = 0, totalVendido = 0, totalPagado = 0, totalCobradoDinero = 0;
 
   for (const cliente of clientes) {
     let stockTotal = 0;
@@ -3058,7 +3174,7 @@ async function buildPanelClientesVendedor(db, email, apiKey, targetUid, desdeOve
     // Concurrencia chica (3) en vez de uno por uno con pausa — mismo
     // criterio que en buildResumenComision, para no tardar tanto en
     // clientes con muchos comprobantes sin arriesgarse a un 429.
-    let vendidoCliente = 0, pagadoCliente = 0;
+    let vendidoCliente = 0, pagadoCliente = 0, cobradoDineroCliente = 0;
     const resultadosComprobantesCliente = await mapWithConcurrency(comprobantes, 3, async (c) => {
       let cant = 0;
       try {
@@ -3073,19 +3189,32 @@ async function buildPanelClientesVendedor(db, email, apiKey, targetUid, desdeOve
     for (const { c, cant } of resultadosComprobantesCliente) {
       const signo = (c.TipoFc || "").startsWith("NC") ? -1 : 1;
       vendidoCliente += signo * cant;
-      if (parseArNumber(c.Saldo) === 0 || numerosConfirmados.has(c.Numero)) pagadoCliente += signo * cant;
+      const pagoManual = pagosPorNumero[c.Numero];
+      if (parseArNumber(c.Saldo) === 0 || numerosConfirmados.has(c.Numero) || pagoManual?.tipo === "completo") {
+        pagadoCliente += signo * cant;
+        cobradoDineroCliente += signo * (pagoManual ? pagoManual.monto : parseArNumber(c.ImporteTotalNeto));
+      } else if (montosParciales[c.Numero] != null) {
+        // Pago parcial confirmado a mano (formato viejo) — no suma a
+        // "pagado" (bicis, es todo o nada por unidad) pero sí al monto real
+        // cobrado en dinero.
+        cobradoDineroCliente += signo * Number(montosParciales[c.Numero]);
+      } else if (pagoManual?.tipo === "parcial") {
+        cobradoDineroCliente += signo * Number(pagoManual.monto || 0);
+      }
     }
 
     const entregadoCliente = stockTotal + vendidoCliente;
     totalEntregado += entregadoCliente;
     totalVendido += vendidoCliente;
     totalPagado += pagadoCliente;
+    totalCobradoDinero += cobradoDineroCliente;
 
     resultados.push({
       cliente: cliente.contabiliumDepositoNombre || cliente.name || "(sin nombre)",
       stock: stockTotal,
       vendido: vendidoCliente,
       pagado: pagadoCliente,
+      cobradoDinero: cobradoDineroCliente,
       pendiente: vendidoCliente - pagadoCliente,
       entregado: entregadoCliente,
     });
@@ -3099,6 +3228,7 @@ async function buildPanelClientesVendedor(db, email, apiKey, targetUid, desdeOve
     totalEntregado,
     totalVendido,
     totalPagado,
+    totalCobradoDinero,
     totalPendiente: totalVendido - totalPagado,
     clientes: resultados,
   };
@@ -3176,16 +3306,68 @@ async function buildInformeCompletoVendedor(db, email, apiKey, webEmail, webPass
   const target = targetSnap.data();
   const nombreVendedor = target.contabiliumDepositoNombre || target.name || "Vendedor";
 
-  // `fechaInicioActividad` (opcional, cargado a mano en el doc del vendedor)
-  // pisa la fecha de alta del usuario — para el caso real de Cuchi, empezó a
-  // trabajar antes de que se le creara la cuenta en el sistema (una venta
-  // suya del 07/08 quedaba afuera usando solo la fecha de alta del 29/08).
-  const desdeISO = target.fechaInicioActividad
+  // `fechaUltimaLiquidacion` (se carga sola al tocar "Cerrar y marcar como
+  // pagado") pisa todo lo anterior — una vez que se le pagó un período, el
+  // próximo arranca de cero desde esa fecha, no desde el principio de los
+  // tiempos (pedido explícito 21/10/2026). Si todavía no se cerró nunca
+  // ningún período, se sigue usando `fechaInicioActividad` (cargado a mano,
+  // cubre el caso de Cuchi que empezó a trabajar antes de que se le creara
+  // la cuenta) o la fecha de alta del usuario.
+  const desdeISO = target.fechaUltimaLiquidacion
+    || target.fechaInicioActividad
     || (target.createdAt?.toDate ? target.createdAt.toDate().toISOString().slice(0, 10) : "2026-08-01");
   const hoyISOVal = new Date().toISOString().slice(0, 10);
   const meses = mesesEntre(desdeISO, hoyISOVal);
+  // Una vez que hubo al menos una liquidación, el flete deja de contarse
+  // por el stock total que tiene (esas bicis ya se pagaron una vez) y pasa
+  // a contarse por MOVIMIENTO NUEVO desde ese cierre: cada retiro de un
+  // depósito propio hacia el suyo Y cada entrega a un cliente, cada uno ×
+  // tarifa — "cada vez que retira más de Lavalle son 10 mil cada una [y
+  // la entrega también]". Antes de la primera liquidación se sigue usando
+  // el total de stock (ya validado a mano con Cuchi, da 200).
+  const usaFleteDeMovimiento = !!target.fechaUltimaLiquidacion;
 
   const panel = await buildPanelClientesVendedor(db, email, apiKey, targetUid, desdeISO);
+
+  // Ventas reportadas por sus clientes desde "Mi stock" (botón "¿Vendiste
+  // esta unidad?") — detalle bici por bici, con su estado (pendiente de
+  // facturar / facturado) y tipo (Factura real / COT) — a pedido explícito
+  // del 21/10/2026, para que el Excel de Cuchi muestre esto además de lo
+  // que ya traía.
+  const asignadosVentas = Array.isArray(target.vendedoresAsignados) ? target.vendedoresAsignados : [];
+  const ventasReportadas = [];
+  if (asignadosVentas.length > 0) {
+    const lotes = [];
+    for (let i = 0; i < asignadosVentas.length; i += 30) lotes.push(asignadosVentas.slice(i, i + 30));
+    const [snaps, clientesSnaps] = await Promise.all([
+      Promise.all(lotes.map((lote) => db.collection("saleRequests").where("distributorUid", "in", lote).get())),
+      Promise.all(asignadosVentas.map((u) => db.doc(`users/${u}`).get())),
+    ]);
+    const nombrePorUid = {};
+    clientesSnaps.forEach((s) => {
+      if (s.exists) nombrePorUid[s.id] = s.data().contabiliumDepositoNombre || s.data().name || "(sin nombre)";
+    });
+    for (const snap of snaps) {
+      snap.forEach((d) => {
+        const v = d.data();
+        const fecha = v.createdAt?.toDate ? v.createdAt.toDate().toISOString().slice(0, 10) : null;
+        if (fecha && fecha < desdeISO) return;
+        ventasReportadas.push({
+          fecha,
+          cliente: nombrePorUid[v.distributorUid] || v.distributorName || "(sin nombre)",
+          producto: v.name || v.sku || "",
+          cantidad: Number(v.quantity || 0),
+          tipo: v.tipoDocumentoEmitido || v.tipoDocumentoElegido || "—",
+          estado: v.status || "pendiente",
+          numeroFactura: v.facturaContabilium?.Numero || null,
+        });
+      });
+    }
+    ventasReportadas.sort((a, b) => String(b.fecha || "").localeCompare(String(a.fecha || "")));
+  }
+  const totalVentasReportadas = ventasReportadas.length;
+  const totalVentasPendientes = ventasReportadas.filter((v) => v.estado === "pendiente").length;
+  const totalVentasCOT = ventasReportadas.filter((v) => v.tipo === "COT").length;
 
   // Stock que el vendedor tiene hoy en SU PROPIO depósito, todavía sin pasar
   // a ningún cliente (panel.totalEntregado ya cuenta lo que está en stock
@@ -3219,6 +3401,64 @@ async function buildInformeCompletoVendedor(db, email, apiKey, webEmail, webPass
       console.error("[buildInformeCompletoVendedor] falló mes", mes, err.message);
       resumenesPorMes.push({ mes, viajes: 0, fleteTotal: 0, ventasTotal: 0, comisionTotal: 0, totalACobrar: 0, detalle: [] });
     }
+  }
+
+  // Lista de pagos confirmados a mano, con cliente/producto/monto, para
+  // mostrarle al admin un aviso claro al abrir el informe ("ya se le pagó
+  // tal cosa") en vez de que quede escondido en un documento aparte —
+  // pedido explícito 21/10/2026. El formato nuevo (`pagosPorNumero`) ya
+  // trae el cliente/producto guardados desde el momento en que se
+  // confirmó el cobro — no hace falta re-buscarlos. El formato viejo
+  // (`numeros`/`montosParciales`, de antes de este cambio) sí necesita
+  // ese cruce contra el detalle de ventas; se deja como respaldo nada más
+  // para no perder confirmaciones ya cargadas, aunque ese cruce puede
+  // fallar si el número de comprobante se repite entre clientes (bug real
+  // detectado 21/10/2026 con una cotización de Leobono atribuida a
+  // "compakjet").
+  const pagosManualesSnap2 = await db.doc(`pagosManualesConfirmados/${targetUid}`).get();
+  const pagosManualesData2 = pagosManualesSnap2.exists ? pagosManualesSnap2.data() : {};
+  const numerosConfirmados2 = new Set(pagosManualesData2.numeros || []);
+  const montosParciales2 = pagosManualesData2.montosParciales || {};
+  const pagosPorNumero2 = pagosManualesData2.pagosPorNumero || {};
+  const todoElDetalle = resumenesPorMes.flatMap((r) => r.detalle || []);
+  const pagosManuales = [];
+  const numerosYaListados = new Set();
+  for (const [numero, p] of Object.entries(pagosPorNumero2)) {
+    pagosManuales.push({
+      numero,
+      cliente: p.cliente || "(sin identificar)",
+      producto: p.producto || "",
+      monto: Number(p.monto || 0),
+      montoTotal: p.montoTotal != null ? Number(p.montoTotal) : null,
+      tipo: p.tipo || "completo",
+      seDescuenta: true, // cobrado por el vendedor mismo — resta del total a pagarle
+    });
+    numerosYaListados.add(numero);
+  }
+  for (const numero of numerosConfirmados2) {
+    if (numerosYaListados.has(numero)) continue;
+    const d = todoElDetalle.find((x) => x.numero === numero);
+    pagosManuales.push({
+      numero,
+      cliente: d?.cliente || "(sin identificar)",
+      producto: d?.modelo || "",
+      monto: d?.monto ?? null,
+      tipo: "completo",
+      seDescuenta: false, // confirmación vieja: solo reconciliación, el cliente le pagó a Fepa normal
+    });
+  }
+  for (const [numero, monto] of Object.entries(montosParciales2)) {
+    if (numerosYaListados.has(numero)) continue;
+    const d = todoElDetalle.find((x) => x.numero === numero);
+    pagosManuales.push({
+      numero,
+      cliente: d?.cliente || "(sin identificar)",
+      producto: d?.modelo || "",
+      monto: Number(monto),
+      montoTotal: d?.monto ?? null,
+      tipo: "parcial",
+      seDescuenta: false,
+    });
   }
 
   const { obtenerMovimientosStock } = require("./contabiliumWebAutomation");
@@ -3276,16 +3516,57 @@ async function buildInformeCompletoVendedor(db, email, apiKey, webEmail, webPass
   const devoluciones = Array.from(devolucionesMap.values());
   const totalDevuelto = devoluciones.reduce((a, v) => a + v.items.reduce((x, it) => x + (it.cantidad || 0), 0), 0);
 
-  const totalFlete = resumenesPorMes.reduce((a, r) => a + (r.fleteTotal || 0), 0);
+  const tarifaFletePorViajeGlobal = Number(target.tarifaFletePorViaje ?? 10000);
   const totalComision = resumenesPorMes.reduce((a, r) => a + (r.comisionTotal || 0), 0);
   const totalViajesComision = resumenesPorMes.reduce((a, r) => a + (r.viajes || 0), 0);
   const totalUnidadesComision = resumenesPorMes.reduce((a, r) => a + (r.unidadesEntregadas || 0), 0);
+
+  // Flete — dos modos, según si ya hubo alguna liquidación cerrada:
+  //  · ANTES de la primera liquidación: (entregado a todos sus clientes +
+  //    lo que todavía tiene en su depósito) × tarifa — pedido explícito
+  //    21/10/2026 ("183 entregadas + 16 en stock Cuchi = 200, eso × 10mil"),
+  //    ya validado a mano contra los números reales de Cuchi.
+  //  · DESPUÉS de cerrar un período: por MOVIMIENTO NUEVO desde ese cierre
+  //    — cada retiro de un depósito propio hacia el suyo Y cada entrega a
+  //    un cliente, cada uno × tarifa (pedido explícito 21/10/2026: "por
+  //    retiros nuevos de Lavalle u otros y entregas a clientes") — así no
+  //    se le vuelve a cobrar por el mismo stock que ya se le pagó una vez.
+  const totalEntregadoMasStockFlete = panel.totalEntregado + stockPropio;
+  const totalFlete = usaFleteDeMovimiento
+    ? (totalUnidadesComision + totalRetirado) * tarifaFletePorViajeGlobal
+    : totalEntregadoMasStockFlete * tarifaFletePorViajeGlobal;
+
+  // Lo que el vendedor ya cobró él mismo, directo de sus clientes, se
+  // descuenta de lo que Fepa le tiene que pagar (flete + comisión) — ese
+  // dinero ya está en su poder, no hace falta pagárselo de nuevo. Pedido
+  // explícito 21/10/2026 ("que ya se le descuente lo que se le cobró").
+  //
+  // OJO 1: esto NO usa `panel.totalCobradoDinero` — ese total suma TODO
+  // comprobante con saldo $0 en Contabilium, que en su mayoría es plata
+  // que pagaron directo a Fepa por los canales normales (no que el
+  // vendedor tenga en el bolsillo). Confundir los dos daba un total
+  // negativo absurdo (bug real: descontaba $7.852.250 de $2.528.063).
+  //
+  // OJO 2: tampoco usa las confirmaciones VIEJAS (`numeros`/`montosParciales`,
+  // cargadas antes del 21/10/2026) — esas representan "Contabilium no
+  // vinculó el pago a la factura" (el cliente igual le pagó a Fepa por el
+  // canal normal), un caso distinto de "el vendedor lo cobró él mismo y se
+  // lo tiene que descontar". Solo las confirmaciones NUEVAS
+  // (`pagosPorNumero`, elegidas a mano desde este informe) representan
+  // específicamente plata que el vendedor cobró él mismo.
+  const totalCobradoPorVendedor = Object.values(pagosPorNumero2).reduce((a, p) => a + (Number(p.monto) || 0), 0);
+  const totalNetoAPagar = totalFlete + totalComision - totalCobradoPorVendedor;
 
   return {
     nombreVendedor, desdeISO, hoyISOVal, panel, resumenesPorMes, viajes,
     totalFlete, totalComision, totalViajesComision, totalUnidadesComision,
     retiros, totalRetirado, devoluciones, totalDevuelto,
     stockPropio, totalEntregadoMasStock: panel.totalEntregado + stockPropio,
+    ventasReportadas, totalVentasReportadas, totalVentasPendientes, totalVentasCOT,
+    pagosManuales, todoElDetalle,
+    totalCobradoPorVendedor, totalNetoAPagar,
+    tarifaFletePorViajeGlobal, comisionPorcentaje: Number(target.comisionPorcentaje ?? 5),
+    usaFleteDeMovimiento, fechaUltimaLiquidacion: target.fechaUltimaLiquidacion || null,
   };
 }
 
@@ -3365,7 +3646,7 @@ exports.descargarInformeCompletoVendedor = onRequest(
         targetUid = vendedorUid;
       }
 
-      const { nombreVendedor, desdeISO, hoyISOVal, panel, resumenesPorMes, viajes, totalFlete, totalComision, totalViajesComision, totalUnidadesComision, retiros, totalRetirado, devoluciones, totalDevuelto, stockPropio, totalEntregadoMasStock } =
+      const { nombreVendedor, desdeISO, hoyISOVal, panel, resumenesPorMes, viajes, totalFlete, totalComision, totalViajesComision, totalUnidadesComision, retiros, totalRetirado, devoluciones, totalDevuelto, stockPropio, totalEntregadoMasStock, ventasReportadas, totalVentasReportadas, totalVentasPendientes, totalVentasCOT, pagosManuales, totalCobradoPorVendedor, totalNetoAPagar, tarifaFletePorViajeGlobal, comisionPorcentaje, usaFleteDeMovimiento, fechaUltimaLiquidacion } =
         await buildInformeCompletoVendedor(
           db,
           CONTABILIUM_EMAIL.value(),
@@ -3379,42 +3660,138 @@ exports.descargarInformeCompletoVendedor = onRequest(
       const XLSX = require("xlsx");
       const wb = XLSX.utils.book_new();
 
-      const wsGeneral = XLSX.utils.json_to_sheet([
-        { Campo: "Vendedor", Valor: nombreVendedor },
-        { Campo: "Desde", Valor: desdeISO },
-        { Campo: "Hasta", Valor: hoyISOVal },
-        { Campo: "Entregado total (stock + vendido, todos los clientes)", Valor: panel.totalEntregado },
-        { Campo: "Vendido total", Valor: panel.totalVendido },
-        { Campo: "Cobrado total", Valor: panel.totalPagado },
-        { Campo: "Vendido sin cobrar", Valor: panel.totalPendiente },
-        { Campo: "Viajes totales", Valor: totalViajesComision },
-        { Campo: "Unidades entregadas (bicis, para flete)", Valor: totalUnidadesComision },
-        { Campo: "Flete total", Valor: totalFlete },
-        { Campo: "Comisión total", Valor: totalComision },
-        { Campo: "Total a cobrar (flete + comisión)", Valor: totalFlete + totalComision },
-        { Campo: "Stock propio (sin pasar a ningún cliente)", Valor: stockPropio },
-        { Campo: "Entregado + stock propio", Valor: totalEntregadoMasStock },
-        { Campo: "Retirado de Lavalle/otros (bruto)", Valor: totalRetirado },
-        { Campo: "Devuelto a depósito propio", Valor: totalDevuelto },
-        { Campo: "Retirado neto (retirado - devuelto)", Valor: totalRetirado - totalDevuelto },
-      ], { header: ["Campo", "Valor"] });
-      wsGeneral["!cols"] = [{ wch: 42 }, { wch: 24 }];
+      // Hoja "Resumen General" en lenguaje llano, paso a paso, para que se
+      // entienda sin tener que saber cómo funciona el sistema — pedido
+      // explícito 21/10/2026 ("que se entienda para bobos"). En vez de una
+      // lista plana de campos técnicos, va contando la cuenta como se la
+      // explicarías en voz alta: cuánto es el flete, cuánto la comisión,
+      // cuánto ya cobró él mismo, y el resultado final bien grande al
+      // final. $ = moneda formateada; "—" = separador en blanco.
+      const MONEY_FMT = '"$"#,##0';
+      const filasPagosQueDescuentan = (pagosManuales || []).filter((p) => p.seDescuenta !== false);
+      const filasPagosSoloInfo = (pagosManuales || []).filter((p) => p.seDescuenta === false);
+
+      const filas = [];
+      const money$ = (campo, valor, indent = 0) => filas.push({ campo: "  ".repeat(indent) + campo, valor: Math.round(valor || 0), esMoneda: true });
+      const num = (campo, valor, indent = 0) => filas.push({ campo: "  ".repeat(indent) + campo, valor, esMoneda: false });
+      const texto = (campo, valor, indent = 0) => filas.push({ campo: "  ".repeat(indent) + campo, valor, esMoneda: false });
+      const titulo = (campo) => filas.push({ campo, valor: "", esTitulo: true });
+      const vacia = () => filas.push({ campo: "", valor: "" });
+
+      titulo(`RESUMEN DE ${nombreVendedor.toUpperCase()}`);
+      texto("Período", `${desdeISO} al ${hoyISOVal}`);
+      if (fechaUltimaLiquidacion) texto("Última liquidación cerrada", fechaUltimaLiquidacion);
+      vacia();
+
+      if (usaFleteDeMovimiento) {
+        titulo("1) FLETE — por cada retiro nuevo de un depósito propio y cada entrega nueva a un cliente, desde la última liquidación");
+        num("Unidades entregadas a clientes (viajes nuevos)", totalUnidadesComision, 1);
+        num("+ Unidades retiradas de Lavalle/otros (retiros nuevos)", totalRetirado, 1);
+        num("= Total de movimientos para el flete", totalUnidadesComision + totalRetirado, 1);
+        money$("× Precio de flete por unidad", tarifaFletePorViajeGlobal, 1);
+        money$("= FLETE TOTAL", totalFlete, 1);
+      } else {
+        titulo("1) FLETE — por cada bici entregada a un cliente o que todavía tiene en su depósito");
+        num("Bicis entregadas a clientes", panel.totalEntregado, 1);
+        num("+ Bicis que tiene en su propio depósito", stockPropio, 1);
+        num("= Total de bicis para el flete", totalEntregadoMasStock, 1);
+        money$("× Precio de flete por bici", tarifaFletePorViajeGlobal, 1);
+        money$("= FLETE TOTAL", totalFlete, 1);
+      }
+      vacia();
+
+      titulo("2) COMISIÓN — % sobre lo que facturaron sus clientes");
+      money$("Total vendido por sus clientes", resumenesPorMes.reduce((a, r) => a + (r.ventasTotal || 0), 0), 1);
+      texto("× % de comisión", `${comisionPorcentaje}%`, 1);
+      money$("= COMISIÓN TOTAL", totalComision, 1);
+      vacia();
+
+      money$("SUBTOTAL (flete + comisión)", totalFlete + totalComision);
+      vacia();
+
+      titulo("3) YA COBRADO POR ÉL — se resta, porque esa plata ya la tiene en la mano");
+      if (filasPagosQueDescuentan.length === 0) {
+        texto("(nada confirmado todavía)", "", 1);
+      } else {
+        for (const p of filasPagosQueDescuentan) {
+          const montoTxt = Number(p.monto || 0).toLocaleString("es-AR");
+          const montoTotalTxt = Number(p.montoTotal || 0).toLocaleString("es-AR");
+          texto(
+            `${p.cliente} — ${p.producto || "(sin identificar)"} (${p.numero})`,
+            p.tipo === "parcial" ? `$${montoTxt} de $${montoTotalTxt} (parcial)` : `$${montoTxt}`,
+            1
+          );
+        }
+      }
+      money$("= YA COBRADO POR ÉL (se resta)", totalCobradoPorVendedor, 1);
+      vacia();
+
+      titulo("═══════════════════════");
+      money$("TOTAL NETO A PAGARLE", totalNetoAPagar);
+      titulo("═══════════════════════");
+      vacia();
+
+      if (filasPagosSoloInfo.length > 0) {
+        titulo("Reconciliaciones (NO se descuentan — el cliente le pagó a Fepa por el canal normal)");
+        for (const p of filasPagosSoloInfo) {
+          texto(`${p.cliente} — ${p.producto || "(sin identificar)"} (${p.numero})`, `$${Number(p.monto || 0).toLocaleString("es-AR")}`, 1);
+        }
+        vacia();
+      }
+
+      titulo("Otros datos (informativos)");
+      num("Entregado total (stock + vendido, todos los clientes)", panel.totalEntregado, 1);
+      num("Vendido total", panel.totalVendido, 1);
+      num("Cobrado (bicis)", panel.totalPagado, 1);
+      money$("Cobrado total ($, todos los canales, no solo lo de arriba)", panel.totalCobradoDinero, 1);
+      num("Vendido sin cobrar", panel.totalPendiente, 1);
+      num("Viajes totales", totalViajesComision, 1);
+      num("Retirado neto de Lavalle/otros", totalRetirado - totalDevuelto, 1);
+      num("Ventas reportadas desde la app", totalVentasReportadas, 1);
+      num("  de esas, sin facturar todavía", totalVentasPendientes, 1);
+      num("  de esas, como COT (cotización)", totalVentasCOT, 1);
+
+      const aoa = filas.map((f) => [f.campo, f.valor]);
+      const wsGeneral = XLSX.utils.aoa_to_sheet(aoa);
+      filas.forEach((f, i) => {
+        if (!f.esMoneda) return;
+        const addr = XLSX.utils.encode_cell({ r: i, c: 1 });
+        if (wsGeneral[addr]) wsGeneral[addr].z = MONEY_FMT;
+      });
+      wsGeneral["!cols"] = [{ wch: 60 }, { wch: 20 }];
       XLSX.utils.book_append_sheet(wb, wsGeneral, "Resumen General");
 
+      const wsVentasReportadas = XLSX.utils.json_to_sheet(
+        ventasReportadas.map((v) => ({
+          Fecha: v.fecha,
+          Cliente: v.cliente,
+          Producto: v.producto,
+          Cantidad: v.cantidad,
+          Tipo: v.tipo,
+          Estado: v.estado === "pendiente" ? "Pendiente de facturar" : "Facturado",
+          "N° comprobante": v.numeroFactura || "",
+        })),
+        { header: ["Fecha", "Cliente", "Producto", "Cantidad", "Tipo", "Estado", "N° comprobante"] }
+      );
+      wsVentasReportadas["!cols"] = [{ wch: 11 }, { wch: 28 }, { wch: 45 }, { wch: 9 }, { wch: 10 }, { wch: 20 }, { wch: 16 }];
+      XLSX.utils.book_append_sheet(wb, wsVentasReportadas, "Ventas reportadas");
+
+      // El flete ya no es por mes (ver "Flete total" en Resumen General —
+      // es un único total sobre entregado+stock propio) — acá queda solo
+      // ventas/comisión por mes, que sí tiene sentido repartido por fecha
+      // real de cada factura.
       const wsPorMes = XLSX.utils.json_to_sheet(
         resumenesPorMes.map((r) => ({
           Mes: r.mes,
           Viajes: r.viajes,
           "Unidades (bicis)": r.unidadesEntregadas || 0,
-          "Flete total": r.fleteTotal,
           "Ventas (neto)": Math.round(r.ventasTotal || 0),
           "% Comisión": r.comisionPorcentaje,
           Comisión: Math.round(r.comisionTotal || 0),
-          "Total a cobrar": Math.round((r.fleteTotal || 0) + (r.comisionTotal || 0)),
         })),
-        { header: ["Mes", "Viajes", "Unidades (bicis)", "Flete total", "Ventas (neto)", "% Comisión", "Comisión", "Total a cobrar"] }
+        { header: ["Mes", "Viajes", "Unidades (bicis)", "Ventas (neto)", "% Comisión", "Comisión"] }
       );
-      wsPorMes["!cols"] = [{ wch: 9 }, { wch: 8 }, { wch: 14 }, { wch: 12 }, { wch: 14 }, { wch: 11 }, { wch: 12 }, { wch: 15 }];
+      wsPorMes["!cols"] = [{ wch: 9 }, { wch: 8 }, { wch: 14 }, { wch: 14 }, { wch: 11 }, { wch: 12 }];
       XLSX.utils.book_append_sheet(wb, wsPorMes, "Resumen por Mes");
 
       const wsClientes = XLSX.utils.json_to_sheet(
@@ -3423,12 +3800,13 @@ exports.descargarInformeCompletoVendedor = onRequest(
           "Stock actual": c.stock,
           Reportado: c.vendido,
           Cobrado: c.pagado,
+          "Cobrado ($)": Math.round(c.cobradoDinero || 0),
           "Vendido sin cobrar": c.pendiente,
           "Entregado (stock+vendido)": c.entregado,
         })),
-        { header: ["Cliente", "Stock actual", "Reportado", "Cobrado", "Vendido sin cobrar", "Entregado (stock+vendido)"] }
+        { header: ["Cliente", "Stock actual", "Reportado", "Cobrado", "Cobrado ($)", "Vendido sin cobrar", "Entregado (stock+vendido)"] }
       );
-      wsClientes["!cols"] = [{ wch: 32 }, { wch: 12 }, { wch: 10 }, { wch: 10 }, { wch: 16 }, { wch: 22 }];
+      wsClientes["!cols"] = [{ wch: 32 }, { wch: 12 }, { wch: 10 }, { wch: 10 }, { wch: 14 }, { wch: 16 }, { wch: 22 }];
       XLSX.utils.book_append_sheet(wb, wsClientes, "Entregas por Cliente");
 
       const viajesRows = [];
@@ -3615,6 +3993,132 @@ exports.adminSetTarifasVendedor = onRequest(
   }
 );
 
+// Confirma a mano que una venta puntual de un cliente de un vendedor (ej.
+// Cuchi) ya se la cobró ÉL MISMO directo al cliente (no por los canales
+// normales de Contabilium) — completa o PARCIAL (monto < total de la
+// factura/COT). Pedido explícito 21/10/2026: "que para próximos cobros te
+// deje elegir clientes y elegir las bicis que se cobró".
+//
+// Guarda cliente/producto/montoTotal en el momento de confirmar (no los
+// vuelve a buscar después por `numero`) — antes se re-buscaba el cliente
+// cruzando el número de factura contra el detalle de ventas, y como ese
+// número no siempre es único entre comprobantes de distintos clientes,
+// terminaba mostrando el cliente equivocado (bug real detectado
+// 21/10/2026: una cotización de Leobono apareció atribuida a "compakjet").
+exports.adminConfirmarCobroManual = onRequest(
+  { cors: false },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { vendedorUid, numero, monto, montoTotal, cliente, producto } = req.body || {};
+      if (!vendedorUid || !numero) return res.status(400).json({ error: "Faltan vendedorUid y numero" });
+      const db = admin.firestore();
+      const ref = db.doc(`pagosManualesConfirmados/${vendedorUid}`);
+      const montoNum = monto == null ? Number(montoTotal || 0) : Number(monto);
+      const esCompleto = montoTotal == null || montoNum >= Number(montoTotal);
+      await ref.set(
+        {
+          pagosPorNumero: {
+            [String(numero)]: {
+              cliente: cliente || "(sin identificar)",
+              producto: producto || "",
+              monto: montoNum,
+              montoTotal: montoTotal != null ? Number(montoTotal) : montoNum,
+              tipo: esCompleto ? "completo" : "parcial",
+            },
+          },
+        },
+        { merge: true }
+      );
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("[adminConfirmarCobroManual] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Deshace una confirmación manual de cobro (nueva o vieja).
+exports.adminQuitarCobroManual = onRequest(
+  { cors: false },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { vendedorUid, numero } = req.body || {};
+      if (!vendedorUid || !numero) return res.status(400).json({ error: "Faltan vendedorUid y numero" });
+      const db = admin.firestore();
+      const ref = db.doc(`pagosManualesConfirmados/${vendedorUid}`);
+      // Saca tanto del formato nuevo (pagosPorNumero, con contexto propio)
+      // como del viejo (numeros/montosParciales, por si era una de las
+      // confirmaciones cargadas antes de este cambio).
+      await ref.set({ numeros: admin.firestore.FieldValue.arrayRemove(String(numero)) }, { merge: true });
+      await ref.update({ [`montosParciales.${String(numero)}`]: admin.firestore.FieldValue.delete() }).catch(() => {});
+      await ref.update({ [`pagosPorNumero.${String(numero)}`]: admin.firestore.FieldValue.delete() }).catch(() => {});
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("[adminQuitarCobroManual] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Cierra un período y lo marca como pagado — pedido explícito 21/10/2026:
+// "que se cierre ese número con un botón y lo que queda del mes que tenga
+// otro número, desde 0 porque lo anterior ya se le pagó". Guarda el
+// período cerrado en un historial (`liquidacionesVendedor`), y corre la
+// fecha de arranque del PRÓXIMO informe a hoy (`users/{uid}.fechaUltimaLiquidacion`)
+// — a partir de ahí el flete deja de contarse por el stock total (eso ya
+// se pagó) y pasa a contarse por movimiento nuevo (retiros + entregas). De
+// paso, limpia las confirmaciones manuales de cobro vigentes: ya quedaron
+// incluidas en el total que se está cerrando, no tienen que seguir
+// restando en el próximo período.
+exports.adminCerrarLiquidacionVendedor = onRequest(
+  { cors: false },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { vendedorUid, desde, hasta, totalFlete, totalComision, totalCobradoPorVendedor, totalNetoAPagar, pagosManuales } = req.body || {};
+      if (!vendedorUid || !hasta) return res.status(400).json({ error: "Faltan vendedorUid y hasta" });
+      const db = admin.firestore();
+
+      await db.collection("liquidacionesVendedor").doc(vendedorUid).collection("periodos").add({
+        desde: desde || null,
+        hasta,
+        totalFlete: Number(totalFlete || 0),
+        totalComision: Number(totalComision || 0),
+        totalCobradoPorVendedor: Number(totalCobradoPorVendedor || 0),
+        totalNetoAPagar: Number(totalNetoAPagar || 0),
+        pagosManualesIncluidos: pagosManuales || [],
+        cerradoPorUid: staffUid,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      await db.doc(`users/${vendedorUid}`).set({ fechaUltimaLiquidacion: hasta }, { merge: true });
+      // Las confirmaciones manuales vigentes ya quedaron guardadas arriba
+      // (pagosManualesIncluidos) — se borran del doc "vivo" para que el
+      // próximo período arranque sin ellas.
+      await db.doc(`pagosManualesConfirmados/${vendedorUid}`).set(
+        { numeros: [], montosParciales: {}, pagosPorNumero: {} },
+        { merge: true }
+      );
+
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("[adminCerrarLiquidacionVendedor] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
 // Detalle completo del depósito propio de Samurai en Lavalle (modelos,
 // colores, cantidades) para quien coordina un grupo de vendedores — mismo
 // gate que getMisVendedores (campo `vendedoresAsignados`), separado en su
@@ -3792,15 +4296,12 @@ async function emitirComprobanteConIva({ idCliente, idDeposito, tipoFc, items, f
       }
     }
 
-    if (tipoFc === "FCB") {
-      const resultado = await crearYEmitir("FCC");
-      return {
-        ...resultado,
-        tipoDocumentoEmitido: "FCC",
-        avisoCambioTipo: "AFIP rechazó la Factura B por la condición de IVA del receptor — se emitió como Factura C en su lugar.",
-      };
-    }
-
+    // Antes acá se reintentaba sola como Factura C si la B fallaba — se
+    // sacó: nosotros somos Responsable Inscripto, una C no discrimina IVA
+    // (literal $0 de IVA) y terminaría facturando sin el IVA que sí
+    // corresponde cobrar. Mejor mostrar el error real y que se resuelva a
+    // mano (revisar el cliente en Contabilium) antes que emitir un
+    // comprobante fiscalmente incorrecto solo para que "no falle".
     throw err;
   }
 }
@@ -4889,7 +5390,7 @@ exports.diagExplorarHistoricoStock = onRequest(
 );
 
 exports.diagHistoricoStockReal = onRequest(
-  { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 180, memory: "1GiB" },
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 540, memory: "1GiB" },
   async (req, res) => {
     setCorsHeaders(req, res);
     if (req.method === "OPTIONS") return res.status(204).send("");
@@ -4938,6 +5439,30 @@ exports.diagExplorarModuloDepositos = onRequest(
 // dirección/teléfono ni el ID). Prueba de un solo depósito por vez a
 // propósito — nunca hace un batch, para que cada cambio se pueda revisar
 // antes de seguir con el siguiente.
+exports.diagExplorarBorrarDeposito = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 120 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { id } = req.body || {};
+      if (!id) return res.status(400).json({ error: "Falta id" });
+      const { explorarBorrarDeposito } = require("./contabiliumWebAutomation");
+      const resultado = await explorarBorrarDeposito({
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+        id: Number(id),
+      });
+      return res.json(resultado);
+    } catch (err) {
+      console.error("[diagExplorarBorrarDeposito] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
 exports.adminRenombrarDeposito = onRequest(
   { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 120, memory: "512MiB" },
   async (req, res) => {
@@ -6466,6 +6991,52 @@ exports.listCotizaciones = onRequest(
   }
 );
 
+// Investigación puntual (SOLO LECTURA): reconstruye el precio de lista
+// aproximado de cada SKU en una ventana de fechas pasada, a partir de lo
+// que realmente se facturó/cotizó ahí — no tenemos historial de precios
+// guardado en ningún lado, así que el precio real de venta de la época es
+// la mejor referencia disponible (pedido 21/10/2026, valorización de stock
+// al 31/12/2025).
+exports.diagPreciosHistoricos = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 300 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const desde = req.body?.desde || "2025-10-01";
+      const hasta = req.body?.hasta || "2025-12-31";
+      const email = CONTABILIUM_EMAIL.value();
+      const apiKey = CONTABILIUM_API_KEY.value();
+      const comprobantes = await getAllComprobantes(email, apiKey, { desde, hasta });
+      const relevantes = comprobantes.filter((c) => ["FCA", "FCB", "FCC", "COT"].includes(c.TipoFc));
+
+      const precioPorSku = {};
+      for (const c of relevantes) {
+        try {
+          const full = await getComprobanteById(email, apiKey, c.Id);
+          for (const it of full?.Items || []) {
+            const sku = (it.Codigo || "").trim();
+            if (!sku) continue;
+            const precioUnitario = Number(it.PrecioUnitario) || 0;
+            if (precioUnitario <= 0) continue;
+            if (!precioPorSku[sku]) precioPorSku[sku] = [];
+            precioPorSku[sku].push({ fecha: c.FechaEmision, numero: c.Numero, precioUnitario });
+          }
+        } catch (err) {
+          console.error("[diagPreciosHistoricos] detalle falló", c.Id, err.message);
+        }
+        await new Promise((r) => setTimeout(r, 80));
+      }
+      return res.json({ totalComprobantes: relevantes.length, precioPorSku });
+    } catch (err) {
+      console.error("[diagPreciosHistoricos] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
 // Diagnóstico: agrupa TODOS los comprobantes de la empresa por TipoFc, para
 // confirmar qué código usa Contabilium para remitos (y cuántos hay).
 exports.diagTiposComprobante = onRequest(
@@ -7445,6 +8016,33 @@ exports.getDepositoStockAdmin = onRequest(
   }
 );
 
+// Rodados Argentinos (depósito único en Contabilium) separado en los 2
+// sectores reales "Adrogué"/"Temperley" según la observación de cada
+// movimiento histórico — ver `buildStockRodadosPorSector`.
+exports.getStockRodadosPorSector = onRequest(
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 300 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const db = admin.firestore();
+      const resultado = await buildStockRodadosPorSector(
+        db,
+        CONTABILIUM_EMAIL.value(),
+        CONTABILIUM_API_KEY.value(),
+        CONTABILIUM_WEB_EMAIL.value(),
+        CONTABILIUM_WEB_PASSWORD.value()
+      );
+      return res.json({ ok: true, ...resultado });
+    } catch (err) {
+      console.error("[getStockRodadosPorSector] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
 // ─────────────────────────────────────────────────────────────
 // Ventas reportadas por distribuidores (no toca Contabilium):
 // el distribuidor marca "vendí esto", queda pendiente hasta que
@@ -8096,6 +8694,131 @@ exports.emitirFacturaManual = onRequest(
       return res.json({ ok: true, comprobante });
     } catch (err) {
       console.error("[facturas] emitirFacturaManual error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+const TIPO_NC_POR_ORIGEN = { COT: "NCT", FCA: "NCA", FCB: "NCB", FCC: "NCC" };
+
+// Nota de crédito contra un comprobante existente (COT o factura real).
+// Dos caminos según el tipo de origen:
+//  - COT → NCT: no es documento AFIP, se crea directo por la API REST
+//    (crearComprobante con IdComprobanteAsociado) — mismo camino que ya usa
+//    el resto del sitio para COT, confirmado contra una NCT real hecha a
+//    mano (20/10/2026, Juliana Peralta): Contabilium la guarda con
+//    IdComprobanteAsociado = id del COT y el total en negativo solo.
+//  - FCA/FCB/FCC → NCA/NCB/NCC: factura real, necesita su propio CAE de
+//    AFIP — va por el mismo flujo web (Puppeteer) que emite facturas
+//    electrónicas, no por la REST pública (que falla con "Condicion IVA
+//    receptor" en casos reales, ver comentario en crearComprobanteWeb).
+// `montoTotal` (opcional): nota de crédito PARCIAL — un solo ítem por ese
+// monto en vez de repetir los ítems originales 1 a 1. Sin él, es un
+// reverso completo de la factura/COT original.
+exports.crearNotaCredito = onRequest(
+  {
+    cors: false,
+    secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD],
+    timeoutSeconds: 120,
+    memory: "1GiB",
+  },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+
+    try {
+      const { idComprobanteOriginal, montoTotal, observaciones } = req.body || {};
+      const idOriginal = Number(idComprobanteOriginal);
+      if (!idOriginal) return res.status(400).json({ error: "idComprobanteOriginal requerido" });
+
+      const email = CONTABILIUM_EMAIL.value();
+      const apiKey = CONTABILIUM_API_KEY.value();
+      const original = await getComprobanteById(email, apiKey, idOriginal);
+      if (!original) return res.status(404).json({ error: "No se encontró el comprobante original" });
+
+      const tipoNC = TIPO_NC_POR_ORIGEN[original.TipoFc];
+      if (!tipoNC) {
+        return res.status(400).json({ error: `No se puede hacer una NC sobre un comprobante tipo "${original.TipoFc}" — solo COT, FCA, FCB o FCC.` });
+      }
+
+      const itemsOriginales = original.Items || [];
+      if (itemsOriginales.length === 0) {
+        return res.status(400).json({ error: "El comprobante original no tiene ítems para copiar" });
+      }
+
+      // NC parcial: un solo ítem con la descripción del primero y el monto
+      // pedido (mismo criterio que se usa a mano en Contabilium: un ítem
+      // "genérico" por la diferencia, no hay forma de prorratear sola entre
+      // varios productos sin que el staff decida a cuál se le aplica).
+      const itemsNC = Number.isFinite(Number(montoTotal)) && Number(montoTotal) > 0
+        ? [{
+            sku: itemsOriginales[0].Codigo || null,
+            descripcion: itemsOriginales[0].Concepto || itemsOriginales[0].Descripcion || "Ajuste",
+            cantidad: 1,
+            precioUnitario: Number(montoTotal),
+          }]
+        : itemsOriginales.map((it) => ({
+            sku: it.Codigo || null,
+            descripcion: it.Concepto || it.Descripcion || "",
+            cantidad: Number(it.Cantidad) || 1,
+            precioUnitario: Number(it.PrecioUnitario) || 0,
+          }));
+
+      let resultado;
+      if (tipoNC === "NCT") {
+        resultado = await crearComprobante(email, apiKey, {
+          idCliente: original.IdCliente,
+          tipoFc: "NCT",
+          items: itemsNC,
+          fechaEmision: new Date().toISOString().slice(0, 10),
+          idComprobanteAsociado: idOriginal,
+        });
+      } else {
+        const { crearComprobanteWeb } = require("./contabiliumWebAutomation");
+        const itemsWeb = itemsNC.map((it) => ({
+          sku: it.sku,
+          descripcion: it.descripcion,
+          cantidad: it.cantidad,
+          precioUnitarioConIva: it.precioUnitario,
+          iva: 21,
+        }));
+        const { idComprobante, cae } = await crearComprobanteWeb({
+          db: admin.firestore(),
+          email: CONTABILIUM_WEB_EMAIL.value(),
+          password: CONTABILIUM_WEB_PASSWORD.value(),
+          restEmail: email,
+          restApiKey: apiKey,
+          idPersona: original.IdCliente,
+          idInventario: original.Inventario || undefined,
+          tipoFc: tipoNC,
+          items: itemsWeb,
+          fechaEmision: new Date().toISOString().slice(0, 10),
+          observaciones: observaciones || "",
+          comprobanteAsociado: idOriginal,
+          motivoNC: observaciones || "Ajuste",
+        });
+        resultado = await getComprobanteById(email, apiKey, idComprobante);
+        resultado = { Id: idComprobante, Cae: cae, ...(resultado || {}) };
+      }
+
+      await admin.firestore().collection("notasCredito").add({
+        idComprobanteOriginal: idOriginal,
+        tipoOriginal: original.TipoFc,
+        tipoNC,
+        montoTotal: montoTotal ? Number(montoTotal) : null,
+        observaciones: observaciones || null,
+        creadoPor: staffUid,
+        creadoAt: admin.firestore.FieldValue.serverTimestamp(),
+        resultado: resultado || null,
+      });
+
+      return res.json({ ok: true, notaCredito: resultado });
+    } catch (err) {
+      console.error("[crearNotaCredito] error:", err);
       return res.status(500).json({ error: err.message || String(err) });
     }
   }

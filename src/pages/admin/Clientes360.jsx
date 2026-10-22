@@ -14,7 +14,7 @@ import { subscribeBusinessDashboardDetail } from "../../services/comprobantes";
 import { nombreBanco, listaBancos } from "../../services/bancos";
 import { listAuditsByDeposito, getAuditProgramStart, nextAuditDate, isAuditOverdue, isAuditDueSoon, contarVistas } from "../../services/stockAudits";
 import AuditVideoPlayer from "../../components/stock/AuditVideoPlayer";
-import { adminGetClientComprobantes, adminGetClientPhone, adminActualizarTelefonosCliente, adminGetComprobanteDetail, adminDescargarPdfComprobante, getDepositoStockAdmin, adminLinkClientesByCuit, emitirFacturaManual, emitirFacturaVenta, cobrarComprobante, verificarCondicionAfip, subscribeClientesReportDetail, adminAsignarVendedor, searchContabiliumClientes, leerComprobantePagoAdmin, adminListDistribuidoresConEquipo, adminAsignarClienteADistribuidor, adminBuscarClientePorTelefono, cargarCobranzaACuentaManual, listarChequesDisponiblesContabilium } from "../../services/comprobantes";
+import { adminGetClientComprobantes, adminGetClientPhone, adminActualizarTelefonosCliente, adminGetComprobanteDetail, adminDescargarPdfComprobante, getDepositoStockAdmin, adminLinkClientesByCuit, emitirFacturaManual, emitirFacturaVenta, cobrarComprobante, verificarCondicionAfip, subscribeClientesReportDetail, adminAsignarVendedor, searchContabiliumClientes, leerComprobantePagoAdmin, adminListDistribuidoresConEquipo, adminAsignarClienteADistribuidor, adminBuscarClientePorTelefono, cargarCobranzaACuentaManual, listarChequesDisponiblesContabilium, deleteSaleRequest } from "../../services/comprobantes";
 import { limpiarNombreBici, extraerTalle, extraerModelo } from "../../utils/bikeName";
 import { getContabiliumDepositos, labelDeposito } from "../../services/contabiliumDepositos";
 import { addNotaEntrega, subscribeNotasEntregaPorCliente } from "../../services/notasEntrega";
@@ -971,6 +971,9 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
   const [revisandoPagoId, setRevisandoPagoId] = useState(null);
   const [pagoConfirmandoId, setPagoConfirmandoId] = useState(null); // id del pago reportado con el form de "cargar en Contabilium" abierto
   const [emitiendoVentaId, setEmitiendoVentaId] = useState(null); // id de la venta reportada que se está facturando
+  const [ventasSeleccionadas, setVentasSeleccionadas] = useState(new Set());
+  const [facturandoSeleccion, setFacturandoSeleccion] = useState(false);
+  const [eliminandoVentaId, setEliminandoVentaId] = useState(null);
   const [programStart, setProgramStart] = useState(null);
   const [reciboAbierto, setReciboAbierto] = useState(null); // id de la factura con el form de recibo abierto
   const [cobranzaCuentaAbierta, setCobranzaCuentaAbierta] = useState(false);
@@ -1458,6 +1461,62 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
       alert(e.message || "No se pudo facturar la venta reportada.");
     } finally {
       setEmitiendoVentaId(null);
+    }
+  }
+
+  function toggleVentaSeleccionada(id) {
+    setVentasSeleccionadas((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  async function handleFacturarSeleccionadas() {
+    const ids = Array.from(ventasSeleccionadas);
+    if (ids.length === 0) return;
+    const seleccionadas = ventasReportadas.filter((v) => ids.includes(v.id));
+    const totalMonto = seleccionadas.reduce((a, v) => a + Number(v.unitPrice || 0) * Number(v.quantity || 0), 0);
+    if (
+      !confirm(
+        `Vas a EMITIR ${ids.length} FACTURA${ids.length === 1 ? "" : "S"} REAL${ids.length === 1 ? "" : "ES"} en Contabilium (con CAE, irreversible) por un total de ${money(totalMonto)}.\n\n¿Confirmás?`
+      )
+    )
+      return;
+    setFacturandoSeleccion(true);
+    try {
+      await emitirFacturaVenta(ids);
+      setVentasReportadas((prev) => prev.map((v) => (ids.includes(v.id) ? { ...v, status: "facturado" } : v)));
+      setVentasSeleccionadas(new Set());
+      recargarFacturas();
+    } catch (e) {
+      alert(e.message || "No se pudieron facturar las ventas seleccionadas.");
+    } finally {
+      setFacturandoSeleccion(false);
+    }
+  }
+
+  async function handleEliminarVentaReportada(venta) {
+    if (
+      !confirm(
+        `Vas a eliminar este reporte de venta (no se factura, no queda registrado):\n\n${venta.name || venta.sku} x${venta.quantity} — ${money(Number(venta.unitPrice || 0) * Number(venta.quantity || 0))}\n\nUsalo si la vas a facturar directo desde el botón "Facturar" del catálogo en vez de desde acá. ¿Confirmás?`
+      )
+    )
+      return;
+    setEliminandoVentaId(venta.id);
+    try {
+      await deleteSaleRequest(venta.id);
+      setVentasReportadas((prev) => prev.filter((v) => v.id !== venta.id));
+      setVentasSeleccionadas((prev) => {
+        const next = new Set(prev);
+        next.delete(venta.id);
+        return next;
+      });
+    } catch (e) {
+      alert(e.message || "No se pudo eliminar el reporte de venta.");
+    } finally {
+      setEliminandoVentaId(null);
     }
   }
 
@@ -2123,25 +2182,54 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
                   🚲 Ventas reportadas pendientes de facturar ({ventasReportadas.filter((v) => v.status === "pendiente").length})
                 </p>
                 <p className="mb-3 text-xs text-sky-700 dark:text-sky-400">
-                  El cliente reportó que ya vendió esto — mientras no se facture, la unidad queda reservada (no cuenta como disponible en "Facturar").
+                  El cliente reportó que ya vendió esto — mientras no se facture, la unidad queda reservada (no cuenta como disponible en "Facturar"). Si vas a facturarla directo desde el botón "Facturar" del catálogo, eliminá el reporte con 🗑️ para liberar la unidad.
                 </p>
+                {!soloLectura && ventasSeleccionadas.size > 0 && (
+                  <button
+                    onClick={handleFacturarSeleccionadas}
+                    disabled={facturandoSeleccion}
+                    className="mb-3 rounded-lg bg-sky-700 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-sky-800 disabled:opacity-60"
+                  >
+                    {facturandoSeleccion ? "Facturando…" : `✓ Facturar seleccionadas (${ventasSeleccionadas.size})`}
+                  </button>
+                )}
                 <div className="space-y-2">
                   {ventasReportadas.filter((v) => v.status === "pendiente").map((v) => (
                     <div key={v.id} className="flex items-center justify-between gap-2 rounded-xl border border-sky-200 bg-white px-3 py-2.5 text-sm dark:border-sky-900/50 dark:bg-neutral-900">
-                      <div className="min-w-0">
-                        <p className="truncate font-semibold text-slate-900 dark:text-white">{v.name || `SKU ${v.sku}`} x{v.quantity}</p>
-                        <p className="text-xs text-slate-400 dark:text-neutral-500">
-                          {money(Number(v.unitPrice || 0) * Number(v.quantity || 0))} · {v.createdAt?.toDate ? formatFecha(v.createdAt.toDate().toISOString().slice(0, 10)) : ""}
-                        </p>
+                      <div className="flex min-w-0 items-center gap-2">
+                        {!soloLectura && (
+                          <input
+                            type="checkbox"
+                            checked={ventasSeleccionadas.has(v.id)}
+                            onChange={() => toggleVentaSeleccionada(v.id)}
+                            className="h-4 w-4 shrink-0 accent-sky-600"
+                          />
+                        )}
+                        <div className="min-w-0">
+                          <p className="truncate font-semibold text-slate-900 dark:text-white">{v.name || `SKU ${v.sku}`} x{v.quantity}</p>
+                          <p className="text-xs text-slate-400 dark:text-neutral-500">
+                            {money(Number(v.unitPrice || 0) * Number(v.quantity || 0))} · {v.createdAt?.toDate ? formatFecha(v.createdAt.toDate().toISOString().slice(0, 10)) : ""}
+                          </p>
+                        </div>
                       </div>
                       {!soloLectura && (
-                        <button
-                          onClick={() => handleFacturarVentaReportada(v)}
-                          disabled={emitiendoVentaId === v.id}
-                          className="shrink-0 rounded-lg bg-sky-600 px-2.5 py-1.5 text-xs font-semibold text-white transition hover:bg-sky-700 disabled:opacity-60"
-                        >
-                          {emitiendoVentaId === v.id ? "Facturando…" : "✓ Facturar"}
-                        </button>
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          <button
+                            onClick={() => handleFacturarVentaReportada(v)}
+                            disabled={emitiendoVentaId === v.id}
+                            className="rounded-lg bg-sky-600 px-2.5 py-1.5 text-xs font-semibold text-white transition hover:bg-sky-700 disabled:opacity-60"
+                          >
+                            {emitiendoVentaId === v.id ? "Facturando…" : "✓ Facturar"}
+                          </button>
+                          <button
+                            onClick={() => handleEliminarVentaReportada(v)}
+                            disabled={eliminandoVentaId === v.id}
+                            title="Eliminar reporte (para facturarla desde otro lado)"
+                            className="rounded-lg border border-rose-200 px-2 py-1.5 text-xs font-semibold text-rose-600 transition hover:bg-rose-50 disabled:opacity-60 dark:border-rose-900/50 dark:text-rose-400 dark:hover:bg-rose-950/20"
+                          >
+                            {eliminandoVentaId === v.id ? "…" : "🗑️"}
+                          </button>
+                        </div>
                       )}
                     </div>
                   ))}

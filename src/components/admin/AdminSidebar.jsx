@@ -1,8 +1,21 @@
 import { useEffect, useState } from "react";
 import { NavLink } from "react-router-dom";
+import { collection, doc, onSnapshot, query, setDoc, where } from "firebase/firestore";
+import { db } from "../../firebase";
 import { subscribeToOrderSyncStatus } from "../../services/contabilium";
 import { useAuth } from "../../auth/AuthContext";
 import { puedeVerCots } from "../../utils/permisosCots";
+
+// Puntito rojo tipo "no leído" (WhatsApp) para estas 3 secciones: se prende
+// cuando hay más pendientes ahora que la última vez que el admin entró ahí,
+// y se apaga solo al entrar (ver marcarSeccionVista). "Visto" se guarda por
+// usuario en users/{uid}.sidebarVisto, así sobrevive a un refresh/cierre de
+// sesión — no es solo estado local del componente.
+const SECCIONES_CON_PENDIENTES = {
+  "/admin/pedidos-pendientes": "pedidosPendientes",
+  "/admin/ventas-reportadas": "ventasReportadas",
+  "/admin/orders": "ordenes",
+};
 
 function timeAgo(date) {
   if (!date) return "nunca";
@@ -43,42 +56,116 @@ const items = [
   { to: "/admin/settings", label: "Configuración", icon: SettingsIcon },
 ];
 
-export default function AdminSidebar({ collapsed, onToggle, onNavigate }) {
+export default function AdminSidebar({ collapsed, forceExpanded, onToggle, onNavigate }) {
   const { user } = useAuth();
   const [syncStatus, setSyncStatus] = useState(null);
+  const [pendientesCounts, setPendientesCounts] = useState({});
+  const [sidebarVisto, setSidebarVisto] = useState({});
+  // En modo "riel de íconos" (collapsed=true), pasar el mouse por encima
+  // despliega los nombres como panel flotante, sin empujar el contenido —
+  // se cierra solo al sacar el mouse. Si está "fijado" abierto (collapsed
+  // =false, con el botón «/») se ve siempre expandido, sin depender del
+  // hover.
+  const [hovering, setHovering] = useState(false);
+  // En el drawer mobile (forceExpanded, ver AdminLayout) siempre se ve
+  // completo — no hay forma de "hacer hover" en touch, así que el riel de
+  // íconos con hover es solo comportamiento de escritorio.
+  const expandido = !collapsed || hovering || forceExpanded;
+  const comoRielFlotante = collapsed && hovering && !forceExpanded;
   const visibleItems = items.filter((it) => !it.restricted || puedeVerCots(user?.uid));
 
   useEffect(() => {
     return subscribeToOrderSyncStatus(setSyncStatus);
   }, []);
 
+  useEffect(() => {
+    const u1 = onSnapshot(
+      query(collection(db, "pedidosPendientes"), where("estado", "==", "pendiente")),
+      (snap) => setPendientesCounts((p) => ({ ...p, pedidosPendientes: snap.size })),
+      () => {}
+    );
+    const u2 = onSnapshot(
+      query(collection(db, "saleRequests"), where("status", "==", "pendiente")),
+      (snap) => setPendientesCounts((p) => ({ ...p, ventasReportadas: snap.size })),
+      () => {}
+    );
+    const u3 = onSnapshot(
+      query(collection(db, "orders"), where("status", "==", "pendiente")),
+      (snap) => setPendientesCounts((p) => ({ ...p, ordenes: snap.size })),
+      () => {}
+    );
+    return () => {
+      u1();
+      u2();
+      u3();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    return onSnapshot(doc(db, "users", user.uid), (snap) => {
+      setSidebarVisto(snap.data()?.sidebarVisto || {});
+    });
+  }, [user]);
+
+  // Se llama al clickear una de estas 3 secciones: guarda el conteo actual
+  // como "ya visto" — la próxima vez el puntito solo vuelve si el conteo
+  // subió por encima de esto.
+  function marcarSeccionVista(key) {
+    if (!user) return;
+    const actualizado = { ...sidebarVisto, [key]: pendientesCounts[key] || 0 };
+    setSidebarVisto(actualizado);
+    setDoc(doc(db, "users", user.uid), { sidebarVisto: actualizado }, { merge: true }).catch(() => {});
+  }
+
   const hasErrors = (syncStatus?.errors?.length || 0) > 0;
 
   const Item = ({ to, label, icon, exact }) => {
     const Icon = icon;
+    const claveSeccion = SECCIONES_CON_PENDIENTES[to];
+    const tienePendienteSinVer = claveSeccion
+      ? (pendientesCounts[claveSeccion] || 0) > (sidebarVisto[claveSeccion] || 0)
+      : false;
     return (
       <NavLink
         exact={!!exact}
         to={to}
-        onClick={onNavigate}
-        title={collapsed ? label : undefined}
+        onClick={() => {
+          if (claveSeccion) marcarSeccionVista(claveSeccion);
+          onNavigate?.();
+        }}
+        title={expandido ? undefined : label}
         className="group relative flex items-center gap-3 rounded-2xl px-3 py-2 text-sm text-slate-600 transition hover:bg-slate-100 hover:text-slate-900 dark:text-neutral-400 dark:hover:bg-neutral-800 dark:hover:text-white"
         activeClassName="bg-white text-slate-900 shadow-lg shadow-sky-100 dark:bg-neutral-800 dark:text-white dark:shadow-none"
       >
         <span className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-500 transition group-hover:bg-slate-200 group-hover:text-slate-900 dark:bg-neutral-800 dark:text-neutral-400 dark:group-hover:bg-neutral-700 dark:group-hover:text-white">
           <Icon className="h-5 w-5" />
+          {tienePendienteSinVer && (
+            <span className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full bg-rose-500 ring-2 ring-white dark:ring-neutral-900" />
+          )}
         </span>
-        {!collapsed && <span className="truncate">{label}</span>}
+        {expandido && <span className="truncate">{label}</span>}
+        {expandido && tienePendienteSinVer && (
+          <span className="ml-auto h-2 w-2 shrink-0 rounded-full bg-rose-500" />
+        )}
         <span className="pointer-events-none absolute inset-0 rounded-2xl border border-slate-200 opacity-0 transition group-hover:opacity-100 dark:border-neutral-700" />
       </NavLink>
     );
   };
   return (
-    <div className="flex h-full flex-col px-4 py-6">
+    <div
+      onMouseEnter={() => collapsed && !forceExpanded && setHovering(true)}
+      onMouseLeave={() => setHovering(false)}
+      className={`flex h-full flex-col px-4 py-6 transition-[width,box-shadow] duration-200 ease-out ${
+        comoRielFlotante
+          ? "fixed inset-y-0 left-0 z-50 w-[280px] overflow-y-auto bg-white shadow-2xl dark:bg-neutral-950"
+          : "w-full"
+      }`}
+    >
       <div className="flex items-center justify-between rounded-2xl border border-slate-200 bg-white px-3 py-3 shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
         <div className="flex items-center gap-3">
-          <div className="h-10 w-10 rounded-2xl bg-gradient-to-br from-sky-500 to-indigo-500" />
-          {!collapsed && (
+          <img src="/img/samurai-favicon-round.png" alt="Samurai" className="h-10 w-10 shrink-0 rounded-2xl" />
+          {expandido && (
             <div>
               <p className="text-sm font-semibold text-slate-900 dark:text-white">Samurai Admin</p>
             </div>
@@ -87,7 +174,7 @@ export default function AdminSidebar({ collapsed, onToggle, onNavigate }) {
         <button
           onClick={onToggle}
           className="rounded-2xl border border-slate-200 bg-white px-2 py-1 text-xs text-slate-500 transition hover:border-sky-400 hover:text-slate-900 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-400 dark:hover:text-white"
-          title={collapsed ? "Expandir" : "Colapsar"}
+          title={collapsed ? "Fijar expandido" : "Volver a riel de íconos"}
         >
           {collapsed ? "»" : "«"}
         </button>
@@ -100,7 +187,7 @@ export default function AdminSidebar({ collapsed, onToggle, onNavigate }) {
       </nav>
 
       <div className="mt-auto rounded-2xl border border-slate-200 bg-white p-4 text-xs text-slate-500 shadow-sm dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-400">
-        {!collapsed ? (
+        {expandido ? (
           <>
             <div className="flex items-center gap-2">
               <span className={`h-2 w-2 rounded-full ${hasErrors ? "bg-rose-500" : "bg-emerald-400"}`} />

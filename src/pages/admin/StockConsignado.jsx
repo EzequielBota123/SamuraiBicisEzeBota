@@ -7,7 +7,7 @@ import { useLocation } from "react-router-dom";
 import { collection, getDocs, query as fsQuery, where } from "firebase/firestore";
 import { db } from "../../firebase";
 import { getContabiliumDepositos, labelDeposito, matchDeposito } from "../../services/contabiliumDepositos";
-import { getDepositoStockAdmin, ajustarStockManual, transferirStockManual, generarRemitoRealManual, debugProbeIdCC, searchContabiliumClientes, crearDepositoManual, pedirProvinciaYCiudad } from "../../services/comprobantes";
+import { getDepositoStockAdmin, ajustarStockManual, transferirStockManual, generarRemitoRealManual, debugProbeIdCC, searchContabiliumClientes, crearDepositoManual, pedirProvinciaYCiudad, getStockRodadosPorSector } from "../../services/comprobantes";
 import { LoadingOverlay } from "../../components/ui/LoadingIndicators";
 import { filterBySearch } from "../../utils/colorSearch";
 import { StatsBanner, BikeCard, ItemModal } from "../../components/stock/ConsignedStockUI";
@@ -54,6 +54,11 @@ function isBici(item) {
   return (item.category || "").toUpperCase() === "BICICLETAS";
 }
 
+const RODADOS_ARGENTINOS_DEPOSITO_ID = 134795;
+function esRodadosArgentinos(d) {
+  return d?.id === RODADOS_ARGENTINOS_DEPOSITO_ID || /rodados argentinos/i.test(d?.nombre || "");
+}
+
 export default function StockConsignado() {
   const { user, profile } = useAuth();
   const [depositos, setDepositos] = useState([]);
@@ -78,6 +83,9 @@ export default function StockConsignado() {
   const [distributorName, setDistributorName] = useState(null);
   const [recorderOpen, setRecorderOpen] = useState(false);
   const [creandoDeposito, setCreandoDeposito] = useState(false);
+  const [rodadosSectores, setRodadosSectores] = useState(null);
+  const [loadingRodados, setLoadingRodados] = useState(false);
+  const [errorRodados, setErrorRodados] = useState("");
 
   async function handleCrearDeposito() {
     const nombre = prompt("Nombre del depósito nuevo (ej. el nombre del cliente/distribuidor):");
@@ -200,6 +208,8 @@ export default function StockConsignado() {
     setDistributorUid(null);
     setDistributorName(null);
     setLoadingAudits(true);
+    setRodadosSectores(null);
+    setErrorRodados("");
     try {
       const result = await getDepositoStockAdmin(d.id);
       setItems(result.items);
@@ -207,6 +217,17 @@ export default function StockConsignado() {
       setError(e.message || "Error al consultar el stock");
     } finally {
       setLoadingItems(false);
+    }
+    if (esRodadosArgentinos(d)) {
+      setLoadingRodados(true);
+      try {
+        const r = await getStockRodadosPorSector();
+        setRodadosSectores(r);
+      } catch (e) {
+        setErrorRodados(e.message || "No se pudo separar el stock por sector");
+      } finally {
+        setLoadingRodados(false);
+      }
     }
     try {
       const list = await listAuditsByDeposito(d.id);
@@ -362,6 +383,48 @@ export default function StockConsignado() {
                   </span>
                 )}
               </div>
+
+              {esRodadosArgentinos(selected) && (
+                <div className="mt-4 rounded-2xl border border-indigo-200 bg-indigo-50/60 p-4 dark:border-indigo-900 dark:bg-indigo-950/10">
+                  <p className="text-sm font-bold text-indigo-800 dark:text-indigo-400">📍 Separado por sector (Adrogué / Temperley)</p>
+                  <p className="mt-1 text-[11px] text-slate-500 dark:text-neutral-400">
+                    Rodados Argentinos es un solo depósito en Contabilium — esto clasifica cada movimiento histórico según si su observación menciona "Adrogué" o "Temperley". Lo que no lo menciona queda sin clasificar.
+                  </p>
+                  {loadingRodados && <p className="mt-2 text-xs text-indigo-700/70 dark:text-indigo-400/60">Leyendo el historial de movimientos (puede tardar)…</p>}
+                  {errorRodados && <p className="mt-2 text-xs text-rose-600 dark:text-rose-400">{errorRodados}</p>}
+                  {rodadosSectores && !loadingRodados && (
+                    <>
+                      <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                        {[
+                          { key: "adrogue", label: "🏠 Rodados Adrogué" },
+                          { key: "temperley", label: "🏠 Rodados Temperley" },
+                          { key: "sinClasificar", label: "❓ Sin clasificar" },
+                        ].map(({ key, label }) => {
+                          const sector = rodadosSectores.sectores?.[key];
+                          return (
+                            <div key={key} className="rounded-xl border border-slate-200 bg-white p-3 dark:border-neutral-700 dark:bg-neutral-800">
+                              <p className="text-xs font-bold text-slate-700 dark:text-neutral-300">{label}</p>
+                              <p className="mt-1 text-xl font-bold text-slate-900 dark:text-white">{sector?.total ?? 0}</p>
+                              {(sector?.items || []).length > 0 && (
+                                <ul className="mt-2 space-y-0.5 text-[11px] text-slate-500 dark:text-neutral-400">
+                                  {sector.items.map((it) => (
+                                    <li key={it.sku}>{it.name}: {it.stockActual}</li>
+                                  ))}
+                                </ul>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                      {rodadosSectores.stockTotalReal != null && (
+                        <p className="mt-2 text-[11px] text-slate-500 dark:text-neutral-400">
+                          Stock real en Contabilium: {rodadosSectores.stockTotalReal} · leído de {rodadosSectores.totalFilasLeidas} movimientos históricos.
+                        </p>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
 
               <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-neutral-700 dark:bg-neutral-800/60">
                 <div className="flex flex-wrap items-center justify-between gap-2">

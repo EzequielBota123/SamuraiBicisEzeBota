@@ -935,7 +935,7 @@ const PUNTO_VENTA_SAMURAI = 117923;
 // stock del depósito consignado real del cliente. Los ítems sin SKU
 // reconocido (ej. una línea de texto libre / ajuste manual) se mandan
 // igual pero sin tocar inventario.
-async function crearComprobante(email, apiKey, { idCliente, idDeposito, tipoFc = "FCA", items, fechaEmision }) {
+async function crearComprobante(email, apiKey, { idCliente, idDeposito, tipoFc = "FCA", items, fechaEmision, idComprobanteAsociado }) {
   const token = await getAccessToken(email, apiKey);
 
   let conceptoIdBySku = null;
@@ -971,6 +971,7 @@ async function crearComprobante(email, apiKey, { idCliente, idDeposito, tipoFc =
     PuntoVenta: PUNTO_VENTA_SAMURAI,
     FechaEmision: fechaEmision || new Date().toISOString().slice(0, 10),
     ...(idDeposito ? { Inventario: idDeposito } : {}),
+    ...(idComprobanteAsociado ? { IdComprobanteAsociado: idComprobanteAsociado } : {}),
     Items: payloadItems,
   };
   const res = await fetch(`${API_BASE}/comprobantes/crear`, {

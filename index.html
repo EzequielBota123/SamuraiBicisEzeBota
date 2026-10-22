@@ -6,6 +6,16 @@
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>Samurai Bikes — Catálogo mayorista</title>
+
+    <!-- Arranca la conexión (DNS + TLS) a Firebase en paralelo con la
+         descarga del JS, en vez de esperar a que el código la pida —
+         ahorra ida y vuelta en el primer pedido a Firestore/Auth/Storage. -->
+    <link rel="preconnect" href="https://firestore.googleapis.com" crossorigin />
+    <link rel="preconnect" href="https://identitytoolkit.googleapis.com" crossorigin />
+    <link rel="preconnect" href="https://firebasestorage.googleapis.com" crossorigin />
+    <link rel="dns-prefetch" href="https://firestore.googleapis.com" />
+    <link rel="dns-prefetch" href="https://identitytoolkit.googleapis.com" />
+    <link rel="dns-prefetch" href="https://firebasestorage.googleapis.com" />
     <meta name="description" content="Catálogo mayorista de bicicletas y accesorios Samurai. Precios exclusivos para distribuidores, tiendas y talleres de todo el país." />
 
     <meta name="theme-color" content="#000000" />

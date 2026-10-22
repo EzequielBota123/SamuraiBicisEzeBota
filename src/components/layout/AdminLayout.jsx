@@ -3,7 +3,10 @@ import AdminSidebar from "../../components/admin/AdminSidebar";
 import AdminTopbar from "../../components/admin/AdminTopbar";
 
 export default function AdminLayout({ children }) {
-  const [collapsed, setCollapsed] = useState(false);
+  // Por default el sidebar arranca como riel de íconos (se expande solo al
+  // pasar el mouse, ver AdminSidebar) — el botón «/» lo fija expandido para
+  // quien lo prefiera siempre abierto.
+  const [collapsed, setCollapsed] = useState(true);
   const [mobileOpen, setMobileOpen] = useState(false);
 
   return (
@@ -29,6 +32,7 @@ export default function AdminLayout({ children }) {
         >
           <AdminSidebar
             collapsed={collapsed}
+            forceExpanded={mobileOpen}
             onToggle={() => setCollapsed(!collapsed)}
             onNavigate={() => setMobileOpen(false)}
           />

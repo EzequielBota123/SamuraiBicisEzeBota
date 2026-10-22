@@ -558,6 +558,12 @@ async function crearComprobanteWeb({
   idVendedor = CONTABILIUM_ID_VENDEDOR_DEFAULT,
   condicionVenta = CONTABILIUM_CONDICION_VENTA_CTA_CTE,
   observaciones = "",
+  // Para notas de crédito sobre una factura real (NCA/NCB/NCC): id del
+  // comprobante original y motivo. El webmethod "guardar"/"generarCae" ya
+  // tenía estos campos (comprobanteAsociado/motivoNC) sin usar — Contabilium
+  // reusa la misma pantalla de alta para facturas y notas de crédito.
+  comprobanteAsociado = "",
+  motivoNC = "",
 }) {
   let cookie = await getCookieValida(db, email, password);
 
@@ -637,7 +643,7 @@ async function crearComprobanteWeb({
         tipoDeCambio: "1",
         idMonedaDefecto: CONTABILIUM_ID_MONEDA_ARS,
         fceMiPYME: false,
-        comprobanteAsociado: "",
+        comprobanteAsociado: String(comprobanteAsociado || ""),
         idVendedor: String(idVendedor),
         cancelaEnMismaMoneda: false,
         issue: true,
@@ -701,7 +707,7 @@ async function crearComprobanteWeb({
         idMoneda: CONTABILIUM_ID_MONEDA_ARS,
         tipoDeCambio: "1",
         fceMiPYME: false,
-        motivoNC: "",
+        motivoNC: motivoNC || "",
         cancelaEnMismaMoneda: false,
         // Solo relevante cuando se factura a un cliente RI tildando
         // "Emitir como consumidor final" en la consola — no es un flujo que
@@ -1695,7 +1701,14 @@ async function explorarHistoricoStock({ db, email, password, fecha }) {
 // cookie. Acá se abre Puppeteer, se loguea de cero, y se navega/completa el
 // formulario como lo haría una persona (depósito + fechas + Buscar), para
 // después leer la tabla resultante directo del DOM. Solo lectura.
-async function obtenerHistoricoStockReal({ email, password, depositoNombre, fechaDesde, fechaHasta }) {
+// `leerTodo:true` desactiva el corte anticipado (pensado para un snapshot
+// "stock a tal fecha" con varios depósitos a la vez) y lee TODAS las páginas
+// hasta que no haya botón "siguiente" — necesario cuando lo que hace falta
+// no es el último valor por sku, sino el historial completo de movimientos
+// de UN depósito puntual (ej. para clasificar cada movimiento por su
+// observación). Al venir filtrado a un solo depósito, el volumen de filas
+// suele ser chico.
+async function obtenerHistoricoStockReal({ email, password, depositoNombre, fechaDesde, fechaHasta, leerTodo = false }) {
   const browser = await puppeteer.launch({
     args: chromium.args,
     executablePath: await chromium.executablePath(),
@@ -1847,6 +1860,17 @@ async function obtenerHistoricoStockReal({ email, password, depositoNombre, fech
       });
     }
 
+    // La lista viene ordenada del movimiento más NUEVO al más VIEJO. Con
+    // fechaHasta fijo en el pasado (ej. 31/12/2025), la primera vez que
+    // aparece cada PAR código+depósito YA es su último movimiento dentro
+    // del rango en ESE depósito — o sea, el stock que tenía ahí justo en
+    // esa fecha. Sin filtro de depósito (consulta cruzada, varios depósitos
+    // a la vez) un mismo código puede aparecer en más de uno — hay que
+    // sumarlos todos, no quedarse con el primero que aparezca y listo. No
+    // hace falta leer todo el historial completo (podrían ser miles de
+    // páginas): se para en cuanto varias páginas seguidas no suman ningún
+    // par código+depósito nuevo.
+    const ultimoPorSkuDeposito = new Map();
     const todasLasFilas = [];
     let totalTexto = await page.evaluate(() => {
       const el = Array.from(document.querySelectorAll("*")).find((e) => /Mostrando \d+/i.test(e.textContent || "") && e.children.length === 0);
@@ -1854,25 +1878,80 @@ async function obtenerHistoricoStockReal({ email, password, depositoNombre, fech
     });
     let seguir = true;
     let vueltas = 0;
-    while (seguir && vueltas < 500) {
+    let paginasSinCodigosNuevos = 0;
+    let debugPaginacion = null;
+    while (seguir && vueltas < 300) {
       vueltas++;
       const filas = await leerFilasTabla();
       todasLasFilas.push(...filas);
+      let nuevosEnEstaPagina = 0;
+      for (const f of filas) {
+        const clave = `${f.codigo}||${f.deposito}`;
+        if (f.codigo && !ultimoPorSkuDeposito.has(clave)) {
+          ultimoPorSkuDeposito.set(clave, f);
+          nuevosEnEstaPagina++;
+        }
+      }
+      paginasSinCodigosNuevos = nuevosEnEstaPagina === 0 ? paginasSinCodigosNuevos + 1 : 0;
+      if (!leerTodo && paginasSinCodigosNuevos >= 5) break;
+
       const avanzo = await page.evaluate(() => {
-        const candidatos = Array.from(document.querySelectorAll("button, a"));
+        // El texto "Mostrando X - Y de Z" es la referencia más confiable —
+        // los botones de paginación están cerca (hermanos o en el mismo
+        // contenedor), así que se buscan ahí primero en vez de en toda la
+        // página (evita confundirse con otros botones/links de la pantalla).
+        const anclaMostrando = Array.from(document.querySelectorAll("*")).find(
+          (e) => /Mostrando \d+/i.test(e.textContent || "") && e.children.length === 0
+        );
+        const contenedor = anclaMostrando ? anclaMostrando.closest("div") || anclaMostrando.parentElement : document;
+        const ambito = contenedor && contenedor !== document ? contenedor.parentElement || contenedor : document.body;
+        const candidatos = Array.from(ambito.querySelectorAll("button, a, [role=button], svg, i"));
+        const esDeshabilitado = (el) =>
+          el.disabled || el.getAttribute("aria-disabled") === "true" || el.classList.contains("disabled") || el.classList.contains("Mui-disabled");
         const siguiente = candidatos.find((b) => {
-          const t = (b.getAttribute("aria-label") || b.title || b.textContent || "").trim();
-          return /^(→|siguiente|next|>)$/i.test(t) || t === "›";
+          if (esDeshabilitado(b)) return false;
+          if (b.tagName === "I" && /ion-md-arrow-forward|ion-ios-arrow-forward/.test(b.className)) return true;
+          const t = (b.getAttribute("aria-label") || b.title || b.textContent || "").trim().toLowerCase();
+          return /^(→|siguiente|next|>|›|chevron_right|navigate_next)$/i.test(t);
         });
-        if (!siguiente || siguiente.disabled || siguiente.classList.contains("disabled")) return false;
-        siguiente.click();
-        return true;
+        if (siguiente) {
+          (siguiente.closest("button, a, [role=button]") || siguiente).click();
+          return { ok: true };
+        }
+        return {
+          ok: false,
+          candidatosVistos: candidatos.slice(0, 20).map((b) => ({
+            tag: b.tagName, texto: (b.textContent || "").trim().slice(0, 20),
+            ariaLabel: b.getAttribute("aria-label"), clase: b.className, disabled: esDeshabilitado(b),
+          })),
+        };
       });
-      if (!avanzo) seguir = false;
-      else await new Promise((r) => setTimeout(r, 1200));
+      if (!avanzo.ok) {
+        debugPaginacion = avanzo.candidatosVistos || null;
+        seguir = false;
+      } else await new Promise((r) => setTimeout(r, 1200));
     }
 
-    return { ok: true, debugAntesDeBuscar, totalTexto, totalFilas: todasLasFilas.length, filas: todasLasFilas };
+    // Total por SKU sumando todos los depósitos donde apareció.
+    const parseNum = (s) => Number(String(s || "0").replace(/\./g, "").replace(",", "."));
+    const totalPorSku = {};
+    for (const fila of ultimoPorSkuDeposito.values()) {
+      if (!totalPorSku[fila.codigo]) totalPorSku[fila.codigo] = { producto: fila.producto, total: 0, porDeposito: [] };
+      totalPorSku[fila.codigo].total += parseNum(fila.stockActualizado);
+      totalPorSku[fila.codigo].porDeposito.push({ deposito: fila.deposito, stock: parseNum(fila.stockActualizado), fecha: fila.fecha });
+    }
+
+    return {
+      ok: true,
+      debugAntesDeBuscar,
+      totalTexto,
+      paginasLeidas: vueltas,
+      totalFilasLeidas: todasLasFilas.length,
+      debugPaginacion,
+      stockFinalPorSkuYDeposito: Object.fromEntries(ultimoPorSkuDeposito),
+      totalPorSku,
+      todasLasFilas,
+    };
   } catch (err) {
     return { ok: false, error: err.message || String(err) };
   } finally {
@@ -2132,6 +2211,62 @@ async function explorarModuloDepositos({ db, email, password }) {
     detalleFormularioEdicion,
     tamañosHtmlBase: Object.fromEntries(Object.entries(htmlsPorPagina).map(([k, v]) => [k, v.html ? v.html.length : v.error])),
   };
+}
+
+// Investigación puntual (SOLO LECTURA): entra a la pantalla de edición de
+// un depósito y lista todos los botones/links/selects visibles, para ver si
+// existe algún control real de "Eliminar/Borrar depósito" antes de intentar
+// usarlo a ciegas (pedido 21/10/2026, cierre del depósito Samurai Adrogue).
+async function explorarBorrarDeposito({ email, password, id }) {
+  const browser = await puppeteer.launch({
+    args: chromium.args,
+    executablePath: await chromium.executablePath(),
+    headless: true,
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    );
+    await page.goto(`${BASE}/`, { waitUntil: "networkidle2", timeout: 60000 });
+    const emailSelector = 'input[placeholder*="mail" i]';
+    const passSelector = 'input[type="password"]';
+    await page.waitForSelector(emailSelector, { timeout: 45000 });
+    await page.type(emailSelector, email, { delay: 20 });
+    await page.type(passSelector, password, { delay: 20 });
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 60000 }).catch(() => {}),
+      page.evaluate(() => {
+        const btns = Array.from(document.querySelectorAll("button"));
+        const ingresar = btns.find((b) => /ingresar/i.test(b.textContent || ""));
+        if (ingresar) ingresar.click();
+      }),
+    ]);
+    if (/\/login/i.test(page.url())) throw new Error(`El login no avanzó, seguimos en ${page.url()}`);
+
+    const urlEdicion = `${BASE}/modulos/inventarios/inventariose.aspx?ID=${id}`;
+    await page.goto(urlEdicion, { waitUntil: "networkidle2", timeout: 60000 });
+
+    const controles = await page.evaluate(() => {
+      const candidatos = Array.from(document.querySelectorAll("button, a, input[type=button], input[type=submit]"));
+      return candidatos
+        .map((el) => ({
+          tag: el.tagName,
+          texto: (el.textContent || el.value || "").trim(),
+          clase: el.className,
+          href: el.getAttribute("href") || null,
+          onclick: el.getAttribute("onclick") || null,
+        }))
+        .filter((c) => c.texto || c.onclick);
+    });
+
+    // También reviso la lista de depósitos (el select que ya conocíamos) por
+    // si el borrado vive ahí (ícono de tacho al lado de cada fila) en vez de
+    // en esta pantalla de edición individual.
+    return { url: page.url(), controles };
+  } finally {
+    await browser.close();
+  }
 }
 
 // Renombra UN depósito (campo "Nombre" en /modulos/inventarios/inventariose.aspx?ID=x).
@@ -2457,6 +2592,7 @@ module.exports = {
   explorarHistoricoStock,
   obtenerHistoricoStockReal,
   renombrarDepositoWeb,
+  explorarBorrarDeposito,
   crearDepositoWeb,
   crearComprobanteWeb,
   PROVINCIAS_ARGENTINA,

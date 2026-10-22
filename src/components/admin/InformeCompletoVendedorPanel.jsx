@@ -8,8 +8,14 @@
 // propio vendedor) y "Cuentas corrientes — Logística" (lo que ve el admin
 // de cualquiera de los 4), para no tener dos lógicas/pantallas distintas
 // dando números distintos.
-import { useState, useEffect } from "react";
-import { getInformeCompletoVendedor, descargarInformeCompletoVendedor } from "../../services/comprobantes";
+import { useState, useEffect, useCallback, useMemo } from "react";
+import {
+  getInformeCompletoVendedor,
+  descargarInformeCompletoVendedor,
+  adminConfirmarCobroManual,
+  adminQuitarCobroManual,
+  adminCerrarLiquidacionVendedor,
+} from "../../services/comprobantes";
 
 function descargarBase64Xlsx(base64, filename) {
   const bytes = atob(base64);
@@ -40,17 +46,27 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
   const [descargando, setDescargando] = useState(false);
   const [verViajes, setVerViajes] = useState(false);
   const [verRetiros, setVerRetiros] = useState(false);
+  const [verReportadas, setVerReportadas] = useState(false);
   const [verVentas, setVerVentas] = useState(false);
+  const [verConfirmarCobro, setVerConfirmarCobro] = useState(false);
+  const [buscarCliente, setBuscarCliente] = useState("");
+  const [ventaElegida, setVentaElegida] = useState(null); // {numero, cliente, modelo, monto}
+  const [montoCobradoInput, setMontoCobradoInput] = useState("");
+  const [guardandoCobro, setGuardandoCobro] = useState(false);
+  const [cerrando, setCerrando] = useState(false);
 
-  useEffect(() => {
+  const cargar = useCallback(() => {
     setCargando(true);
     setError("");
     getInformeCompletoVendedor(vendedorUid)
       .then(setInforme)
       .catch((e) => setError(e.message || "No se pudo cargar el informe"))
       .finally(() => setCargando(false));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vendedorUid]);
+
+  useEffect(() => {
+    cargar();
+  }, [cargar]);
 
   async function descargarExcel() {
     setDescargando(true);
@@ -65,8 +81,77 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
     }
   }
 
+  async function confirmarCobro() {
+    if (!ventaElegida) return;
+    setGuardandoCobro(true);
+    setError("");
+    try {
+      const monto = montoCobradoInput === "" ? undefined : Number(montoCobradoInput);
+      await adminConfirmarCobroManual(vendedorUid, ventaElegida.numero, monto, ventaElegida.monto, ventaElegida.cliente, ventaElegida.modelo);
+      setVentaElegida(null);
+      setMontoCobradoInput("");
+      setBuscarCliente("");
+      cargar();
+    } catch (e) {
+      setError(e.message || "No se pudo confirmar el cobro");
+    } finally {
+      setGuardandoCobro(false);
+    }
+  }
+
+  async function cerrarLiquidacion() {
+    if (!informe) return;
+    const monto = money(informe.totalNetoAPagar);
+    const ok = window.confirm(
+      `¿Cerrar este período y marcarlo como pagado?\n\nTotal neto pagado: ${monto}\n\n` +
+        `El próximo informe arranca de cero: el flete se va a calcular solo sobre retiros y entregas nuevas a partir de hoy.`
+    );
+    if (!ok) return;
+    setCerrando(true);
+    setError("");
+    try {
+      await adminCerrarLiquidacionVendedor({
+        vendedorUid,
+        desde: informe.desdeISO,
+        hasta: informe.hoyISOVal,
+        totalFlete: informe.totalFlete,
+        totalComision: informe.totalComision,
+        totalCobradoPorVendedor: informe.totalCobradoPorVendedor ?? 0,
+        totalNetoAPagar: informe.totalNetoAPagar,
+        pagosManuales: informe.pagosManuales || [],
+      });
+      cargar();
+    } catch (e) {
+      setError(e.message || "No se pudo cerrar el período");
+    } finally {
+      setCerrando(false);
+    }
+  }
+
+  async function quitarCobro(numero) {
+    setGuardandoCobro(true);
+    setError("");
+    try {
+      await adminQuitarCobroManual(vendedorUid, numero);
+      cargar();
+    } catch (e) {
+      setError(e.message || "No se pudo quitar la confirmación");
+    } finally {
+      setGuardandoCobro(false);
+    }
+  }
+
   const panel = informe?.panel;
   const todasLasVentas = (informe?.resumenesPorMes || []).flatMap((r) => (r.detalle || []).map((d) => ({ ...d, mes: r.mes })));
+
+  const q = buscarCliente.trim().toLowerCase();
+  const resultadosBusqueda = useMemo(() => {
+    if (q.length < 2) return [];
+    return todasLasVentas
+      .filter((v) => (v.cliente || "").toLowerCase().includes(q) && v.numero)
+      .slice(0, 15);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [q, informe]);
 
   return (
     <div className="rounded-2xl border border-indigo-200 bg-indigo-50/60 p-4 dark:border-indigo-900 dark:bg-indigo-950/10">
@@ -75,21 +160,142 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
           <h2 className="text-sm font-bold text-indigo-800 dark:text-indigo-400">📦 Informe completo</h2>
           <p className="mt-0.5 text-[11px] text-slate-500 dark:text-neutral-400">
             Entregado, vendido, cobrado, comisión, viajes y retiros — desde {informe ? formatFechaCorta(informe.desdeISO) : "…"}.
+            {informe?.fechaUltimaLiquidacion && (
+              <> · Última liquidación cerrada: {formatFechaCorta(informe.fechaUltimaLiquidacion)}</>
+            )}
           </p>
         </div>
         {informe && !cargando && (
-          <button
-            onClick={descargarExcel}
-            disabled={descargando}
-            className="rounded-lg border border-indigo-300 bg-white px-3 py-1.5 text-xs font-semibold text-indigo-700 transition hover:bg-indigo-50 disabled:opacity-60 dark:border-indigo-800 dark:bg-neutral-900 dark:text-indigo-400"
-          >
-            {descargando ? "Generando…" : "📥 Descargar Excel"}
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={descargarExcel}
+              disabled={descargando}
+              className="rounded-lg border border-indigo-300 bg-white px-3 py-1.5 text-xs font-semibold text-indigo-700 transition hover:bg-indigo-50 disabled:opacity-60 dark:border-indigo-800 dark:bg-neutral-900 dark:text-indigo-400"
+            >
+              {descargando ? "Generando…" : "📥 Descargar Excel"}
+            </button>
+            <button
+              onClick={cerrarLiquidacion}
+              disabled={cerrando}
+              className="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-100 disabled:opacity-60 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-400"
+            >
+              {cerrando ? "Cerrando…" : "✅ Cerrar y marcar como pagado"}
+            </button>
+          </div>
         )}
       </div>
 
       {error && <p className="mt-2 text-xs text-rose-600 dark:text-rose-400">{error}</p>}
       {cargando && <p className="mt-2 text-xs text-indigo-700/70 dark:text-indigo-400/60">Calculando (puede tardar un minuto)…</p>}
+
+      {/* Aviso bien visible de lo que ya se confirmó cobrado a mano — para
+          que salte apenas se abre el informe, no quede escondido. */}
+      {informe && !cargando && (informe.pagosManuales?.length ?? 0) > 0 && (
+        <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3 dark:border-emerald-900 dark:bg-emerald-950/20">
+          <p className="text-xs font-bold text-emerald-800 dark:text-emerald-400">✅ Ya cobrado (confirmado a mano)</p>
+          <ul className="mt-1.5 space-y-1">
+            {informe.pagosManuales.map((p) => (
+              <li key={p.numero} className="flex flex-wrap items-center justify-between gap-2 text-xs text-emerald-800 dark:text-emerald-300">
+                <span>
+                  <strong>{p.cliente}</strong> — {p.producto || "(producto sin identificar)"} — {p.numero} —{" "}
+                  {p.tipo === "parcial" ? `${money(p.monto)} de ${money(p.montoTotal)} (parcial)` : money(p.monto)}
+                  {p.seDescuenta === false && (
+                    <span className="ml-1 text-[10px] font-normal text-slate-500 dark:text-neutral-400">
+                      (reconciliación — le pagó a Fepa normal, NO se descuenta)
+                    </span>
+                  )}
+                </span>
+                <button
+                  onClick={() => quitarCobro(p.numero)}
+                  disabled={guardandoCobro}
+                  className="text-[11px] text-rose-600 underline hover:text-rose-700 disabled:opacity-50 dark:text-rose-400"
+                >
+                  Quitar
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Confirmar un cobro nuevo a mano — buscar cliente, elegir la venta,
+          cargar cuánto se cobró (completo o parcial). */}
+      {informe && !cargando && (
+        <div className="mt-3">
+          <button
+            onClick={() => setVerConfirmarCobro((v) => !v)}
+            className="text-xs font-bold text-indigo-800 underline decoration-dotted dark:text-indigo-400"
+          >
+            💰 {verConfirmarCobro ? "Ocultar" : "Confirmar un cobro"}
+          </button>
+          {verConfirmarCobro && (
+            <div className="mt-2 rounded-xl border border-indigo-200 bg-white p-3 dark:border-indigo-900 dark:bg-neutral-900">
+              {!ventaElegida ? (
+                <>
+                  <input
+                    value={buscarCliente}
+                    onChange={(e) => setBuscarCliente(e.target.value)}
+                    placeholder="Buscar cliente…"
+                    className="w-full rounded-lg border border-indigo-200 bg-white px-2.5 py-1.5 text-sm dark:border-indigo-900 dark:bg-neutral-950 dark:text-white"
+                  />
+                  {resultadosBusqueda.length > 0 && (
+                    <div className="mt-2 max-h-56 overflow-y-auto rounded-lg border border-indigo-100 dark:border-indigo-900/50">
+                      {resultadosBusqueda.map((v, i) => (
+                        <button
+                          key={`${v.numero}-${i}`}
+                          onClick={() => {
+                            setVentaElegida(v);
+                            setMontoCobradoInput(String(v.monto));
+                          }}
+                          className="block w-full border-b border-indigo-50 px-3 py-2 text-left text-xs last:border-b-0 hover:bg-indigo-50 dark:border-indigo-950/50 dark:hover:bg-indigo-950/30"
+                        >
+                          <span className="font-semibold">{v.cliente}</span> — {v.modelo} — {v.numero} — {money(v.monto)}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {q.length >= 2 && resultadosBusqueda.length === 0 && (
+                    <p className="mt-2 text-xs text-slate-400 dark:text-neutral-500">Sin resultados para "{buscarCliente}".</p>
+                  )}
+                </>
+              ) : (
+                <div className="space-y-2">
+                  <p className="text-xs text-slate-700 dark:text-neutral-200">
+                    <strong>{ventaElegida.cliente}</strong> — {ventaElegida.modelo} — {ventaElegida.numero} — Total: {money(ventaElegida.monto)}
+                  </p>
+                  <label className="block text-xs text-slate-600 dark:text-neutral-300">
+                    Monto cobrado
+                    <input
+                      type="number"
+                      value={montoCobradoInput}
+                      onChange={(e) => setMontoCobradoInput(e.target.value)}
+                      className="ml-2 w-32 rounded-lg border border-indigo-200 bg-white px-2 py-1 text-xs dark:border-indigo-900 dark:bg-neutral-950 dark:text-white"
+                    />
+                  </label>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={confirmarCobro}
+                      disabled={guardandoCobro}
+                      className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-indigo-700 disabled:opacity-60"
+                    >
+                      {guardandoCobro ? "Guardando…" : "Confirmar cobro"}
+                    </button>
+                    <button
+                      onClick={() => {
+                        setVentaElegida(null);
+                        setMontoCobradoInput("");
+                      }}
+                      className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 dark:border-neutral-700 dark:text-neutral-300"
+                    >
+                      Cancelar
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {informe && !cargando && (
         <>
@@ -116,12 +322,11 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
               <p className="mt-1 text-base font-bold text-slate-900 dark:text-white">{informe.totalViajesComision}</p>
             </div>
             <div className="rounded-xl border border-indigo-100 bg-white p-3 dark:border-indigo-900/50 dark:bg-neutral-900">
-              <p className="text-[11px] text-slate-500 dark:text-neutral-400">Unidades (para flete)</p>
-              <p className="mt-1 text-base font-bold text-slate-900 dark:text-white">{informe.totalUnidadesComision ?? 0}</p>
-            </div>
-            <div className="rounded-xl border border-indigo-100 bg-white p-3 dark:border-indigo-900/50 dark:bg-neutral-900">
               <p className="text-[11px] text-slate-500 dark:text-neutral-400">Flete total</p>
               <p className="mt-1 text-base font-bold text-slate-900 dark:text-white">{money(informe.totalFlete)}</p>
+              <p className="mt-0.5 text-[10px] text-slate-400 dark:text-neutral-500">
+                {informe.totalEntregadoMasStock} bicis (entregado + stock propio) × {money(informe.totalFlete / (informe.totalEntregadoMasStock || 1))}
+              </p>
             </div>
             <div className="rounded-xl border border-indigo-100 bg-white p-3 dark:border-indigo-900/50 dark:bg-neutral-900">
               <p className="text-[11px] text-slate-500 dark:text-neutral-400">Comisión total</p>
@@ -137,13 +342,41 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
               </p>
             </div>
             <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 dark:border-emerald-900 dark:bg-emerald-950/20">
-              <p className="text-[11px] text-emerald-700 dark:text-emerald-400">Total a cobrar</p>
-              <p className="mt-1 text-base font-bold text-emerald-700 dark:text-emerald-400">{money(informe.totalFlete + informe.totalComision)}</p>
+              <p className="text-[11px] text-emerald-700 dark:text-emerald-400">Total neto a pagarle</p>
+              <p className="mt-1 text-base font-bold text-emerald-700 dark:text-emerald-400">{money(informe.totalNetoAPagar)}</p>
+              <p className="mt-0.5 text-[10px] text-emerald-700/70 dark:text-emerald-400/70">
+                {money(informe.totalFlete + informe.totalComision)} (flete + comisión) − {money(informe.totalCobradoPorVendedor ?? 0)} (ya cobrado por él)
+              </p>
+            </div>
+            <div className="rounded-xl border border-indigo-100 bg-white p-3 dark:border-indigo-900/50 dark:bg-neutral-900">
+              <p className="text-[11px] text-slate-500 dark:text-neutral-400">Ventas reportadas</p>
+              <p className="mt-1 text-base font-bold text-slate-900 dark:text-white">
+                {informe.totalVentasReportadas ?? 0}
+                <span className="ml-1 text-[11px] font-normal text-slate-400 dark:text-neutral-500">
+                  ({informe.totalVentasPendientes ?? 0} sin facturar)
+                </span>
+              </p>
+            </div>
+            <div className="rounded-xl border border-indigo-100 bg-white p-3 dark:border-indigo-900/50 dark:bg-neutral-900">
+              <p className="text-[11px] text-slate-500 dark:text-neutral-400">Cobradas</p>
+              <p className="mt-1 text-base font-bold text-slate-900 dark:text-white">{panel.totalPagado}</p>
+            </div>
+            <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 dark:border-emerald-900 dark:bg-emerald-950/20">
+              <p className="text-[11px] text-emerald-700 dark:text-emerald-400">Cobrado ($)</p>
+              <p className="mt-1 text-base font-bold text-emerald-700 dark:text-emerald-400">{money(panel.totalCobradoDinero ?? 0)}</p>
+              <p className="mt-0.5 text-[10px] text-slate-400 dark:text-neutral-500">Incluye pagos parciales confirmados a mano</p>
+            </div>
+            <div className="rounded-xl border border-indigo-100 bg-white p-3 dark:border-indigo-900/50 dark:bg-neutral-900">
+              <p className="text-[11px] text-slate-500 dark:text-neutral-400">COTs</p>
+              <p className="mt-1 text-base font-bold text-slate-900 dark:text-white">{informe.totalVentasCOT ?? 0}</p>
             </div>
           </div>
 
-          {/* Resumen por mes */}
-          <p className="mb-1.5 mt-5 text-xs font-bold text-indigo-800 dark:text-indigo-400">📅 Mes a mes</p>
+          {/* Resumen por mes — el flete ya NO es por mes (ver tile "Flete
+              total" arriba, es un único total sobre entregado+stock), acá
+              queda solo la comisión (que sí es por fecha real de cada
+              factura) y los viajes/unidades a modo informativo. */}
+          <p className="mb-1.5 mt-5 text-xs font-bold text-indigo-800 dark:text-indigo-400">📅 Mes a mes (ventas y comisión)</p>
           <div className="overflow-x-auto rounded-xl border border-indigo-100 dark:border-indigo-900/50">
             <table className="min-w-full divide-y divide-indigo-100 text-xs dark:divide-indigo-900/50">
               <thead className="bg-indigo-50/60 dark:bg-indigo-950/20">
@@ -151,10 +384,8 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
                   <th className="px-3 py-2 font-semibold">Mes</th>
                   <th className="px-3 py-2 text-right font-semibold">Viajes</th>
                   <th className="px-3 py-2 text-right font-semibold">Unidades</th>
-                  <th className="px-3 py-2 text-right font-semibold">Flete</th>
                   <th className="px-3 py-2 text-right font-semibold">Ventas</th>
                   <th className="px-3 py-2 text-right font-semibold">Comisión</th>
-                  <th className="px-3 py-2 text-right font-semibold">Total a cobrar</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-indigo-50 bg-white dark:divide-indigo-950/30 dark:bg-neutral-900">
@@ -163,10 +394,8 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
                     <td className="px-3 py-1.5">{r.mes}</td>
                     <td className="px-3 py-1.5 text-right">{r.viajes}</td>
                     <td className="px-3 py-1.5 text-right">{r.unidadesEntregadas ?? 0}</td>
-                    <td className="px-3 py-1.5 text-right">{money(r.fleteTotal)}</td>
                     <td className="px-3 py-1.5 text-right">{money(r.ventasTotal)}</td>
-                    <td className="px-3 py-1.5 text-right">{money(r.comisionTotal)}</td>
-                    <td className="px-3 py-1.5 text-right font-semibold">{money(r.fleteTotal + r.comisionTotal)}</td>
+                    <td className="px-3 py-1.5 text-right font-semibold">{money(r.comisionTotal)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -175,10 +404,8 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
                   <td className="px-3 py-2">Total</td>
                   <td className="px-3 py-2 text-right">{informe.totalViajesComision}</td>
                   <td className="px-3 py-2 text-right">{informe.totalUnidadesComision ?? 0}</td>
-                  <td className="px-3 py-2 text-right">{money(informe.totalFlete)}</td>
                   <td className="px-3 py-2 text-right">{money(informe.resumenesPorMes.reduce((a, r) => a + (r.ventasTotal || 0), 0))}</td>
                   <td className="px-3 py-2 text-right">{money(informe.totalComision)}</td>
-                  <td className="px-3 py-2 text-right">{money(informe.totalFlete + informe.totalComision)}</td>
                 </tr>
               </tfoot>
             </table>
@@ -345,6 +572,56 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
                 </p>
               )}
             </div>
+          )}
+
+          {/* Ventas reportadas por sus clientes (colapsable) */}
+          {(informe.ventasReportadas?.length ?? 0) > 0 && (
+            <>
+              <button
+                onClick={() => setVerReportadas((v) => !v)}
+                className="mb-1.5 mt-5 text-xs font-bold text-indigo-800 underline decoration-dotted dark:text-indigo-400"
+              >
+                📲 {verReportadas ? "Ocultar" : "Ver"} ventas reportadas por sus clientes, una por una ({informe.ventasReportadas.length})
+              </button>
+              {verReportadas && (
+                <div className="overflow-x-auto rounded-xl border border-indigo-100 dark:border-indigo-900/50">
+                  <table className="min-w-full divide-y divide-indigo-100 text-xs dark:divide-indigo-900/50">
+                    <thead className="bg-indigo-50/60 dark:bg-indigo-950/20">
+                      <tr className="text-left text-slate-500 dark:text-neutral-400">
+                        <th className="px-3 py-2 font-semibold">Fecha</th>
+                        <th className="px-3 py-2 font-semibold">Cliente</th>
+                        <th className="px-3 py-2 font-semibold">Producto</th>
+                        <th className="px-3 py-2 text-right font-semibold">Cant.</th>
+                        <th className="px-3 py-2 font-semibold">Tipo</th>
+                        <th className="px-3 py-2 font-semibold">Estado</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-indigo-50 bg-white dark:divide-indigo-950/30 dark:bg-neutral-900">
+                      {informe.ventasReportadas.map((v, i) => (
+                        <tr key={i}>
+                          <td className="whitespace-nowrap px-3 py-1.5">{formatFechaCorta(v.fecha)}</td>
+                          <td className="px-3 py-1.5">{v.cliente}</td>
+                          <td className="px-3 py-1.5">{v.producto}</td>
+                          <td className="px-3 py-1.5 text-right">{v.cantidad}</td>
+                          <td className="px-3 py-1.5">{v.tipo}</td>
+                          <td className="px-3 py-1.5">
+                            {v.estado === "pendiente" ? (
+                              <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-700 dark:bg-amber-500/10 dark:text-amber-400">
+                                Sin facturar
+                              </span>
+                            ) : (
+                              <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400">
+                                Facturado {v.numeroFactura ? `(${v.numeroFactura})` : ""}
+                              </span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </>
           )}
         </>
       )}

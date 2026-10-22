@@ -767,9 +767,16 @@ export default function AdminTopbar({ onToggleSidebar, mobileOpen }) {
           <ThemeToggle />
 
           <div className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-2 dark:border-neutral-700 dark:bg-neutral-900">
-            <div className="h-9 w-9 rounded-full bg-gradient-to-br from-sky-500 to-indigo-500" title="Mi cuenta" />
+            <img
+              src="/img/samurai-favicon-round.png"
+              alt="Samurai"
+              className="h-9 w-9 shrink-0 rounded-full"
+              title="Mi cuenta"
+            />
             <div className="hidden text-xs text-slate-500 sm:block dark:text-neutral-400">
-              <div className="font-semibold text-slate-900 dark:text-white">Admin</div>
+              <div className="truncate font-semibold text-slate-900 dark:text-white">
+                {profile?.name || user?.displayName || user?.email || "Admin"}
+              </div>
               <div>online</div>
             </div>
           </div>
