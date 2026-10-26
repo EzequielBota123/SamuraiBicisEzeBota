@@ -2464,13 +2464,28 @@ async function obtenerMovimientosStock({ db, email, password, fechaDesde, fechaH
   let cookie = await getCookieValida(db, email, password);
   let tokenApi = await obtenerTokenApiV2(db, cookie);
 
+  // La API toma "fechaHasta" como las 00:00:00 de ese día (excluye todo lo
+  // que pasó DESPUÉS de medianoche ese mismo día) — confirmado en vivo
+  // 22/10/2026: pedir fechaDesde=fechaHasta="2026-10-22" devolvía 0
+  // resultados aunque había movimientos reales a las 09:28 de ese mismo
+  // día, y ampliar a fechaHasta="2026-10-23" sí los traía. Bug serio: el
+  // informe de un vendedor siempre pide fechaHasta=hoy, así que TODOS los
+  // movimientos del día en curso se perdían en cualquier reporte en vivo
+  // hasta este fix — se le suma un día para que el corte sea inclusivo.
+  let fechaHastaInclusiva = fechaHasta;
+  if (fechaHasta && /^\d{4}-\d{2}-\d{2}$/.test(fechaHasta)) {
+    const d = new Date(`${fechaHasta}T00:00:00`);
+    d.setDate(d.getDate() + 1);
+    fechaHastaInclusiva = d.toISOString().slice(0, 10);
+  }
+
   async function pedirPagina(pageNumber) {
     const params = new URLSearchParams({
       idOrigen: String(idOrigen),
       idDestino: String(idDestino),
       concepto: String(concepto),
       fechaDesde: fechaDesde || "",
-      fechaHasta: fechaHasta || "",
+      fechaHasta: fechaHastaInclusiva || "",
       pageSize: "50",
       pageNumber: String(pageNumber),
     });
@@ -2478,6 +2493,12 @@ async function obtenerMovimientosStock({ db, email, password, fechaDesde, fechaH
       headers: { Accept: "*/*", Authorization: `Bearer ${tokenApi}` },
     });
     if (res.status === 401) return null; // token vencido, hay que renovar
+    // Contabilium devuelve 204 sin body cuando la página pedida ya no tiene
+    // resultados (confirmado 26/10/2026) — antes esto se trataba como una
+    // respuesta JSON más y explotaba con "Unexpected end of JSON input" al
+    // parsear un body vacío, tumbando CUALQUIER reporte que llegara a la
+    // última página (ej. Credifin, Jíbaro, informes de vendedores).
+    if (res.status === 204) return { items: [] };
     if (!res.ok) throw new Error(`movinventarios/GetPageWithFilters respondió ${res.status}`);
     return res.json();
   }

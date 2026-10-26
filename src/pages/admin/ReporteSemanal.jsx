@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useAuth } from "../../auth/AuthContext";
 import { subscribeReporteSemana, agregarEntradaReporte, eliminarEntradaReporte } from "../../services/reporteSemanal";
-import { generateReporteSemanalPdf } from "../../utils/generateReporteSemanalPdf";
+import { generateReporteSemanalPdf, generateReporteDiarioPdf } from "../../utils/generateReporteSemanalPdf";
 
 const DIAS = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];
 
@@ -97,12 +97,29 @@ export default function ReporteSemanal() {
     }
   }
 
-  function handleDescargar() {
-    generateReporteSemanalPdf(diasPorFecha, {
-      desde: desdeISO,
-      hasta: hastaISO,
-      fileName: `Reporte semanal ${desdeISO} a ${hastaISO}.pdf`,
-    });
+  const [descargandoDia, setDescargandoDia] = useState(null);
+  const [descargandoSemana, setDescargandoSemana] = useState(false);
+
+  async function handleDescargar() {
+    setDescargandoSemana(true);
+    try {
+      await generateReporteSemanalPdf(diasPorFecha, {
+        desde: desdeISO,
+        hasta: hastaISO,
+        fileName: `Reporte semanal ${desdeISO} a ${hastaISO}.pdf`,
+      });
+    } finally {
+      setDescargandoSemana(false);
+    }
+  }
+
+  async function handleDescargarDia(dia) {
+    setDescargandoDia(dia.fecha);
+    try {
+      await generateReporteDiarioPdf(dia, { fileName: `Reporte ${dia.fecha}.pdf` });
+    } finally {
+      setDescargandoDia(null);
+    }
   }
 
   function cambiarSemana(delta) {
@@ -188,10 +205,21 @@ export default function ReporteSemanal() {
         {dias !== null &&
           diasPorFecha.map((d) => (
             <div key={d.fecha} className="rounded-3xl border border-slate-200 bg-white p-4 shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
-              <p className="mb-2 text-sm font-bold text-slate-900 dark:text-white">
-                {nombreDiaCorto(d.fecha)}
-                {d.fecha === hoyISO && <span className="ml-2 rounded-full bg-sky-100 px-2 py-0.5 text-[10px] font-semibold text-sky-700 dark:bg-sky-950/40 dark:text-sky-400">HOY</span>}
-              </p>
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <p className="text-sm font-bold text-slate-900 dark:text-white">
+                  {nombreDiaCorto(d.fecha)}
+                  {d.fecha === hoyISO && <span className="ml-2 rounded-full bg-sky-100 px-2 py-0.5 text-[10px] font-semibold text-sky-700 dark:bg-sky-950/40 dark:text-sky-400">HOY</span>}
+                </p>
+                {d.items.length > 0 && (
+                  <button
+                    onClick={() => handleDescargarDia(d)}
+                    disabled={descargandoDia === d.fecha}
+                    className="shrink-0 rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-semibold text-slate-600 transition hover:border-sky-300 hover:text-sky-700 disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-300"
+                  >
+                    {descargandoDia === d.fecha ? "Generando…" : "⬇️ PDF del día"}
+                  </button>
+                )}
+              </div>
               {d.items.length === 0 ? (
                 <p className="text-xs text-slate-400 dark:text-neutral-500">Sin novedades.</p>
               ) : (
@@ -220,9 +248,10 @@ export default function ReporteSemanal() {
 
       <button
         onClick={handleDescargar}
-        className="w-full rounded-2xl border-2 border-dashed border-slate-300 py-4 text-sm font-semibold text-slate-600 transition hover:border-sky-400 hover:text-sky-700 dark:border-neutral-700 dark:text-neutral-300"
+        disabled={descargandoSemana}
+        className="w-full rounded-2xl border-2 border-dashed border-slate-300 py-4 text-sm font-semibold text-slate-600 transition hover:border-sky-400 hover:text-sky-700 disabled:opacity-60 dark:border-neutral-700 dark:text-neutral-300"
       >
-        ⬇️ Descargar PDF de esta semana ({desdeISO} al {hastaISO})
+        {descargandoSemana ? "Generando…" : `⬇️ Descargar PDF de esta semana (${desdeISO} al ${hastaISO})`}
       </button>
     </div>
   );

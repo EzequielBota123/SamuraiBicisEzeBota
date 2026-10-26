@@ -98,9 +98,20 @@ export async function diagExplorarCompras(): Promise<any> {
   return callFunction("diagExplorarCompras", {}, 180000);
 }
 
+export type ClientCobranza = {
+  id: string;
+  numero: string | null;
+  fecha: string | null;
+  importeTotal: number;
+  formasDePago: Array<{ FormaDePago: string; NroReferencia: string | null; Importe: number }>;
+  esReimputacion: boolean;
+  excluirDeSaldo: boolean;
+  detalle: Array<{ IDComprobante: number; Importe: number; numeroFactura: string | null }>;
+};
+
 export async function getClientComprobantes(
   params: GetComprobantesParams = {}
-): Promise<{ items: Comprobante[]; total: number; saldoTotal: number }> {
+): Promise<{ items: Comprobante[]; total: number; saldoTotal: number; cobranzas: ClientCobranza[] }> {
   return callFunction("getClientComprobantes", params);
 }
 
@@ -220,6 +231,8 @@ export type DetalleVentaComision = {
   fecha: string;
 };
 
+export type ViajeDetalleManual = { id: number | string; fecha: string; destino: string; bicis: number; monto: number | null };
+
 export type ResumenComisionVendedor = {
   mes: string;
   viajes: number;
@@ -231,6 +244,10 @@ export type ResumenComisionVendedor = {
   totalACobrar: number;
   cantidadClientesAsignados: number;
   detalle: DetalleVentaComision[];
+  // Proveedores con monto por viaje a cargar a mano (ej. Jíbaro: cobra 3.5%
+  // de la carga pero hay que consultarle el monto puntual de cada viaje).
+  modoFleteManual: boolean;
+  viajesDetalle: ViajeDetalleManual[];
 };
 
 // Cuenta corriente mensual (flete por viaje + comisión sobre lo que
@@ -343,6 +360,17 @@ export async function adminSetTarifasVendedor(
   params: { comisionPorcentaje?: number; tarifaFletePorViaje?: number }
 ): Promise<{ ok: true }> {
   return callFunction("adminSetTarifasVendedor", { vendedorUid, ...params });
+}
+
+// Para proveedores con `modoFleteManual` (hoy: Jíbaro) — guarda lo que
+// cobró por un viaje puntual (id = el movimiento de stock de Contabilium
+// que lo generó).
+export async function adminGuardarMontoViajeLogistica(
+  vendedorUid: string,
+  viajeId: number | string,
+  monto: number
+): Promise<{ ok: true }> {
+  return callFunction("adminGuardarMontoViajeLogistica", { vendedorUid, viajeId, monto });
 }
 
 // Confirma a mano que una venta puntual ya se cobró (completa o parcial,
@@ -549,6 +577,31 @@ export async function adminGetComprobanteDetail(id: number): Promise<Comprobante
 // emitida — replica el pedido real de la consola (common.aspx/ObtenerComprobante
 // para conseguir el Href, después lo descarga). `intentos` trae el detalle
 // de cada paso, útil si algún día cambia el mecanismo interno.
+// Cuenta corriente real de FEPA TOP en Credifin (la logística que nos
+// factura los envíos) — Credifin no tiene API pública, se reversó su portal
+// de autogestión (ver credifinWebAutomation.js en functions/). `desde`/
+// `hasta` en formato YYYY-MM-DD.
+export type CredifinMovimiento = {
+  Fecha: string;
+  Comprobante: string;
+  Concepto: string;
+  Debitos: number;
+  Creditos: number;
+  Saldo: number;
+  Filial_Origen?: string;
+  Filial_Destino?: string;
+  NroAuxiliar: number;
+};
+export async function credifinGetCtaCte(desde: string, hasta: string): Promise<{ reporte: CredifinMovimiento[] }> {
+  return callFunction("credifinGetCtaCte", { desde, hasta }, 120000);
+}
+
+// PDF real de un comprobante puntual de Credifin — `comprobantesId` es el
+// campo NroAuxiliar de cada fila de credifinGetCtaCte.
+export async function credifinGetComprobantePdf(comprobantesId: number): Promise<{ pdfBase64: string }> {
+  return callFunction("credifinGetComprobantePdf", { comprobantesId }, 120000);
+}
+
 export async function adminDescargarPdfComprobante(idComprobante: number): Promise<{
   ok: boolean;
   pdfBase64: string | null;
@@ -811,6 +864,58 @@ export async function emitirFacturaManual(
   sinDescontarStock?: boolean // no le resta stock al depósito propio del cliente (ej: ya se descontó por otro lado)
 ): Promise<{ ok: true; comprobante: unknown }> {
   return callFunction("emitirFacturaManual", { contabiliumId, items, tipoFc, fechaEmision, sinDescontarStock }, 60000);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Sub-cuentas de un vendedor/distribuidor (ej. Stortini → Carhué/Viedma):
+// revendedores propios suyos, sin contabiliumId/depósito propio en
+// Contabilium — seguimiento de stock/saldo nuestro, aparte, aunque la
+// factura real siempre sale a nombre del vendedor.
+export type StockSubcuenta = { sku: string; nombre: string; cantidad: number };
+export type HistorialSubcuenta = {
+  tipo: "factura" | "pago";
+  monto: number;
+  fecha: string;
+  nota?: string;
+  facturaNumero?: string | null;
+  items?: FacturaManualItem[];
+};
+export type Subcuenta = {
+  id: string;
+  nombre: string;
+  stock: StockSubcuenta[];
+  saldo: number;
+  historial: HistorialSubcuenta[];
+};
+
+export async function listSubcuentasVendedor(vendedorUid: string): Promise<{ subcuentas: Subcuenta[] }> {
+  return callFunction("adminListSubcuentasVendedor", { vendedorUid });
+}
+
+export async function guardarSubcuentaVendedor(
+  vendedorUid: string,
+  subcuenta: { id: string; nombre: string; stock: StockSubcuenta[]; saldo: number }
+): Promise<{ ok: true; subcuentas: Subcuenta[] }> {
+  return callFunction("adminGuardarSubcuentaVendedor", { vendedorUid, ...subcuenta });
+}
+
+export async function facturarSubcuenta(
+  vendedorUid: string,
+  subcuentaId: string,
+  items: Array<FacturaManualItem & { sku: string }>,
+  tipoFc: "FCA" | "FCB" | "FCC" | "COT" = "FCA",
+  fechaEmision?: string
+): Promise<{ ok: true; comprobante: unknown; subcuenta: Subcuenta }> {
+  return callFunction("adminFacturarSubcuenta", { vendedorUid, subcuentaId, items, tipoFc, fechaEmision }, 60000);
+}
+
+export async function registrarPagoSubcuenta(
+  vendedorUid: string,
+  subcuentaId: string,
+  monto: number,
+  nota?: string
+): Promise<{ ok: true; subcuenta: Subcuenta }> {
+  return callFunction("adminRegistrarPagoSubcuenta", { vendedorUid, subcuentaId, monto, nota });
 }
 
 export interface ContabiliumClienteResultado {

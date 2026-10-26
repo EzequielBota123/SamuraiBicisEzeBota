@@ -320,13 +320,24 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
             <div className="rounded-xl border border-indigo-100 bg-white p-3 dark:border-indigo-900/50 dark:bg-neutral-900">
               <p className="text-[11px] text-slate-500 dark:text-neutral-400">Viajes (todos)</p>
               <p className="mt-1 text-base font-bold text-slate-900 dark:text-white">{informe.totalViajesComision}</p>
+              {informe.usaFleteDeMovimiento && (
+                <p className="mt-0.5 text-[10px] text-slate-400 dark:text-neutral-500">
+                  {informe.totalUnidadesComision ?? 0} entregas a clientes + {informe.totalRetirado ?? 0} retiros a su depósito
+                </p>
+              )}
             </div>
             <div className="rounded-xl border border-indigo-100 bg-white p-3 dark:border-indigo-900/50 dark:bg-neutral-900">
               <p className="text-[11px] text-slate-500 dark:text-neutral-400">Flete total</p>
               <p className="mt-1 text-base font-bold text-slate-900 dark:text-white">{money(informe.totalFlete)}</p>
-              <p className="mt-0.5 text-[10px] text-slate-400 dark:text-neutral-500">
-                {informe.totalEntregadoMasStock} bicis (entregado + stock propio) × {money(informe.totalFlete / (informe.totalEntregadoMasStock || 1))}
-              </p>
+              {informe.usaFleteDeMovimiento ? (
+                <p className="mt-0.5 text-[10px] text-slate-400 dark:text-neutral-500">
+                  {(informe.totalUnidadesComision ?? 0) + (informe.totalRetirado ?? 0)} movimientos × {money(informe.totalFlete / (((informe.totalUnidadesComision ?? 0) + (informe.totalRetirado ?? 0)) || 1))}
+                </p>
+              ) : (
+                <p className="mt-0.5 text-[10px] text-slate-400 dark:text-neutral-500">
+                  {informe.totalEntregadoMasStock} bicis (entregado + stock propio) × {money(informe.totalFlete / (informe.totalEntregadoMasStock || 1))}
+                </p>
+              )}
             </div>
             <div className="rounded-xl border border-indigo-100 bg-white p-3 dark:border-indigo-900/50 dark:bg-neutral-900">
               <p className="text-[11px] text-slate-500 dark:text-neutral-400">Comisión total</p>
@@ -512,6 +523,7 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
                     <th className="px-3 py-2 font-semibold">Fecha</th>
                     <th className="px-3 py-2 font-semibold">Destino</th>
                     <th className="px-3 py-2 font-semibold">Productos</th>
+                    <th className="px-3 py-2 font-semibold">Observación</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-indigo-50 bg-white dark:divide-indigo-950/30 dark:bg-neutral-900">
@@ -526,6 +538,7 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
                           </div>
                         ))}
                       </td>
+                      <td className="px-3 py-1.5 align-top text-slate-500 dark:text-neutral-400">{v.descripcion}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -548,6 +561,7 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
                     <th className="px-3 py-2 font-semibold">Fecha</th>
                     <th className="px-3 py-2 font-semibold">Origen</th>
                     <th className="px-3 py-2 font-semibold">Productos</th>
+                    <th className="px-3 py-2 font-semibold">Observación</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-indigo-50 bg-white dark:divide-indigo-950/30 dark:bg-neutral-900">
@@ -562,6 +576,7 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
                           </div>
                         ))}
                       </td>
+                      <td className="px-3 py-1.5 align-top text-slate-500 dark:text-neutral-400">{v.descripcion}</td>
                     </tr>
                   ))}
                 </tbody>

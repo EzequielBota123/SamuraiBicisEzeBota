@@ -905,6 +905,12 @@ function AjusteStockPanel({ depositoId, items, onAjustado }) {
 function TransferirStockPanel({ depositoOrigenId, depositoOrigenNombre, items, depositos, onTransferido }) {
   const { user: authUser, profile: authProfile } = useAuth();
   const [destinoId, setDestinoId] = useState("");
+  // Rodados Argentinos es un solo depósito en Contabilium pero físicamente
+  // son 2 (Adrogué/Temperley) — al elegirlo como destino, se pide el sector
+  // real y esa palabra se mete sola en la observación, para que la
+  // separación automática de Stock Consignado la detecte sin depender de
+  // que alguien se acuerde de escribirla a mano.
+  const [sectorRodados, setSectorRodados] = useState("");
   // Viaje que se carga solo en la grilla de logística de Julián al mover
   // la mercadería (se puede destildar si el movimiento no lleva chofer).
   const [viajeCfg, setViajeCfg] = useState(viajeCfgInicial);
@@ -1111,11 +1117,13 @@ function TransferirStockPanel({ depositoOrigenId, depositoOrigenNombre, items, d
     setEnviando(true);
     setError("");
     try {
+      const etiquetaSector = sectorRodados === "adrogue" ? "Rodados Adrogué" : sectorRodados === "temperley" ? "Rodados Temperley" : "";
+      const observacionFinal = [etiquetaSector, observacion.trim()].filter(Boolean).join(" — ");
       const result = await transferirStockManual({
         depositoOrigenId,
         depositoDestinoId: Number(destinoId),
         items: carrito.map((c) => ({ sku: c.sku, cantidad: c.cantidad, name: c.name })),
-        observaciones: observacion.trim() || undefined,
+        observaciones: observacionFinal || undefined,
         depositoOrigenNombre,
         depositoDestinoNombre: destinosDisponibles.find((d) => d.id === Number(destinoId))?.nombre,
       });
@@ -1138,7 +1146,7 @@ function TransferirStockPanel({ depositoOrigenId, depositoOrigenNombre, items, d
             horaSalida: viajeCfg.hora,
             remitoArchivo: result.remitoArchivo,
             pdfBase64: result.remitoPdfBase64,
-            notas: observacion.trim(),
+            notas: observacionFinal,
             chofer: viajeCfg.choferUid ? { uid: viajeCfg.choferUid, nombre: viajeCfg.choferNombre } : null,
             actor: { uid: authUser?.uid || "", nombre: authProfile?.name || authUser?.email || null },
           });
@@ -1390,7 +1398,10 @@ function TransferirStockPanel({ depositoOrigenId, depositoOrigenNombre, items, d
       <p className="mt-4 mb-1.5 text-xs font-bold uppercase tracking-wide text-sky-700 dark:text-sky-400">Paso 1 · ¿A qué depósito va?</p>
       <select
         value={destinoId}
-        onChange={(e) => setDestinoId(e.target.value)}
+        onChange={(e) => {
+          setDestinoId(e.target.value);
+          setSectorRodados("");
+        }}
         className="w-full rounded-xl border border-sky-200 bg-white px-4 py-3 text-base text-slate-700 outline-none focus:border-sky-500 focus:ring-2 focus:ring-sky-500/40 dark:border-sky-900/50 dark:bg-neutral-900 dark:text-white"
       >
         <option value="">Elegí un depósito…</option>
@@ -1400,6 +1411,34 @@ function TransferirStockPanel({ depositoOrigenId, depositoOrigenNombre, items, d
           </option>
         ))}
       </select>
+
+      {Number(destinoId) === RODADOS_ARGENTINOS_DEPOSITO_ID && (
+        <div className="mt-3 rounded-xl border border-indigo-200 bg-indigo-50 p-3 dark:border-indigo-900 dark:bg-indigo-950/20">
+          <p className="text-xs font-bold uppercase tracking-wide text-indigo-700 dark:text-indigo-400">¿A qué sector de Rodados va?</p>
+          <div className="mt-2 flex gap-2">
+            {[
+              { id: "adrogue", label: "🏠 Rodados Adrogué" },
+              { id: "temperley", label: "🏠 Rodados Temperley" },
+            ].map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => setSectorRodados(s.id)}
+                className={`flex-1 rounded-xl border px-3 py-2 text-sm font-semibold transition ${
+                  sectorRodados === s.id
+                    ? "border-indigo-500 bg-indigo-600 text-white"
+                    : "border-indigo-200 bg-white text-indigo-700 hover:border-indigo-400 dark:border-indigo-900/50 dark:bg-neutral-900 dark:text-indigo-400"
+                }`}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-[11px] text-indigo-600/80 dark:text-indigo-400/70">
+            Es un solo depósito en Contabilium, pero esto queda anotado en la observación para separarlo solo en Stock Consignado.
+          </p>
+        </div>
+      )}
 
       <p className="mt-3 text-[11px] text-slate-400 dark:text-neutral-500">
         El cliente para el remito "real" (para circular en la calle) se elige después, una vez que el movimiento ya se
@@ -1542,7 +1581,12 @@ function TransferirStockPanel({ depositoOrigenId, depositoOrigenNombre, items, d
 
       <button
         type="button"
-        disabled={enviando || !destinoId || carrito.length === 0}
+        disabled={
+          enviando ||
+          !destinoId ||
+          carrito.length === 0 ||
+          (Number(destinoId) === RODADOS_ARGENTINOS_DEPOSITO_ID && !sectorRodados)
+        }
         onClick={confirmar}
         className="mt-4 w-full rounded-xl bg-sky-600 py-3 text-base font-bold text-white transition hover:-translate-y-0.5 hover:bg-sky-700 disabled:opacity-60"
       >

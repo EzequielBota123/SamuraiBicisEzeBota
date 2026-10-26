@@ -92,6 +92,8 @@ const CONTABILIUM_API_KEY = defineSecret("CONTABILIUM_API_KEY");
 // / CONTABILIUM_API_KEY (esos son para la API oficial con OAuth).
 const CONTABILIUM_WEB_EMAIL = defineSecret("CONTABILIUM_WEB_EMAIL");
 const CONTABILIUM_WEB_PASSWORD = defineSecret("CONTABILIUM_WEB_PASSWORD");
+const CREDIFIN_EMAIL = defineSecret("CREDIFIN_EMAIL");
+const CREDIFIN_PASSWORD = defineSecret("CREDIFIN_PASSWORD");
 const RESEND_API_KEY      = defineSecret("RESEND_API_KEY");
 const MERCADOPAGO_ACCESS_TOKEN = defineSecret("MERCADOPAGO_ACCESS_TOKEN");
 const GALICIA_APP_ID = defineSecret("GALICIA_APP_ID");
@@ -142,6 +144,52 @@ async function sendEmail(apiKey, { to, subject, html }) {
   return res.json();
 }
 
+// Le avisa por mail al vendedor "dueño" de un cliente (el que lo tiene en
+// su `vendedoresAsignados`) cada vez que pasa algo con ese cliente puntual
+// — pedido nuevo, venta reportada, o un comprobante/cobranza que se le
+// aplicó. Opt-in: solo manda algo si ese vendedor tiene cargado el campo
+// `notificarMovimientosClientesA` (un email) en su propia ficha — por
+// pedido explícito 26/10/2026 (caso Cuchi → alfredobavcevich@gmail.com),
+// pero genérico para cualquier vendedor con equipo, no hardcodeado a uno.
+function movimientoClienteEmailContent(tipo, clienteNombre, detalle) {
+  const html = `
+    <div style="font-family: -apple-system, Helvetica, Arial, sans-serif; max-width: 560px; margin: 0 auto;">
+      <div style="background:#0f172a; padding: 24px 28px; border-radius: 12px 12px 0 0;">
+        <h1 style="color:#fff; font-size: 22px; margin:0;">Samurai Bicis</h1>
+      </div>
+      <div style="border:1px solid #e2e8f0; border-top:none; padding: 28px; border-radius: 0 0 12px 12px;">
+        <h2 style="color:#0f172a; font-size:18px;">${tipo}</h2>
+        <p style="color:#334155; font-size:14px; line-height:1.6;">
+          Cliente: <strong>${clienteNombre}</strong>
+        </p>
+        <p style="color:#334155; font-size:14px; line-height:1.6; white-space:pre-line;">${detalle}</p>
+      </div>
+    </div>`;
+  return { subject: `Samurai Bicis — ${tipo}: ${clienteNombre}`, html };
+}
+
+async function notificarVendedorDeMovimientoCliente(db, resendApiKey, { clienteUid, clienteContabiliumId, clienteNombre, tipo, detalle }) {
+  try {
+    let uid = clienteUid || null;
+    if (!uid && clienteContabiliumId != null) {
+      const snap = await db.collection("users").where("contabiliumId", "==", clienteContabiliumId).limit(1).get();
+      if (snap.empty) return;
+      uid = snap.docs[0].id;
+    }
+    if (!uid) return;
+
+    const vendedoresSnap = await db.collection("users").where("vendedoresAsignados", "array-contains", uid).get();
+    for (const vDoc of vendedoresSnap.docs) {
+      const email = String(vDoc.data().notificarMovimientosClientesA || "").trim();
+      if (!email) continue;
+      const { subject, html } = movimientoClienteEmailContent(tipo, clienteNombre || "Cliente sin nombre", detalle || "");
+      await sendEmail(resendApiKey, { to: email, subject, html });
+    }
+  } catch (err) {
+    console.error("[notificarVendedorDeMovimientoCliente] error:", err);
+  }
+}
+
 // Devuelve un email real donde contactar al usuario, o null si no hay
 // ninguno confiable. `email` en el doc del usuario suele ser un placeholder
 // interno (`usuario@samurai.internal`, usado solo para el login de Auth),
@@ -174,6 +222,14 @@ async function doContabiliumSync(email, apiKey) {
   const desgloseMap = new Map();
   const disponibleErrors = [];
   for (const c of conceptos) {
+    // Si otro sync (o este mismo, en una vuelta anterior) ya detectó el
+    // bloqueo y pausó todo, cortamos acá en vez de seguir insistiendo SKU
+    // por SKU — lo que queda sin traer simplemente mantiene el último valor
+    // bueno que ya tenía Firestore.
+    if (await syncsContabiliumPausados(db)) {
+      console.warn("[contabilium] stock sync: cortado a mitad de camino, syncs pausados");
+      break;
+    }
     const code = (c.Codigo || "").trim();
     if (!code) continue;
     let ok = false;
@@ -187,6 +243,7 @@ async function doContabiliumSync(email, apiKey) {
         if (attempt === 4) {
           console.error(`[contabilium] stock disponible ${code}:`, err);
           disponibleErrors.push({ code, error: String(err) });
+          if (is429) await pausarSyncsAutomaticamente(db, `doContabiliumSync/${code}`);
         } else {
           await sleep(is429 ? 2000 * attempt : 400);
         }
@@ -286,17 +343,62 @@ async function doContabiliumSync(email, apiKey) {
   return { updated: updates.length, total: conceptos.length, disponibleErrors };
 }
 
+// Pausa de emergencia para TODOS los syncs automáticos que le pegan a
+// Contabilium — para usar cuando Contabilium empieza a devolver 429 en
+// cadena (nos corta la cuenta entera por un rato, no solo el endpoint que
+// lo disparó) y hace falta dejar de insistir mientras se libera el límite.
+// Se activa/desactiva escribiendo `meta/syncControl.pausarSyncsHasta` (un
+// timestamp futuro) — cada sync lo chequea al arrancar y si todavía no
+// pasó esa fecha, no llama a Contabilium y sale. Se "des-pausa" solo, sin
+// necesidad de otro deploy, en cuanto pasa la fecha.
+async function syncsContabiliumPausados(db) {
+  try {
+    const snap = await db.doc("meta/syncControl").get();
+    const hasta = snap.data()?.pausarSyncsHasta;
+    const hastaDate = hasta?.toDate ? hasta.toDate() : hasta ? new Date(hasta) : null;
+    return !!(hastaDate && hastaDate.getTime() > Date.now());
+  } catch {
+    return false;
+  }
+}
+
+// Freno automático: lo llama cualquier sync que se encuentre con un 429 de
+// Contabilium después de agotar sus reintentos — así, en vez de que cada
+// robot siga insistiendo por su cuenta y empeore el bloqueo, el primero que
+// se choca contra el límite frena a TODOS los demás un rato (10 min) solo.
+// No hace falta que nadie entre a mano a pausar nada la próxima vez.
+async function pausarSyncsAutomaticamente(db, motivo) {
+  try {
+    const hasta = new Date(Date.now() + 10 * 60 * 1000);
+    await db.doc("meta/syncControl").set(
+      { pausarSyncsHasta: admin.firestore.Timestamp.fromDate(hasta), pausadoAutomaticamentePor: motivo },
+      { merge: true }
+    );
+    console.warn(`[contabilium] 429 detectado (${motivo}) — syncs pausados automáticamente hasta ${hasta.toISOString()}`);
+  } catch (e) {
+    console.error("[contabilium] no se pudo pausar syncs automáticamente:", e);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────
 // Sync automático cada 5 minutos
 // ─────────────────────────────────────────────────────────────
 exports.syncContabiliumStock = onSchedule(
   {
-    schedule: "every 15 minutes",
+    // Era cada 15 min — es, por lejos, el sync que más le pega a
+    // Contabilium (un pedido por SKU, secuencial) y el responsable de casi
+    // todos los 429 detectados el 22/10/2026. A 30 min se reduce el volumen
+    // diario a la mitad sin resentir demasiado la frescura del stock.
+    schedule: "every 30 minutes",
     secrets:  [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY],
     timeoutSeconds: 300,
   },
   async () => {
     try {
+      if (await syncsContabiliumPausados(admin.firestore())) {
+        console.log("[contabilium] syncContabiliumStock: pausado, salteando");
+        return;
+      }
       const result = await doContabiliumSync(
         CONTABILIUM_EMAIL.value(),
         CONTABILIUM_API_KEY.value()
@@ -456,6 +558,10 @@ exports.syncClientesContabiliumSinCuentaDaily = onSchedule(
   },
   async () => {
     try {
+      if (await syncsContabiliumPausados(admin.firestore())) {
+        console.log("[contabilium] syncClientesContabiliumSinCuentaDaily: pausado, salteando");
+        return;
+      }
       const result = await syncClientesContabiliumSinCuenta(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value());
       console.log("[contabilium] clientes sin cuenta sync ok:", result);
     } catch (err) {
@@ -622,6 +728,10 @@ exports.syncCobranzasDaily = onSchedule(
   },
   async () => {
     try {
+      if (await syncsContabiliumPausados(admin.firestore())) {
+        console.log("[contabilium] syncCobranzasDaily: pausado, salteando");
+        return;
+      }
       const d = new Date();
       d.setDate(d.getDate() - 31);
       const result = await doContabiliumCobranzasSync(
@@ -998,7 +1108,32 @@ exports.getClientComprobantes = onRequest(
 
       const saldoTotal = await computeSaldoTotal(db, contabiliumId, rawItemsFull);
 
-      return res.json({ items, total: items.length, saldoTotal });
+      // Cobranzas (pagos) del cliente, con a qué factura quedó aplicada
+      // cada una — mismo criterio que la lista de "Cobranzas" de Clientes
+      // 360 en el admin, para que el cliente vea de su lado lo mismo que ve
+      // Samurai: no solo las facturas, también los pagos y a qué se
+      // aplicaron.
+      const comprobanteNumeroPorId = new Map(rawItemsFull.map((c) => [c.Id, c.Numero]));
+      const cobranzasSnap = await db.collection("cobranzas").where("idPersona", "==", contabiliumId).get();
+      const cobranzas = cobranzasSnap.docs
+        .map((d) => {
+          const data = d.data();
+          return {
+            id: d.id,
+            numero: data.numero || null,
+            fecha: data.fecha || null,
+            importeTotal: Number(data.importeReal ?? data.importeTotal ?? 0),
+            formasDePago: data.formasDePago || [],
+            esReimputacion: !!data.esReimputacion,
+            excluirDeSaldo: !!data.excluirDeSaldo,
+            detalle: (data.detalle || [])
+              .filter((it) => it && it.IDComprobante != null)
+              .map((it) => ({ IDComprobante: it.IDComprobante, Importe: it.Importe, numeroFactura: comprobanteNumeroPorId.get(it.IDComprobante) || null })),
+          };
+        })
+        .sort((a, b) => String(b.fecha || "").localeCompare(String(a.fecha || "")));
+
+      return res.json({ items, total: items.length, saldoTotal, cobranzas });
     } catch (err) {
       console.error("[contabilium] getClientComprobantes error:", err);
       return res.status(500).json({ error: String(err) });
@@ -1068,7 +1203,9 @@ exports.getComprobanteDetail = onRequest(
 // los datos del cliente ya listos para la carga manual en Contabilium
 // (POST /comprobantes no está disponible en la API v1).
 // ═════════════════════════════════════════════════════════════
-exports.onOrderCreated = onDocumentCreated("orders/{orderId}", async (event) => {
+exports.onOrderCreated = onDocumentCreated(
+  { document: "orders/{orderId}", secrets: [RESEND_API_KEY] },
+  async (event) => {
   const snap = event.data;
   if (!snap) return;
 
@@ -1134,10 +1271,72 @@ exports.onOrderCreated = onDocumentCreated("orders/{orderId}", async (event) => 
     });
 
     console.log(`[notify] notificación creada para orden #${orderId}`);
+
+    if (customer.uid) {
+      const detalleItems = items.map((it) => `• ${it.qty}x ${it.name}`).join("\n");
+      await notificarVendedorDeMovimientoCliente(db, RESEND_API_KEY.value(), {
+        clienteUid: customer.uid,
+        clienteNombre: customer.name || "Cliente sin nombre",
+        tipo: "📦 Pedido nuevo",
+        detalle: `${detalleItems}\n\nTotal: ${Number(order.total ?? 0).toLocaleString("es-AR", { style: "currency", currency: "ARS" })}`,
+      });
+    }
   } catch (err) {
     console.error("[notify] onOrderCreated error:", err);
   }
-});
+  }
+);
+
+// Mismo aviso por mail que onOrderCreated (ver `notificarVendedorDeMovimientoCliente`),
+// disparado cuando un cliente reporta una venta desde "Mi Stock".
+exports.onSaleRequestCreated = onDocumentCreated(
+  { document: "saleRequests/{id}", secrets: [RESEND_API_KEY] },
+  async (event) => {
+    const snap = event.data;
+    if (!snap) return;
+    const s = snap.data() || {};
+    try {
+      const db = admin.firestore();
+      await notificarVendedorDeMovimientoCliente(db, RESEND_API_KEY.value(), {
+        clienteUid: s.distributorUid || null,
+        clienteNombre: s.distributorName || "Cliente sin nombre",
+        tipo: "🚲 Venta reportada",
+        detalle: `${s.quantity || 1}x ${s.name || `SKU ${s.sku}`}\nPrecio unitario: ${Number(s.unitPrice || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS" })}`,
+      });
+    } catch (err) {
+      console.error("[notify] onSaleRequestCreated error:", err);
+    }
+  }
+);
+
+// Mismo aviso, disparado cuando se sincroniza una cobranza nueva desde
+// Contabilium (un comprobante/pago que se le aplicó a un cliente) — la
+// sync (cada 15 min) crea el doc en `cobranzas`, este trigger reacciona a
+// esa creación en vez de tener que meterse dentro del loop de sync.
+exports.onCobranzaCreated = onDocumentCreated(
+  { document: "cobranzas/{id}", secrets: [RESEND_API_KEY] },
+  async (event) => {
+    const snap = event.data;
+    if (!snap) return;
+    const c = snap.data() || {};
+    if (c.idPersona == null) return;
+    try {
+      const db = admin.firestore();
+      const detalleFacturas = (c.detalle || [])
+        .filter((d) => d && d.IDComprobante != null)
+        .map((d) => `• factura #${d.IDComprobante} — ${Number(d.Importe || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS" })}`)
+        .join("\n");
+      await notificarVendedorDeMovimientoCliente(db, RESEND_API_KEY.value(), {
+        clienteContabiliumId: c.idPersona,
+        clienteNombre: c.razonSocial || "Cliente sin nombre",
+        tipo: "💳 Comprobante aplicado",
+        detalle: `Cobranza Nº ${c.numero || snap.id} — ${Number(c.importeReal ?? c.importeTotal ?? 0).toLocaleString("es-AR", { style: "currency", currency: "ARS" })}${detalleFacturas ? `\n\n${detalleFacturas}` : ""}`,
+      });
+    } catch (err) {
+      console.error("[notify] onCobranzaCreated error:", err);
+    }
+  }
+);
 
 // Chequeo diario de vehículo: cuando el chofer lo envía (nuevo o
 // reenviado tras un rechazo) le avisa a los admins para que lo revisen;
@@ -1344,6 +1543,10 @@ exports.syncOrderStatuses = onSchedule(
   },
   async () => {
     try {
+      if (await syncsContabiliumPausados(admin.firestore())) {
+        console.log("[contabilium] syncOrderStatuses: pausado, salteando");
+        return;
+      }
       const result = await doOrderStatusSync(
         CONTABILIUM_EMAIL.value(),
         CONTABILIUM_API_KEY.value()
@@ -1838,6 +2041,10 @@ exports.syncAutoLinkClientes = onSchedule(
   },
   async () => {
     try {
+      if (await syncsContabiliumPausados(admin.firestore())) {
+        console.log("[contabilium] syncAutoLinkClientes: pausado, salteando");
+        return;
+      }
       const result = await computeAutoLinkClientes(admin.firestore(), CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value());
       console.log("[autoLinkClientes] ok — creados:", result.creadosCount, "ya vinculados:", result.yaVinculados, "sin ficha:", result.sinFichaCliente);
     } catch (err) {
@@ -2766,6 +2973,7 @@ async function buildResumenComision(db, email, apiKey, webEmail, webPassword, ta
   const esLogisticaSoloFlete = origenesExplicitos.length > 0;
   let viajes = 0;
   let unidadesEntregadas = 0;
+  let viajesDetalle = [];
   if (palabrasOrigen.length && webEmail && webPassword) {
     try {
       const { obtenerMovimientosStock } = require("./contabiliumWebAutomation");
@@ -2779,16 +2987,53 @@ async function buildResumenComision(db, email, apiKey, webEmail, webPassword, ta
       // campo real de la respuesta (el que sí viene es "descripcion"), así
       // que agrupar por fecha+observaciones como antes subcontaba/sobrecontaba
       // viajes.
+      // Movimientos con origen Credifin/Jíbaro/etc. que en realidad son un
+      // retiro interno hecho por Julián con la camioneta de Rodados (ej.
+      // "Retira Julián de Credifin hacia Lavalle") — no es un viaje que el
+      // proveedor logístico facture, así que no debe contarse como suyo
+      // (confirmado 26/10/2026, caso Credifin).
+      //
+      // Para la cuenta del propio Julián/Vito el criterio cambia del todo
+      // (pedido explícito 26/10/2026, tras auditar a mano): él maneja para
+      // CUALQUIER depósito/cliente, no solo el suyo propio ("Rodados") —
+      // le lleva mercadería a Cuchi, a Credifin, a Cañuelas, a clientes
+      // puntuales, y trae cosas de esos lados hacia Lavalle. Filtrar por
+      // origen/destino "RODADOS" se quedaba afuera de casi todo eso. Ahora
+      // para su cuenta NO se filtra por origen/destino en absoluto — cuenta
+      // CUALQUIER movimiento cuya observación diga que lo llevó/retiró él,
+      // venga de donde venga y vaya adonde vaya. "JULIAN BRAUER LARRABURU"
+      // es un cliente real (no el chofer) — se excluye a propósito.
+      const esCuentaDeJulian = origenesExplicitos.some((o) => /rodados/i.test(o));
+      const llevaJulianRe = /juli[aá]n(?!\s*brauer)/i;
       const viajesUnicos = new Set();
+      const viajesDetalleMap = new Map(); // id del movimiento -> { fecha, destino, bicis }
       for (const m of movimientos) {
         const origen = (m.origen || "").trim();
         const destino = (m.destino || "").trim();
-        if (!origenVendedorRe.test(origen)) continue;
-        if (!esLogisticaSoloFlete && depositoPropioRe.test(destino)) continue;
+        const mencionaJulian = llevaJulianRe.test(m.descripcion || "");
+        if (esCuentaDeJulian) {
+          // Solo "entregas" (destino NO es un depósito propio de Samurai) —
+          // lo que vuelve a un depósito propio ya lo cuenta `totalRetirado`
+          // en buildInformeCompletoVendedor; sumar acá también lo duplicaba
+          // (bug detectado 26/10/2026 al desplegar el criterio ampliado).
+          if (!mencionaJulian || depositoPropioRe.test(destino)) continue;
+        } else {
+          if (!origenVendedorRe.test(origen)) continue;
+          if (!esLogisticaSoloFlete && depositoPropioRe.test(destino)) continue;
+          if (esLogisticaSoloFlete && mencionaJulian) continue;
+        }
         viajesUnicos.add(m.id);
-        if (/BIC\b/i.test(m.codigoNombre || "")) unidadesEntregadas += Number(m.cantidad || 0);
+        if (!viajesDetalleMap.has(m.id)) viajesDetalleMap.set(m.id, { id: m.id, fecha: m.fecha || "", destino, bicis: 0 });
+        if (/BIC\b/i.test(m.codigoNombre || "")) {
+          const cant = Number(m.cantidad || 0);
+          unidadesEntregadas += cant;
+          viajesDetalleMap.get(m.id).bicis += cant;
+        }
       }
       viajes = viajesUnicos.size;
+      viajesDetalle = Array.from(viajesDetalleMap.values())
+        .filter((v) => v.bicis > 0)
+        .sort((a, b) => (a.fecha || "").localeCompare(b.fecha || ""));
     } catch (err) {
       console.error("[buildResumenComision] no se pudo traer movimientos de stock para contar viajes:", err.message);
     }
@@ -2797,7 +3042,20 @@ async function buildResumenComision(db, email, apiKey, webEmail, webPassword, ta
   // bici, confirmado 21/10/2026 (antes se cobraba por viaje, que era
   // incorrecto: un viaje puede llevar varias bicis y cobraba lo mismo que
   // uno con una sola).
-  const fleteTotal = unidadesEntregadas * tarifaFletePorViaje;
+  // Jíbaro es un caso aparte (confirmado 22/10/2026, mail de Mariana Alvarez):
+  // cobra 3.5% de la carga pero el monto puntual hay que consultárselo viaje
+  // por viaje, no se puede calcular solo — así que en vez de unidades × tarifa
+  // fija, se suma lo que se cargó a mano para cada viaje puntual (0 si
+  // todavía no se cargó ese viaje).
+  let montosManualesPorViaje = {};
+  let fleteTotal;
+  if (target.modoFleteManual && viajesDetalle.length > 0) {
+    const montosSnap = await db.collection(`users/${targetUid}/montosViajesManuales`).get();
+    for (const d of montosSnap.docs) montosManualesPorViaje[d.id] = Number(d.data().monto || 0);
+    fleteTotal = viajesDetalle.reduce((acc, v) => acc + (montosManualesPorViaje[String(v.id)] || 0), 0);
+  } else {
+    fleteTotal = unidadesEntregadas * tarifaFletePorViaje;
+  }
 
   let ventasTotal = 0;
   // Detalle bici por bici (modelo + cliente + comisión de esa venta puntual)
@@ -2891,6 +3149,10 @@ async function buildResumenComision(db, email, apiKey, webEmail, webPassword, ta
     totalACobrar,
     cantidadClientesAsignados: asignados.length,
     detalle,
+    modoFleteManual: !!target.modoFleteManual,
+    viajesDetalle: target.modoFleteManual
+      ? viajesDetalle.map((v) => ({ ...v, monto: montosManualesPorViaje[String(v.id)] ?? null }))
+      : [],
   };
 }
 
@@ -3018,13 +3280,22 @@ exports.descargarResumenVendedorExcel = onRequest(
       const esLogisticaSoloFlete = origenesExplicitos.length > 0;
       const origenRe = new RegExp(palabrasOrigen.map(escapeRegExpBackend).join("|"), "i");
       const depositoPropioRe = /lavalle|temperley|ca[ñn]uelas|credifin/i;
+      // Ver comentario largo más arriba (caso Credifin + cuenta de Julián, 26/10/2026).
+      const esCuentaDeJulian = origenesExplicitos.some((o) => /rodados/i.test(o));
+      const llevaJulianRe = /juli[aá]n(?!\s*brauer)/i;
 
       const viajesMap = new Map();
       for (const m of movimientos) {
         const origen = (m.origen || "").trim();
         const destino = (m.destino || "").trim();
-        if (!origenRe.test(origen)) continue;
-        if (!esLogisticaSoloFlete && depositoPropioRe.test(destino)) continue;
+        const mencionaJulian = llevaJulianRe.test(m.descripcion || "");
+        if (esCuentaDeJulian) {
+          if (!mencionaJulian || depositoPropioRe.test(destino)) continue;
+        } else {
+          if (!origenRe.test(origen)) continue;
+          if (!esLogisticaSoloFlete && depositoPropioRe.test(destino)) continue;
+          if (esLogisticaSoloFlete && mencionaJulian) continue;
+        }
         const key = m.id;
         if (!viajesMap.has(key)) {
           viajesMap.set(key, { fecha: m.fecha || "", destino, descripcion: m.descripcion || "", items: [] });
@@ -3325,7 +3596,19 @@ async function buildInformeCompletoVendedor(db, email, apiKey, webEmail, webPass
   // tarifa — "cada vez que retira más de Lavalle son 10 mil cada una [y
   // la entrega también]". Antes de la primera liquidación se sigue usando
   // el total de stock (ya validado a mano con Cuchi, da 200).
-  const usaFleteDeMovimiento = !!target.fechaUltimaLiquidacion;
+  //
+  // Esto último asume que el vendedor tiene clientes propios con depósito
+  // consignado (de ahí sale "stock total" y "entregado") — una cuenta
+  // "solo logística" (chofer puro, ej. Vito/Jíbaro/Credifin, sin
+  // `vendedoresAsignados`) no tiene nada de eso: el panel le da siempre 0
+  // clientes/0 stock/0 entregado, así que ese cálculo le daba flete $0 por
+  // más viajes reales que hiciera (bug detectado 26/10/2026 con Vito, 5
+  // viajes reales pero $0 de flete). Para esas cuentas usamos SIEMPRE el
+  // cálculo por movimiento, nunca el de stock total — no hay "stock ya
+  // pagado" que proteger porque nunca hubo panel de clientes en primer
+  // lugar.
+  const esSoloLogistica = !Array.isArray(target.vendedoresAsignados) || target.vendedoresAsignados.length === 0;
+  const usaFleteDeMovimiento = !!target.fechaUltimaLiquidacion || esSoloLogistica;
 
   const panel = await buildPanelClientesVendedor(db, email, apiKey, targetUid, desdeISO);
 
@@ -3472,12 +3755,29 @@ async function buildInformeCompletoVendedor(db, email, apiKey, webEmail, webPass
   const esLogisticaSoloFlete = origenesExplicitos.length > 0;
   const origenRe = new RegExp(palabrasOrigen.map(escapeRegExpBackend).join("|"), "i");
   const depositoPropioRe = /lavalle|temperley|ca[ñn]uelas|credifin/i;
+  // Ver comentario largo más arriba (buildResumenComision, caso Credifin +
+  // cuenta de Julián, 26/10/2026). Para la cuenta de Julián no se filtra
+  // por origen/destino — cuenta CUALQUIER movimiento que la observación
+  // diga que llevó/retiró él, sin importar hacia/desde dónde. Para que no
+  // quede duplicado entre "viajes" (entregas) y "retiros" (vuelve a un
+  // depósito propio de Samurai), se parte por el destino: si vuelve a un
+  // depósito propio va a "retiros", si no (entrega a un cliente/depósito
+  // externo) va a "viajes" — la separación es aproximada (prioriza no
+  // duplicar guita sobre la etiqueta exacta), pero el total sí es exacto.
+  const esCuentaDeJulian = origenesExplicitos.some((o) => /rodados/i.test(o));
+  const llevaJulianRe = /juli[aá]n(?!\s*brauer)/i;
   const viajesMap = new Map();
   for (const m of movimientos) {
     const origen = (m.origen || "").trim();
     const destino = (m.destino || "").trim();
-    if (!origenRe.test(origen)) continue;
-    if (!esLogisticaSoloFlete && depositoPropioRe.test(destino)) continue;
+    const mencionaJulian = llevaJulianRe.test(m.descripcion || "");
+    if (esCuentaDeJulian) {
+      if (!mencionaJulian || depositoPropioRe.test(destino)) continue;
+    } else {
+      if (!origenRe.test(origen)) continue;
+      if (!esLogisticaSoloFlete && depositoPropioRe.test(destino)) continue;
+      if (esLogisticaSoloFlete && mencionaJulian) continue;
+    }
     const key = m.id;
     if (!viajesMap.has(key)) viajesMap.set(key, { fecha: m.fecha || "", destino, descripcion: m.descripcion || "", items: [] });
     viajesMap.get(key).items.push({ producto: m.codigoNombre || "", cantidad: m.cantidad != null ? Number(m.cantidad) : null });
@@ -3495,13 +3795,30 @@ async function buildInformeCompletoVendedor(db, email, apiKey, webEmail, webPass
   for (const m of movimientos) {
     const origen = (m.origen || "").trim();
     const destino = (m.destino || "").trim();
-    if (!destinoVendedorRe.test(destino)) continue;
+    const mencionaJulian = llevaJulianRe.test(m.descripcion || "");
+    if (esCuentaDeJulian) {
+      if (!mencionaJulian || !depositoPropioRe.test(destino)) continue;
+    } else {
+      if (!destinoVendedorRe.test(destino)) continue;
+      if (esLogisticaSoloFlete && mencionaJulian) continue;
+    }
     const key = m.id;
     if (!retirosMap.has(key)) retirosMap.set(key, { fecha: m.fecha || "", origen, descripcion: m.descripcion || "", items: [] });
     retirosMap.get(key).items.push({ producto: m.codigoNombre || "", cantidad: m.cantidad != null ? Number(m.cantidad) : null });
   }
   const retiros = Array.from(retirosMap.values()).sort((a, b) => (a.fecha || "").localeCompare(b.fecha || ""));
-  const totalRetirado = retiros.reduce((a, v) => a + v.items.reduce((x, it) => x + (it.cantidad || 0), 0), 0);
+  // Para flete solo cuentan bicicletas — mismo filtro /BIC\b/i que
+  // unidadesEntregadas/totalUnidadesComision. `retiros` (arriba) sigue
+  // guardando TODOS los ítems (accesorios incluidos) para que el detalle
+  // sea fiel a lo que realmente se transfirió, pero cobrar flete a $10.000
+  // por un inflador o una luz trasera no tiene sentido — eso inflaba
+  // totalRetirado con decenas de accesorios de golpe (bug detectado
+  // 26/10/2026 con Vito: una sola transferencia de accesorios sumaba 125
+  // unidades al conteo de flete).
+  const totalRetirado = retiros.reduce(
+    (a, v) => a + v.items.reduce((x, it) => x + (/BIC\b/i.test(it.producto || "") ? Number(it.cantidad || 0) : 0), 0),
+    0
+  );
   // Devoluciones: el caso particular donde el vendedor manda mercadería DE
   // VUELTA a un depósito propio de Samurai (resta del total retirado neto).
   const devolucionesMap = new Map();
@@ -3988,6 +4305,33 @@ exports.adminSetTarifasVendedor = onRequest(
       return res.json({ ok: true });
     } catch (err) {
       console.error("[adminSetTarifasVendedor] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Para proveedores logísticos con `modoFleteManual` (ej. Jíbaro: cobra 3.5%
+// de la carga pero el monto puntual hay que consultárselo viaje por viaje,
+// no se puede calcular solo) — guarda lo que cobró por un viaje puntual
+// (identificado por el id del movimiento de stock de Contabilium que lo
+// generó), en vez de una tarifa fija global.
+exports.adminGuardarMontoViajeLogistica = onRequest(
+  { cors: false },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { vendedorUid, viajeId, monto } = req.body || {};
+      if (!vendedorUid || viajeId == null) return res.status(400).json({ error: "Falta vendedorUid o viajeId" });
+      await admin
+        .firestore()
+        .doc(`users/${vendedorUid}/montosViajesManuales/${viajeId}`)
+        .set({ monto: Number(monto) || 0, updatedAt: admin.firestore.FieldValue.serverTimestamp(), updatedPorUid: staffUid }, { merge: true });
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("[adminGuardarMontoViajeLogistica] error:", err);
       return res.status(500).json({ error: err.message || String(err) });
     }
   }
@@ -5408,6 +5752,48 @@ exports.diagHistoricoStockReal = onRequest(
       return res.json(resultado);
     } catch (err) {
       console.error("[diagHistoricoStockReal] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Busca TODOS los movimientos de stock (sin filtrar por origen/destino de
+// ningún vendedor puntual) cuya observación mencione a Julián, en un rango
+// de fechas — para auditar a mano si hay retiros/envíos suyos desde
+// depósitos que no sean Lavalle (ej. Credifin) que el informe de Vito no
+// esté agarrando (pedido 26/10/2026).
+exports.diagMovimientosJulian = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 300 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { obtenerMovimientosStock } = require("./contabiliumWebAutomation");
+      const fechaDesde = req.body?.fechaDesde || "2026-08-01";
+      const fechaHasta = req.body?.fechaHasta || new Date().toISOString().slice(0, 10);
+      const movimientos = await obtenerMovimientosStock({
+        db: admin.firestore(),
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+        fechaDesde,
+        fechaHasta,
+      });
+      const julianRe = /juli[aá]n/i;
+      const matches = movimientos
+        .filter((m) => julianRe.test(m.descripcion || ""))
+        .map((m) => ({
+          fecha: m.fecha,
+          origen: m.origen,
+          destino: m.destino,
+          codigoNombre: m.codigoNombre,
+          cantidad: m.cantidad,
+          descripcion: m.descripcion,
+        }));
+      return res.json({ ok: true, totalMovimientos: movimientos.length, totalConJulian: matches.length, matches });
+    } catch (err) {
+      console.error("[diagMovimientosJulian] error:", err);
       return res.status(500).json({ error: err.message || String(err) });
     }
   }
@@ -8312,7 +8698,9 @@ exports.listVentasFacturadasSinCobrar = onRequest(
         });
       });
 
-      sinCobrar.sort((a, b) => (a.resolvedAt || "").localeCompare(b.resolvedAt || ""));
+      // Más reciente primero, igual que el resto de las pestañas (antes era
+      // al revés y la más nueva quedaba escondida al final de la lista).
+      sinCobrar.sort((a, b) => (b.resolvedAt || "").localeCompare(a.resolvedAt || ""));
       return res.json({ items: sinCobrar });
     } catch (err) {
       console.error("[saleRequests] listVentasFacturadasSinCobrar error:", err);
@@ -8694,6 +9082,233 @@ exports.emitirFacturaManual = onRequest(
       return res.json({ ok: true, comprobante });
     } catch (err) {
       console.error("[facturas] emitirFacturaManual error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────
+// Sub-cuentas de un vendedor/distribuidor (ej. Stortini → Carhué/Viedma).
+// Caso real: Stortini consigna parte de su propio stock a dos revendedores
+// propios (no son clientes de Samurai, ni tienen contabiliumId/depósito
+// propio) y les lleva una cuenta corriente aparte para cada uno — pedido
+// explícito 22/10/2026. En Contabilium NO existen como entidades separadas
+// — todo sigue siendo UNA sola factura/cliente (Stortini, su contabiliumId
+// y su depósito real); esto es una capa de seguimiento nuestra, en
+// Firestore, para no perder de vista cuánto stock/saldo tiene cada
+// revendedor, aunque todo el movimiento real en Contabilium quede a nombre
+// de Stortini.
+// Estructura: users/{vendedorUid}.subcuentas = [{ id, nombre, stock: [{sku,
+// nombre, cantidad}], saldo, historial: [{tipo, monto, fecha, nota,
+// facturaNumero}] }]
+function clampStockSubcuenta(stock) {
+  return (Array.isArray(stock) ? stock : []).filter((it) => Number(it.cantidad) > 0);
+}
+
+exports.adminListSubcuentasVendedor = onRequest(
+  { cors: false, invoker: "public" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const vendedorUid = req.body?.vendedorUid || req.query.vendedorUid;
+      if (!vendedorUid) return res.status(400).json({ error: "vendedorUid requerido" });
+      const snap = await admin.firestore().doc(`users/${vendedorUid}`).get();
+      if (!snap.exists) return res.status(404).json({ error: "No existe ese usuario" });
+      const subcuentas = snap.data().subcuentas || [];
+      return res.json({ subcuentas });
+    } catch (err) {
+      console.error("[adminListSubcuentasVendedor] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Crea o edita una sub-cuenta entera (nombre + stock inicial + saldo
+// inicial) — para dar de alta Carhué/Viedma la primera vez, o corregir algo
+// a mano después.
+exports.adminGuardarSubcuentaVendedor = onRequest(
+  { cors: false, invoker: "public" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { vendedorUid, id, nombre, stock, saldo } = req.body || {};
+      if (!vendedorUid || !id || !nombre) return res.status(400).json({ error: "Faltan vendedorUid, id y nombre" });
+      const db = admin.firestore();
+      const ref = db.doc(`users/${vendedorUid}`);
+      const snap = await ref.get();
+      if (!snap.exists) return res.status(404).json({ error: "No existe ese usuario" });
+      const subcuentas = snap.data().subcuentas || [];
+      const idx = subcuentas.findIndex((s) => s.id === id);
+      const nueva = {
+        id,
+        nombre,
+        stock: clampStockSubcuenta(stock),
+        saldo: Number(saldo) || 0,
+        historial: idx >= 0 ? subcuentas[idx].historial || [] : [],
+      };
+      if (idx >= 0) subcuentas[idx] = nueva;
+      else subcuentas.push(nueva);
+      await ref.update({ subcuentas });
+      return res.json({ ok: true, subcuentas });
+    } catch (err) {
+      console.error("[adminGuardarSubcuentaVendedor] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Factura a nombre del VENDEDOR real (su contabiliumId/depósito, como
+// siempre) pero descuenta el SKU vendido del stock visible de la
+// sub-cuenta elegida, y le suma el total de la factura a SU saldo (no al
+// saldo general del vendedor, que ya lo maneja Contabilium solo). La
+// cobranza real la sigue recibiendo/registrando el vendedor (Stortini), acá
+// solo se actualiza el seguimiento interno de la sub-cuenta.
+exports.adminFacturarSubcuenta = onRequest(
+  {
+    cors: false,
+    secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD],
+    timeoutSeconds: 90,
+    memory: "1GiB",
+  },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { vendedorUid, subcuentaId, items, tipoFc, fechaEmision } = req.body || {};
+      if (!vendedorUid || !subcuentaId) return res.status(400).json({ error: "Faltan vendedorUid y subcuentaId" });
+      if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "Agregá al menos un ítem" });
+
+      const db = admin.firestore();
+      const ref = db.doc(`users/${vendedorUid}`);
+      const snap = await ref.get();
+      if (!snap.exists) return res.status(404).json({ error: "No existe ese usuario" });
+      const vendedor = snap.data();
+      if (!vendedor.contabiliumId) return res.status(400).json({ error: "El vendedor no tiene contabiliumId vinculado" });
+
+      const subcuentas = vendedor.subcuentas || [];
+      const idx = subcuentas.findIndex((s) => s.id === subcuentaId);
+      if (idx < 0) return res.status(404).json({ error: "No existe esa sub-cuenta" });
+      const subcuenta = subcuentas[idx];
+
+      // Verifica ANTES de facturar que la sub-cuenta tenga stock suficiente
+      // de cada SKU — evita dejar la factura real emitida en Contabilium
+      // pero el seguimiento de la sub-cuenta en un estado imposible (stock
+      // negativo).
+      const stockPorSku = new Map((subcuenta.stock || []).map((it) => [it.sku, it]));
+      for (const it of items) {
+        const actual = stockPorSku.get(it.sku)?.cantidad || 0;
+        if (Number(it.cantidad) > actual) {
+          return res.status(400).json({ error: `${subcuenta.nombre} no tiene ${it.cantidad} de ${it.sku} (tiene ${actual})` });
+        }
+      }
+
+      const cleanItems = items.map((it, i) => {
+        const descripcion = String(it.descripcion || "").trim();
+        const cantidad = Number(it.cantidad);
+        const precioUnitario = Number(it.precioUnitario);
+        if (!descripcion) throw new Error(`Ítem ${i + 1}: falta la descripción`);
+        if (!Number.isFinite(cantidad) || cantidad <= 0) throw new Error(`Ítem ${i + 1}: cantidad inválida`);
+        if (!Number.isFinite(precioUnitario) || precioUnitario < 0) throw new Error(`Ítem ${i + 1}: precio inválido`);
+        return { descripcion, cantidad, precioUnitario, sku: it.sku ? String(it.sku).trim() : null };
+      });
+
+      const tipoFcValido = ["FCA", "FCB", "FCC", "COT", "REM"].includes(tipoFc) ? tipoFc : "FCA";
+      const fechaEmisionValida = /^\d{4}-\d{2}-\d{2}$/.test(fechaEmision || "") ? fechaEmision : undefined;
+
+      const comprobante = await emitirComprobanteConIva({
+        idCliente: vendedor.contabiliumId,
+        idDeposito: vendedor.contabiliumDepositoId || null,
+        tipoFc: tipoFcValido,
+        items: cleanItems,
+        fechaEmision: fechaEmisionValida,
+      });
+
+      // Descuenta el stock de la sub-cuenta (independiente del stock real
+      // de Contabilium, que ya lo descontó emitirComprobanteConIva solo) y
+      // le suma el total a su saldo.
+      const totalFactura = cleanItems.reduce((a, it) => a + it.cantidad * it.precioUnitario, 0);
+      const nuevoStock = (subcuenta.stock || []).map((it) => ({ ...it }));
+      for (const it of cleanItems) {
+        const linea = nuevoStock.find((s) => s.sku === it.sku);
+        if (linea) linea.cantidad = Math.max(0, Number(linea.cantidad) - it.cantidad);
+      }
+      const nuevaSubcuenta = {
+        ...subcuenta,
+        stock: clampStockSubcuenta(nuevoStock),
+        saldo: Number(subcuenta.saldo || 0) + totalFactura,
+        historial: [
+          ...(subcuenta.historial || []),
+          {
+            tipo: "factura",
+            monto: totalFactura,
+            fecha: new Date().toISOString(),
+            facturaNumero: comprobante?.Numero || null,
+            items: cleanItems,
+            registradoPor: staffUid,
+          },
+        ],
+      };
+      subcuentas[idx] = nuevaSubcuenta;
+      await ref.update({ subcuentas });
+
+      return res.json({ ok: true, comprobante, subcuenta: nuevaSubcuenta });
+    } catch (err) {
+      console.error("[adminFacturarSubcuenta] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Registra un pago/ajuste manual contra el SALDO de una sub-cuenta (no toca
+// Contabilium — el cobro real a Samurai lo recibe el vendedor, esto es solo
+// la cuenta corriente interna entre el vendedor y su revendedor). Monto
+// positivo = sube el saldo (ej. se le entregó más stock sin facturar
+// todavía); negativo = lo baja (pagó algo).
+exports.adminRegistrarPagoSubcuenta = onRequest(
+  { cors: false, invoker: "public" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { vendedorUid, subcuentaId, monto, nota } = req.body || {};
+      if (!vendedorUid || !subcuentaId || monto == null) {
+        return res.status(400).json({ error: "Faltan vendedorUid, subcuentaId y monto" });
+      }
+      const db = admin.firestore();
+      const ref = db.doc(`users/${vendedorUid}`);
+      const snap = await ref.get();
+      if (!snap.exists) return res.status(404).json({ error: "No existe ese usuario" });
+      const subcuentas = snap.data().subcuentas || [];
+      const idx = subcuentas.findIndex((s) => s.id === subcuentaId);
+      if (idx < 0) return res.status(404).json({ error: "No existe esa sub-cuenta" });
+      const subcuenta = subcuentas[idx];
+      const montoNum = Number(monto);
+      const nuevaSubcuenta = {
+        ...subcuenta,
+        saldo: Number(subcuenta.saldo || 0) - montoNum,
+        historial: [
+          ...(subcuenta.historial || []),
+          { tipo: "pago", monto: montoNum, fecha: new Date().toISOString(), nota: nota || "", registradoPor: staffUid },
+        ],
+      };
+      subcuentas[idx] = nuevaSubcuenta;
+      await ref.update({ subcuentas });
+      return res.json({ ok: true, subcuenta: nuevaSubcuenta });
+    } catch (err) {
+      console.error("[adminRegistrarPagoSubcuenta] error:", err);
       return res.status(500).json({ error: err.message || String(err) });
     }
   }
@@ -9772,6 +10387,10 @@ exports.syncConsignedRollup = onSchedule(
   },
   async () => {
     try {
+      if (await syncsContabiliumPausados(admin.firestore())) {
+        console.log("[contabilium] syncConsignedRollup: pausado, salteando");
+        return;
+      }
       const result = await computeConsignedRollup(
         admin.firestore(),
         CONTABILIUM_EMAIL.value(),
@@ -10134,6 +10753,10 @@ exports.syncBusinessDashboard = onSchedule(
   },
   async () => {
     try {
+      if (await syncsContabiliumPausados(admin.firestore())) {
+        console.log("[contabilium] syncBusinessDashboard: pausado, salteando");
+        return;
+      }
       const result = await computeBusinessDashboard(admin.firestore(), CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value());
       console.log("[businessDashboard] sync ok:", result.totalBicisVendidas, "bicis,", result.totalFacturado, "facturado");
     } catch (err) {
@@ -10350,6 +10973,10 @@ exports.syncDailyBikeStats = onSchedule(
   },
   async () => {
     try {
+      if (await syncsContabiliumPausados(admin.firestore())) {
+        console.log("[contabilium] syncDailyBikeStats: pausado, salteando");
+        return;
+      }
       const result = await computeDailyBikeStats(admin.firestore(), CONTABILIUM_WEB_EMAIL.value(), CONTABILIUM_WEB_PASSWORD.value());
       console.log("[dailyBikeStats] sync ok:", result.dias, "días, consignado hoy:", result.consignadoHoy);
     } catch (err) {
@@ -10581,8 +11208,12 @@ exports.syncRemitosDesdeWeb = onSchedule(
   },
   async () => {
     try {
-      const { listarRemitosCompletos } = require("./contabiliumWebAutomation");
       const db = admin.firestore();
+      if (await syncsContabiliumPausados(db)) {
+        console.log("[contabilium] syncRemitosDesdeWeb: pausado, salteando");
+        return;
+      }
+      const { listarRemitosCompletos } = require("./contabiliumWebAutomation");
       // Ventana amplia (4 meses) para no perder ediciones tardías de
       // remitos viejos (ej. alguien completa la observación después), sin
       // tener que traer la base histórica entera en cada corrida.
@@ -10607,6 +11238,10 @@ exports.syncClientesReport = onSchedule(
   },
   async () => {
     try {
+      if (await syncsContabiliumPausados(admin.firestore())) {
+        console.log("[contabilium] syncClientesReport: pausado, salteando");
+        return;
+      }
       const result = await computeClientesReport(admin.firestore(), CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value());
       console.log("[clientesReport] sync ok:", result.totalClientes, "clientes");
     } catch (err) {
@@ -10920,6 +11555,10 @@ exports.syncContabiliumDepositos = onSchedule(
   },
   async () => {
     try {
+      if (await syncsContabiliumPausados(admin.firestore())) {
+        console.log("[contabilium] syncContabiliumDepositos: pausado, salteando");
+        return;
+      }
       const result = await computeDepositosSync(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value());
       console.log("[contabilium] depositos sync ok:", result);
     } catch (err) {
@@ -11482,6 +12121,38 @@ exports.backfillContabiliumEmails = onRequest(
 
 // Diagnóstico de un solo uso: consulta el estado real de verificación del
 // dominio samurai.ar en Resend (DNS records, estado, etc).
+// Manda un mail de prueba cualquiera, a cualquier dirección — para probar
+// rápido que Resend sigue andando sin tener que disparar un flujo real.
+exports.sendTestEmail = onRequest(
+  { cors: false, invoker: "public", secrets: [RESEND_API_KEY] },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { to, subject, html } = req.body || {};
+      if (!to) return res.status(400).json({ error: "Falta 'to'" });
+      const result = await sendEmail(RESEND_API_KEY.value(), {
+        to,
+        subject: subject || "Samurai Bicis — Mensaje de prueba",
+        html: html || `<div style="font-family: -apple-system, Helvetica, Arial, sans-serif; max-width: 560px; margin: 0 auto;">
+          <div style="background:#0f172a; padding: 24px 28px; border-radius: 12px 12px 0 0;">
+            <h1 style="color:#fff; font-size: 22px; margin:0;">Samurai Bicis</h1>
+          </div>
+          <div style="border:1px solid #e2e8f0; border-top:none; padding: 28px; border-radius: 0 0 12px 12px;">
+            <h2 style="color:#0f172a; font-size:20px;">👋 Bienvenido a Samurai</h2>
+          </div>
+        </div>`,
+      });
+      return res.json({ ok: true, result });
+    } catch (err) {
+      console.error("[sendTestEmail] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
 exports.diagResendDomainStatus = onRequest(
   { cors: false, secrets: [RESEND_API_KEY] },
   async (req, res) => {
@@ -11816,3 +12487,52 @@ exports.descargarGaliciaMovimientos = onRequest({ cors: false, secrets: GALICIA_
   }
 });
 
+
+// Cuenta corriente real de FEPA TOP en Credifin (la logística que nos
+// factura los envíos) — Credifin no tiene API pública para partners, se
+// reversó su portal de autogestión (ver credifinWebAutomation.js: login
+// Auth0 con Puppeteer, cacheado, y de ahí en más fetch directo con el
+// token). `desde`/`hasta` en formato YYYY-MM-DD.
+exports.credifinGetCtaCte = onRequest(
+  { cors: false, secrets: [CREDIFIN_EMAIL, CREDIFIN_PASSWORD], timeoutSeconds: 120, memory: "1GiB" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { desde, hasta } = req.body || {};
+      if (!desde || !hasta) return res.status(400).json({ error: "Faltan desde/hasta (YYYY-MM-DD)" });
+      const { getCtaCteCredifin } = require("./credifinWebAutomation");
+      const reporte = await getCtaCteCredifin(admin.firestore(), CREDIFIN_EMAIL.value(), CREDIFIN_PASSWORD.value(), { desde, hasta });
+      return res.json({ reporte });
+    } catch (err) {
+      console.error("[credifin] credifinGetCtaCte error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// PDF real de un comprobante puntual de Credifin — `comprobantesId` es el
+// campo `NroAuxiliar` que trae cada fila de credifinGetCtaCte. Funciona
+// aunque la cuenta no tenga habilitada la sección "Comprobantes" (son
+// permisos separados, confirmado por captura real).
+exports.credifinGetComprobantePdf = onRequest(
+  { cors: false, secrets: [CREDIFIN_EMAIL, CREDIFIN_PASSWORD], timeoutSeconds: 120, memory: "1GiB" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { comprobantesId } = req.body || {};
+      if (!comprobantesId) return res.status(400).json({ error: "Falta comprobantesId" });
+      const { getComprobantePdfCredifin } = require("./credifinWebAutomation");
+      const pdfBase64 = await getComprobantePdfCredifin(admin.firestore(), CREDIFIN_EMAIL.value(), CREDIFIN_PASSWORD.value(), Number(comprobantesId));
+      return res.json({ pdfBase64 });
+    } catch (err) {
+      console.error("[credifin] credifinGetComprobantePdf error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);

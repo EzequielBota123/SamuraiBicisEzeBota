@@ -10,6 +10,7 @@ import {
   getResumenComisionVendedor,
   descargarResumenVendedorExcel,
   adminSetTarifasVendedor,
+  adminGuardarMontoViajeLogistica,
 } from "../../services/comprobantes";
 import InformeCompletoVendedorPanel from "../../components/admin/InformeCompletoVendedorPanel";
 
@@ -40,6 +41,52 @@ function formatFecha(s) {
   if (!s) return "-";
   const d = new Date(s.includes("T") ? s : `${s}T00:00:00`);
   return d.toLocaleDateString("es-AR", { day: "2-digit", month: "2-digit", year: "numeric" });
+}
+
+// Jíbaro: cobra 3.5% de la carga pero el monto puntual hay que
+// consultárselo viaje por viaje — una fila editable por cada viaje
+// detectado, en vez de una tarifa fija.
+function FilaViajeManual({ uid, viaje, onGuardado }) {
+  const [monto, setMonto] = useState(viaje.monto != null ? String(viaje.monto) : "");
+  const [guardando, setGuardando] = useState(false);
+
+  async function guardar() {
+    setGuardando(true);
+    try {
+      await adminGuardarMontoViajeLogistica(uid, viaje.id, Number(monto) || 0);
+      onGuardado();
+    } finally {
+      setGuardando(false);
+    }
+  }
+
+  return (
+    <tr className={viaje.monto == null ? "bg-amber-50 dark:bg-amber-950/10" : ""}>
+      <td className="whitespace-nowrap px-3 py-1.5">{formatFecha(viaje.fecha)}</td>
+      <td className="px-3 py-1.5">{viaje.destino}</td>
+      <td className="px-3 py-1.5 text-right">{viaje.bicis}</td>
+      <td className="px-3 py-1.5 text-right">
+        <div className="flex items-center justify-end gap-1.5">
+          <input
+            type="number"
+            min="0"
+            step="100"
+            value={monto}
+            onChange={(e) => setMonto(e.target.value)}
+            placeholder="Monto real"
+            className="w-28 rounded-lg border border-sky-200 bg-white px-2 py-1 text-right text-xs dark:border-sky-900 dark:bg-neutral-950 dark:text-white"
+          />
+          <button
+            onClick={guardar}
+            disabled={guardando}
+            className="rounded-lg bg-sky-600 px-2 py-1 text-[11px] font-semibold text-white transition hover:bg-sky-700 disabled:opacity-60"
+          >
+            {guardando ? "…" : "✓"}
+          </button>
+        </div>
+      </td>
+    </tr>
+  );
 }
 
 function TarjetaLogistica({ uid, nombre, mes, soloFlete }) {
@@ -154,17 +201,19 @@ function TarjetaLogistica({ uid, nombre, mes, soloFlete }) {
               />
             </label>
           )}
-          <label className="text-xs text-slate-600 dark:text-neutral-300">
-            Flete por unidad ($)
-            <input
-              type="number"
-              min="0"
-              step="500"
-              value={tarifaInput}
-              onChange={(e) => setTarifaInput(e.target.value)}
-              className="ml-1.5 w-28 rounded-lg border border-sky-200 bg-white px-2 py-1 text-xs dark:border-sky-900 dark:bg-neutral-950 dark:text-white"
-            />
-          </label>
+          {!resumen.modoFleteManual && (
+            <label className="text-xs text-slate-600 dark:text-neutral-300">
+              Flete por unidad ($)
+              <input
+                type="number"
+                min="0"
+                step="500"
+                value={tarifaInput}
+                onChange={(e) => setTarifaInput(e.target.value)}
+                className="ml-1.5 w-28 rounded-lg border border-sky-200 bg-white px-2 py-1 text-xs dark:border-sky-900 dark:bg-neutral-950 dark:text-white"
+              />
+            </label>
+          )}
           <button
             onClick={guardarTarifas}
             disabled={guardando}
@@ -179,7 +228,11 @@ function TarjetaLogistica({ uid, nombre, mes, soloFlete }) {
         <>
           <div className={`mt-4 grid grid-cols-2 gap-3 ${soloFlete ? "" : "sm:grid-cols-4"}`}>
             <div className="rounded-xl border border-sky-100 bg-white p-3 dark:border-sky-900/50 dark:bg-neutral-900">
-              <p className="text-[11px] text-slate-500 dark:text-neutral-400">Flete ({resumen.unidadesEntregadas ?? 0} bici{(resumen.unidadesEntregadas ?? 0) === 1 ? "" : "s"} × {money(resumen.tarifaFletePorViaje)})</p>
+              <p className="text-[11px] text-slate-500 dark:text-neutral-400">
+                {resumen.modoFleteManual
+                  ? `Flete (${resumen.viajesDetalle.length} viaje${resumen.viajesDetalle.length === 1 ? "" : "s"}, cargado a mano)`
+                  : `Flete (${resumen.unidadesEntregadas ?? 0} bici${(resumen.unidadesEntregadas ?? 0) === 1 ? "" : "s"} × ${money(resumen.tarifaFletePorViaje)})`}
+              </p>
               <p className="mt-1 text-base font-bold text-slate-900 dark:text-white">{money(resumen.fleteTotal)}</p>
             </div>
             {!soloFlete && (
@@ -199,6 +252,31 @@ function TarjetaLogistica({ uid, nombre, mes, soloFlete }) {
               <p className="mt-1 text-base font-bold text-emerald-700 dark:text-emerald-400">{money(resumen.totalACobrar)}</p>
             </div>
           </div>
+
+          {resumen.modoFleteManual && resumen.viajesDetalle.length > 0 && (
+            <div className="mt-4">
+              <p className="mb-2 text-xs font-bold text-sky-800 dark:text-sky-400">
+                🚚 Viajes de este mes — cargá lo que {nombre} cobró por cada uno según su factura real
+              </p>
+              <div className="overflow-x-auto rounded-xl border border-sky-100 dark:border-sky-900/50">
+                <table className="min-w-full divide-y divide-sky-100 text-xs dark:divide-sky-900/50">
+                  <thead className="bg-sky-50/60 dark:bg-sky-950/20">
+                    <tr className="text-left text-slate-500 dark:text-neutral-400">
+                      <th className="px-3 py-2 font-semibold">Fecha</th>
+                      <th className="px-3 py-2 font-semibold">Destino</th>
+                      <th className="px-3 py-2 font-semibold text-right">Bicis</th>
+                      <th className="px-3 py-2 font-semibold text-right">Monto cobrado</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-sky-50 bg-white dark:divide-sky-950/30 dark:bg-neutral-900">
+                    {resumen.viajesDetalle.map((v) => (
+                      <FilaViajeManual key={v.id} uid={uid} viaje={v} onGuardado={cargar} />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
 
           {!soloFlete && resumen.detalle.length > 0 && (
             <div className="mt-4">

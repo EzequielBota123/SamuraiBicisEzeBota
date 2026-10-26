@@ -86,6 +86,7 @@ export default function MiCuentaPage() {
   const cuentaOculta = profile?.ocultarCuentaEnSamurai?.activo === true;
   const history = useHistory();
   const [comprobantes, setComprobantes] = useState([]);
+  const [cobranzas, setCobranzas] = useState([]);
   const [saldoTotal, setSaldoTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -99,17 +100,19 @@ let cancelled = false;
     setError(null);
 
     getClientComprobantes()
-      .then(({ items, saldoTotal }) => {
+      .then(({ items, saldoTotal, cobranzas }) => {
         if (cancelled) return;
         // Mismo ocultamiento visual que en el panel admin — mientras se
         // corrige algo a mano en Contabilium, el cliente tampoco ve el
         // saldo/facturas viejos acá en su propia cuenta.
         if (cuentaOculta) {
           setComprobantes([]);
+          setCobranzas([]);
           setSaldoTotal(0);
           return;
         }
         setComprobantes(items);
+        setCobranzas(cobranzas || []);
         setSaldoTotal(saldoTotal ?? 0);
       })
       .catch((err) => { if (!cancelled) setError(err.message); })
@@ -280,6 +283,53 @@ const detalle = await getComprobanteDetail(c.Id);
               </div>
             </div>
           )}
+
+          {/* Cobranzas: tus pagos, y a qué factura quedó aplicado cada uno */}
+          <div className="mt-8">
+            <h2 className="mb-3 text-lg font-semibold text-slate-900">Cobranzas ({cobranzas.length})</h2>
+            {cobranzas.length === 0 ? (
+              <div className="rounded-2xl border border-slate-200 bg-white py-10 text-center">
+                <p className="text-slate-400">No hay pagos registrados todavía.</p>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {cobranzas.map((c) => (
+                  <div key={c.id} className="rounded-xl border border-sky-100 bg-sky-50/50 px-4 py-3 text-sm">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-mono text-slate-700">Nº {c.numero || c.id}</span>
+                      <span className="text-xs text-slate-400">{fmtDate(c.fecha)}</span>
+                      <span className="font-semibold text-slate-900">{money(c.importeTotal)}</span>
+                    </div>
+                    {c.formasDePago.length > 0 && (
+                      <div className="mt-1.5 flex flex-wrap gap-1.5">
+                        {c.formasDePago.map((f, i) => (
+                          <span key={i} className="inline-flex items-center rounded-lg border border-sky-200 bg-white px-2 py-0.5 text-xs text-sky-700">
+                            {f.FormaDePago}{f.NroReferencia ? ` #${f.NroReferencia}` : ''} — {money(f.Importe)}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {c.esReimputacion && (
+                      <p className="mt-1.5 text-xs font-medium text-amber-700">
+                        ⚠️ Reimputación — aplica un saldo a favor existente, no es un pago nuevo
+                      </p>
+                    )}
+                    {c.detalle.length === 0 ? (
+                      <p className="mt-1.5 text-xs font-medium text-orange-600">🟠 Sin aplicar a ninguna factura todavía (a cuenta)</p>
+                    ) : (
+                      <div className="mt-1.5 flex flex-wrap gap-1.5">
+                        {c.detalle.map((d, i) => (
+                          <span key={i} className="inline-flex items-center rounded-lg border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-xs text-emerald-700">
+                            ✅ Paga {d.numeroFactura || `factura #${d.IDComprobante}`} — {money(d.Importe)}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </>
       )}
     </div>

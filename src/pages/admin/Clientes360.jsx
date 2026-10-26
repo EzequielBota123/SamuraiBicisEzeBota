@@ -14,7 +14,7 @@ import { subscribeBusinessDashboardDetail } from "../../services/comprobantes";
 import { nombreBanco, listaBancos } from "../../services/bancos";
 import { listAuditsByDeposito, getAuditProgramStart, nextAuditDate, isAuditOverdue, isAuditDueSoon, contarVistas } from "../../services/stockAudits";
 import AuditVideoPlayer from "../../components/stock/AuditVideoPlayer";
-import { adminGetClientComprobantes, adminGetClientPhone, adminActualizarTelefonosCliente, adminGetComprobanteDetail, adminDescargarPdfComprobante, getDepositoStockAdmin, adminLinkClientesByCuit, emitirFacturaManual, emitirFacturaVenta, cobrarComprobante, verificarCondicionAfip, subscribeClientesReportDetail, adminAsignarVendedor, searchContabiliumClientes, leerComprobantePagoAdmin, adminListDistribuidoresConEquipo, adminAsignarClienteADistribuidor, adminBuscarClientePorTelefono, cargarCobranzaACuentaManual, listarChequesDisponiblesContabilium, deleteSaleRequest } from "../../services/comprobantes";
+import { adminGetClientComprobantes, adminGetClientPhone, adminActualizarTelefonosCliente, adminGetComprobanteDetail, adminDescargarPdfComprobante, getDepositoStockAdmin, adminLinkClientesByCuit, emitirFacturaManual, emitirFacturaVenta, cobrarComprobante, verificarCondicionAfip, subscribeClientesReportDetail, adminAsignarVendedor, searchContabiliumClientes, leerComprobantePagoAdmin, adminListDistribuidoresConEquipo, adminAsignarClienteADistribuidor, adminBuscarClientePorTelefono, cargarCobranzaACuentaManual, listarChequesDisponiblesContabilium, deleteSaleRequest, listSubcuentasVendedor, facturarSubcuenta, registrarPagoSubcuenta } from "../../services/comprobantes";
 import { limpiarNombreBici, extraerTalle, extraerModelo } from "../../utils/bikeName";
 import { getContabiliumDepositos, labelDeposito } from "../../services/contabiliumDepositos";
 import { addNotaEntrega, subscribeNotasEntregaPorCliente } from "../../services/notasEntrega";
@@ -945,6 +945,15 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
   const [businessDetail, setBusinessDetail] = useState(null); // porFactura con bicis por factura, para el contador de "Bicis vendidas"
   const [error, setError] = useState("");
   const [showCobranzas, setShowCobranzas] = useState(false);
+  // Sub-cuentas propias de este distribuidor (revendedores suyos sin
+  // contabiliumId propio, ej. Stortini → Carhué/Viedma) — null mientras no
+  // se sabe si tiene, [] si no tiene ninguna.
+  const [subcuentas, setSubcuentas] = useState(null);
+  const [subcuentaFacturar, setSubcuentaFacturar] = useState(null); // subcuenta elegida para abrir el modal de facturar
+  const [subcuentaPagoAbierta, setSubcuentaPagoAbierta] = useState(null); // id de la subcuenta con el form de "registrar pago" abierto
+  const [pagoSubcuentaMonto, setPagoSubcuentaMonto] = useState("");
+  const [pagoSubcuentaNota, setPagoSubcuentaNota] = useState("");
+  const [guardandoPagoSubcuenta, setGuardandoPagoSubcuenta] = useState(false);
   const [depositos, setDepositos] = useState([]);
   const [telefono, setTelefono] = useState(undefined); // undefined=cargando, null=no tiene
   const [celular, setCelular] = useState(undefined); // undefined=cargando, null=no tiene
@@ -1007,6 +1016,19 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
   useEffect(() => {
     return subscribeBusinessDashboardDetail(setBusinessDetail);
   }, []);
+
+  useEffect(() => {
+    if (!cliente.id) {
+      setSubcuentas([]);
+      return;
+    }
+    listSubcuentasVendedor(cliente.id)
+      .then((r) => setSubcuentas(r.subcuentas || []))
+      .catch((e) => {
+        console.error("Error cargando subcuentas:", e);
+        setSubcuentas([]);
+      });
+  }, [cliente.id]);
 
   const depositoDeCliente = useMemo(
     () => depositos.find((d) => d.id === cliente.contabiliumDepositoId) || null,
@@ -1695,6 +1717,16 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
   const cantidadFacturas = ocultarCuenta?.activo ? 0 : (comprobantes || []).length;
   const totalCobranzas = ocultarCuenta?.activo ? 0 : cliente.pagado || 0;
   const cobranzasListVisible = ocultarCuenta?.activo ? [] : cliente.cobranzasList || [];
+  // Cobranzas "a cuenta" (sin IDComprobante, o con 0) que todavía no se
+  // aplicaron a ninguna factura puntual — plata real ya cobrada, pero que
+  // todavía no tiene una venta/factura concreta detrás. Mientras no se
+  // facture el modelo correspondiente, esto es justamente lo que explica un
+  // saldo a favor del cliente que no cierra con ninguna factura individual
+  // (caso real detectado 22/10/2026, Stortini).
+  const totalACuentaSinFactura = cobranzasListVisible.reduce((acc, cob) => {
+    const sinAplicar = (cob.detalle || []).filter((d) => !d.IDComprobante);
+    return acc + sinAplicar.reduce((a, d) => a + (Number(d.Importe) || 0), 0);
+  }, 0);
   const stockBicis = (stock || []).filter((s) => (s.category || "").toUpperCase() === "BICICLETAS");
   // stockDisponible ya viene del backend restando las ventas reportadas
   // todavía no facturadas (getPendingSoldBySku) — usarlo acá evita que este
@@ -1704,14 +1736,30 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
   const valorConsignado = stockBicis.reduce((acc, s) => acc + Number(s.stockDisponible ?? s.stockActual ?? 0) * Number(s.priceArs ?? 0), 0);
 
   return (
-    <div className="fixed inset-0 z-[9000] flex items-end justify-center bg-black/50 p-0 sm:items-center sm:p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-[9000] flex items-end justify-center bg-black/50 p-0 backdrop-blur-sm sm:items-center sm:p-4" onClick={onClose}>
       <div
-        className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-t-3xl bg-white p-5 shadow-2xl sm:rounded-3xl dark:bg-neutral-900"
+        className="relative max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-t-3xl bg-white p-5 shadow-2xl sm:rounded-3xl sm:p-6 dark:bg-neutral-900"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex flex-wrap items-start justify-between gap-3">
+        <button
+          onClick={onClose}
+          className="absolute right-4 top-4 z-10 flex h-8 w-8 items-center justify-center rounded-full bg-slate-100 text-slate-500 transition hover:bg-slate-200 hover:text-slate-800 dark:bg-neutral-800 dark:text-neutral-400 dark:hover:bg-neutral-700 dark:hover:text-white"
+        >
+          ✕
+        </button>
+
+        <div className="flex flex-wrap items-start gap-3 pr-10">
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-sky-500 to-indigo-600 text-base font-bold text-white shadow-sm">
+            {(cliente.name || "?")
+              .trim()
+              .split(/\s+/)
+              .slice(0, 2)
+              .map((w) => w[0])
+              .join("")
+              .toUpperCase()}
+          </div>
           <div className="min-w-0 flex-1">
-            <h2 className="text-lg font-bold text-slate-900 dark:text-white">{cliente.name || "Sin nombre"}</h2>
+            <h2 className="truncate text-lg font-bold text-slate-900 dark:text-white">{cliente.name || "Sin nombre"}</h2>
             <p className="text-sm text-slate-500 dark:text-neutral-400">{cliente.cuit || "sin CUIT"}</p>
             {cliente.contabiliumDepositoId != null && (
               <p className="text-xs text-slate-400 dark:text-neutral-500">
@@ -1933,7 +1981,9 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
               )}
             </div>
           </div>
-          <div className="flex w-full flex-wrap items-center justify-end gap-2 sm:w-auto sm:shrink-0">
+        </div>
+
+        <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-100 pt-4 dark:border-neutral-800">
             {!soloLectura && (
               <select
                 value={cliente.vendedor && VENDEDORES.includes(cliente.vendedor) ? cliente.vendedor : ""}
@@ -2036,13 +2086,6 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
                 {ocultarCuenta?.activo ? "👁️ Cuenta oculta" : "🙈 Ocultar cuenta"}
               </button>
             )}
-            <button
-              onClick={onClose}
-              className="rounded-full p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:text-neutral-500 dark:hover:bg-neutral-800 dark:hover:text-neutral-300"
-            >
-              ✕
-            </button>
-          </div>
         </div>
 
         {!soloLectura && cliente.contabiliumId && CONTABILIUM_IDS_CON_RED_VENDEDORES.has(cliente.contabiliumId) && (
@@ -2096,6 +2139,12 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
                     : "Sin saldo pendiente en ningún sentido"
                 }
               />
+              {totalACuentaSinFactura > 0 && (
+                <div className="col-span-full -mt-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/20 dark:text-amber-400">
+                  ⚠️ De ese saldo a favor, <b>{money(totalACuentaSinFactura)}</b> son cobranzas "a cuenta" ya cargadas pero sin factura
+                  vinculada todavía — falta declarar qué modelo/venta corresponde a cada una para que se cierre solo.
+                </div>
+              )}
               <SummaryTile label="Facturas" value={cantidadFacturas} source="Cantidad de facturas, historial completo" />
               <button onClick={() => setShowCobranzas((v) => !v)} className="w-full text-left">
                 <SummaryTile
@@ -2146,6 +2195,121 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
                 })()
               )}
             </div>
+
+            {subcuentas && subcuentas.length > 0 && (
+              <div className="mt-4 rounded-2xl border border-indigo-200 bg-indigo-50 p-4 dark:border-indigo-900/50 dark:bg-indigo-950/20">
+                <p className="mb-2 text-sm font-semibold text-indigo-900 dark:text-indigo-300">
+                  🧑‍🤝‍🧑 Sub-cuentas de {cliente.name} ({subcuentas.length})
+                </p>
+                <p className="mb-3 text-xs text-indigo-700 dark:text-indigo-400">
+                  Revendedores propios de {cliente.name}, sin cliente de Contabilium propio. Lo que se les factura se le factura
+                  en Contabilium a {cliente.name}, pero se descuenta de su stock chico y actualiza su saldo acá abajo.
+                </p>
+                <div className="space-y-2">
+                  {subcuentas.map((sc) => (
+                    <div key={sc.id} className="rounded-xl border border-indigo-200 bg-white px-3 py-2.5 text-sm dark:border-indigo-900/50 dark:bg-neutral-900">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="font-semibold text-slate-900 dark:text-white">{sc.nombre}</span>
+                        <span
+                          className={`text-sm font-bold ${
+                            Number(sc.saldo || 0) > 0 ? "text-rose-600 dark:text-rose-400" : "text-emerald-600 dark:text-emerald-400"
+                          }`}
+                        >
+                          {Number(sc.saldo || 0) > 0 ? "Debe " : "Saldo "}
+                          {money(Math.abs(Number(sc.saldo || 0)))}
+                        </span>
+                      </div>
+                      <div className="mt-1.5 flex flex-wrap gap-1.5">
+                        {(sc.stock || []).length === 0 ? (
+                          <span className="text-xs text-slate-400 dark:text-neutral-500">Sin stock cargado</span>
+                        ) : (
+                          sc.stock.map((it) => (
+                            <span
+                              key={it.sku}
+                              className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600 dark:bg-neutral-800 dark:text-neutral-300"
+                            >
+                              {it.nombre} x{it.cantidad}
+                            </span>
+                          ))
+                        )}
+                      </div>
+                      {!soloLectura && (
+                        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                          <button
+                            onClick={() => setSubcuentaFacturar(sc)}
+                            className="rounded-lg bg-indigo-600 px-2.5 py-1 text-xs font-semibold text-white transition hover:bg-indigo-700"
+                          >
+                            Facturar
+                          </button>
+                          <button
+                            onClick={() => {
+                              setSubcuentaPagoAbierta(subcuentaPagoAbierta === sc.id ? null : sc.id);
+                              setPagoSubcuentaMonto("");
+                              setPagoSubcuentaNota("");
+                            }}
+                            className="rounded-lg border border-indigo-200 px-2.5 py-1 text-xs font-semibold text-indigo-700 transition hover:bg-indigo-50 dark:border-indigo-900/50 dark:text-indigo-400 dark:hover:bg-indigo-950/30"
+                          >
+                            {subcuentaPagoAbierta === sc.id ? "✕ Cancelar" : "Registrar pago"}
+                          </button>
+                        </div>
+                      )}
+                      {subcuentaPagoAbierta === sc.id && (
+                        <div className="mt-2 flex flex-wrap items-end gap-2 rounded-lg border border-indigo-100 bg-indigo-50/50 p-2 dark:border-indigo-900/40 dark:bg-indigo-950/10">
+                          <label className="text-xs">
+                            <span className="block text-slate-500 dark:text-neutral-400">Monto</span>
+                            <input
+                              type="number"
+                              value={pagoSubcuentaMonto}
+                              onChange={(e) => setPagoSubcuentaMonto(e.target.value)}
+                              className="mt-0.5 w-28 rounded-lg border border-slate-200 px-2 py-1 text-sm dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+                            />
+                          </label>
+                          <label className="text-xs">
+                            <span className="block text-slate-500 dark:text-neutral-400">Nota (opcional)</span>
+                            <input
+                              type="text"
+                              value={pagoSubcuentaNota}
+                              onChange={(e) => setPagoSubcuentaNota(e.target.value)}
+                              className="mt-0.5 w-40 rounded-lg border border-slate-200 px-2 py-1 text-sm dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+                            />
+                          </label>
+                          <button
+                            disabled={guardandoPagoSubcuenta || !Number(pagoSubcuentaMonto)}
+                            onClick={async () => {
+                              setGuardandoPagoSubcuenta(true);
+                              try {
+                                const r = await registrarPagoSubcuenta(cliente.id, sc.id, Number(pagoSubcuentaMonto), pagoSubcuentaNota || undefined);
+                                setSubcuentas((prev) => prev.map((x) => (x.id === sc.id ? r.subcuenta : x)));
+                                setSubcuentaPagoAbierta(null);
+                              } catch (e) {
+                                setError(e.message || "No se pudo registrar el pago de la sub-cuenta");
+                              } finally {
+                                setGuardandoPagoSubcuenta(false);
+                              }
+                            }}
+                            className="rounded-lg bg-emerald-600 px-3 py-1 text-xs font-semibold text-white transition hover:bg-emerald-700 disabled:opacity-50"
+                          >
+                            {guardandoPagoSubcuenta ? "Guardando…" : "✓ Guardar pago"}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {subcuentaFacturar && (
+              <FacturarSubcuentaModal
+                vendedorUid={cliente.id}
+                subcuenta={subcuentaFacturar}
+                onClose={() => setSubcuentaFacturar(null)}
+                onDone={(nuevaSub) => {
+                  setSubcuentas((prev) => prev.map((x) => (x.id === nuevaSub.id ? nuevaSub : x)));
+                  setSubcuentaFacturar(null);
+                }}
+              />
+            )}
 
             {showAudits && audits && audits.length > 0 && (
               <div className="mt-3">
@@ -2703,7 +2867,7 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
                                 <button
                                   onClick={() => handleRevisarPago(p, false)}
                                   disabled={revisandoPagoId === p.id}
-                                  className="rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-300"
+                                  className="rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
                                 >
                                   Rechazar
                                 </button>
@@ -4151,6 +4315,124 @@ function ReciboForm({ factura, contabiliumId, clienteName, clienteId, vendedor, 
 
 const TIPO_LABELS = { FCA: "factura A", FCB: "factura B", FCC: "factura C", COT: "cotización", REM: "remito" };
 
+// Modal liviano para facturar contra una sub-cuenta (ej. Carhué/Viedma de
+// Stortini): solo permite elegir cantidades dentro del stock chico ya
+// cargado en la sub-cuenta, no busca en todo el catálogo. La factura real en
+// Contabilium queda a nombre del vendedor (ej. Stortini) — ver
+// adminFacturarSubcuenta en el backend.
+function FacturarSubcuentaModal({ vendedorUid, subcuenta, onClose, onDone }) {
+  const [cantidades, setCantidades] = useState(() =>
+    Object.fromEntries((subcuenta.stock || []).map((it) => [it.sku, 0]))
+  );
+  const [precios, setPrecios] = useState(() => Object.fromEntries((subcuenta.stock || []).map((it) => [it.sku, ""])));
+  const [tipoFc, setTipoFc] = useState("FCA");
+  const [emitting, setEmitting] = useState(false);
+  const [error, setError] = useState("");
+
+  const items = (subcuenta.stock || [])
+    .filter((it) => Number(cantidades[it.sku]) > 0)
+    .map((it) => ({
+      sku: it.sku,
+      descripcion: it.nombre,
+      cantidad: Number(cantidades[it.sku]),
+      precioUnitario: Number(precios[it.sku]) || 0,
+    }));
+  const total = items.reduce((acc, it) => acc + it.cantidad * it.precioUnitario, 0);
+
+  async function handleFacturar() {
+    if (items.length === 0) return;
+    setEmitting(true);
+    setError("");
+    try {
+      const r = await facturarSubcuenta(vendedorUid, subcuenta.id, items, tipoFc);
+      onDone(r.subcuenta);
+    } catch (e) {
+      setError(e.message || "No se pudo facturar");
+    } finally {
+      setEmitting(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-[9300] flex items-end justify-center bg-black/60 p-0 sm:items-center sm:p-4" onClick={onClose}>
+      <div
+        className="relative max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-t-3xl bg-white p-5 shadow-2xl sm:rounded-3xl sm:p-6 dark:bg-neutral-900"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          onClick={onClose}
+          className="absolute right-4 top-4 flex h-8 w-8 items-center justify-center rounded-full bg-slate-100 text-slate-500 transition hover:bg-slate-200 hover:text-slate-800 dark:bg-neutral-800 dark:text-neutral-400 dark:hover:bg-neutral-700 dark:hover:text-white"
+        >
+          ✕
+        </button>
+        <h2 className="pr-10 text-lg font-bold text-slate-900 dark:text-white">Facturar a {subcuenta.nombre}</h2>
+        <p className="mt-1 text-xs text-slate-500 dark:text-neutral-400">
+          Se factura en Contabilium a nombre del vendedor y se descuenta de este stock chico.
+        </p>
+
+        <div className="mt-4 space-y-2">
+          {(subcuenta.stock || []).length === 0 ? (
+            <p className="text-sm text-slate-400 dark:text-neutral-500">Esta sub-cuenta no tiene stock cargado.</p>
+          ) : (
+            subcuenta.stock.map((it) => (
+              <div key={it.sku} className="flex items-center gap-2 rounded-xl border border-slate-200 px-3 py-2 dark:border-neutral-700">
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-medium text-slate-900 dark:text-white">{it.nombre}</p>
+                  <p className="text-xs text-slate-400 dark:text-neutral-500">Disponible: {it.cantidad}</p>
+                </div>
+                <input
+                  type="number"
+                  min={0}
+                  max={it.cantidad}
+                  value={cantidades[it.sku]}
+                  onChange={(e) =>
+                    setCantidades((prev) => ({ ...prev, [it.sku]: Math.max(0, Math.min(it.cantidad, Number(e.target.value) || 0)) }))
+                  }
+                  className="w-16 rounded-lg border border-slate-200 px-2 py-1 text-sm dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+                />
+                <input
+                  type="number"
+                  placeholder="Precio"
+                  value={precios[it.sku]}
+                  onChange={(e) => setPrecios((prev) => ({ ...prev, [it.sku]: e.target.value }))}
+                  className="w-24 rounded-lg border border-slate-200 px-2 py-1 text-sm dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+                />
+              </div>
+            ))
+          )}
+        </div>
+
+        <div className="mt-4 flex items-center gap-3">
+          <label className="text-sm">
+            <span className="mr-2 text-slate-500 dark:text-neutral-400">Tipo</span>
+            <select
+              value={tipoFc}
+              onChange={(e) => setTipoFc(e.target.value)}
+              className="rounded-lg border border-slate-200 px-2 py-1 text-sm dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
+            >
+              <option value="FCA">FCA</option>
+              <option value="FCB">FCB</option>
+              <option value="FCC">FCC</option>
+              <option value="COT">COT</option>
+            </select>
+          </label>
+          <span className="ml-auto text-sm font-semibold text-slate-900 dark:text-white">Total: {money(total)}</span>
+        </div>
+
+        {error && <p className="mt-2 text-sm text-rose-600 dark:text-rose-400">{error}</p>}
+
+        <button
+          onClick={handleFacturar}
+          disabled={emitting || items.length === 0}
+          className="mt-4 w-full rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-700 disabled:opacity-50"
+        >
+          {emitting ? "Facturando…" : "✓ Facturar"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, cuit, clienteId, vendedor, realizadoPor, onClose, initialTipoFc, initialLines }) {
   const [products, setProducts] = useState(null);
   const [stockPorSku, setStockPorSku] = useState(null); // Map sku -> stockDisponible, null = no aplica (sin depósito)
@@ -4773,20 +5055,22 @@ function FacturarModal({ contabiliumId, depositoId, clienteName, condicionIva, c
 
 function SummaryTile({ label, value, accent = "neutral", source, clickable = false }) {
   const colors = {
-    neutral: "text-slate-900 dark:text-white",
-    red: "text-rose-600 dark:text-rose-400",
-    green: "text-emerald-600 dark:text-emerald-400",
-    amber: "text-amber-600 dark:text-amber-400",
-    sky: "text-sky-600 dark:text-sky-400",
+    neutral: { text: "text-slate-900 dark:text-white", bar: "bg-slate-300 dark:bg-neutral-600" },
+    red: { text: "text-rose-600 dark:text-rose-400", bar: "bg-rose-500" },
+    green: { text: "text-emerald-600 dark:text-emerald-400", bar: "bg-emerald-500" },
+    amber: { text: "text-amber-600 dark:text-amber-400", bar: "bg-amber-500" },
+    sky: { text: "text-sky-600 dark:text-sky-400", bar: "bg-sky-500" },
   };
+  const c = colors[accent];
   return (
     <div
-      className={`rounded-2xl border border-slate-200 bg-white p-3 dark:border-neutral-800 dark:bg-neutral-900 ${
-        clickable ? "cursor-pointer transition hover:border-sky-400 dark:hover:border-sky-600" : ""
+      className={`relative overflow-hidden rounded-2xl border border-slate-200 bg-white p-3 pl-4 dark:border-neutral-800 dark:bg-neutral-900 ${
+        clickable ? "cursor-pointer transition hover:-translate-y-0.5 hover:border-sky-400 hover:shadow-md dark:hover:border-sky-600" : ""
       }`}
     >
+      <span className={`absolute left-0 top-0 h-full w-1 ${c.bar}`} />
       <p className="text-xs text-slate-500 dark:text-neutral-400">{label}</p>
-      <p className={`mt-1 text-lg font-bold ${colors[accent]}`}>{value}</p>
+      <p className={`mt-1 text-lg font-bold ${c.text}`}>{value}</p>
       {source && <p className="mt-1 text-[10px] leading-tight text-slate-400 dark:text-neutral-500">{source}</p>}
     </div>
   );

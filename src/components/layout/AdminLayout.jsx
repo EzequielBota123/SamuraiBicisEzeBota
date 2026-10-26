@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import AdminSidebar from "../../components/admin/AdminSidebar";
 import AdminTopbar from "../../components/admin/AdminTopbar";
 
@@ -8,6 +8,21 @@ export default function AdminLayout({ children }) {
   // quien lo prefiera siempre abierto.
   const [collapsed, setCollapsed] = useState(true);
   const [mobileOpen, setMobileOpen] = useState(false);
+
+  // `mobileOpen` (el drawer del hamburger) solo tiene sentido por debajo de
+  // "lg" — si queda en true (ej. se abrió en una ventana angosta) y después
+  // la ventana se agranda a escritorio, AdminSidebar lo toma como "forzar
+  // expandido" y rompe el riel de íconos (muestra texto en un ancho de 88px,
+  // todo cortado). Se resetea solo al cruzar el breakpoint, para que nunca
+  // quede una apertura de mobile "pisando" el layout de escritorio.
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 1024px)");
+    const onChange = (e) => {
+      if (e.matches) setMobileOpen(false);
+    };
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
 
   return (
     <div className="relative min-h-screen overflow-hidden bg-slate-50 text-slate-900 dark:bg-black dark:text-white">
