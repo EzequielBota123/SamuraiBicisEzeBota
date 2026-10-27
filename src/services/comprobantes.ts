@@ -147,6 +147,7 @@ export type FacturaResumen = {
   fecha: string;
   total: number;
   saldo: number;
+  pagada: boolean;
 };
 
 export type BiciResumen = {
@@ -172,6 +173,7 @@ export type VendedorResumen = {
   bicis: BiciResumen[];
   saldoTotal: number | null;
   facturasRecientes: FacturaResumen[];
+  modelosVendidos: Array<{ modelo: string; cantidad: number }>;
   error?: string;
 };
 
@@ -220,12 +222,44 @@ export async function getVendedorResumen(vendedorUid: string): Promise<VendedorR
   return callFunction("getVendedorResumen", { vendedorUid }, 60000);
 }
 
+export type VendedorClienteDetalle = {
+  cliente: {
+    uid: string;
+    name: string;
+    cuit: string | null;
+    contabiliumId: number | null;
+    contabiliumDepositoId: number | null;
+    contabiliumDepositoNombre: string | null;
+  };
+  comprobantes: Array<Record<string, unknown>>;
+  saldoTotal: number;
+  stock: Array<Record<string, unknown>>;
+  audits: Array<Record<string, unknown>>;
+  pagosReportados: Array<Record<string, unknown>>;
+  cheques: Array<Record<string, unknown>>;
+  ventasReportadas: Array<Record<string, unknown>>;
+  cobranzas: Array<Record<string, unknown>>;
+  notasEntrega: Array<Record<string, unknown>>;
+  telefono: string | null;
+  celular: string | null;
+  ciudad: string | null;
+  provincia: string | null;
+};
+
+// Detalle completo de solo lectura de un cliente propio (mismo nivel que
+// Clientes 360, pero el distribuidor no necesita loguearse como admin) —
+// solo funciona si `clienteUid` está en su propio `vendedoresAsignados`.
+export async function getVendedorClienteDetalle(clienteUid: string): Promise<VendedorClienteDetalle> {
+  return callFunction("getVendedorClienteDetalle", { clienteUid }, 60000);
+}
+
 export type DetalleVentaComision = {
   cliente: string;
   modelo: string;
   cantidad: number | null;
   monto: number;
   comision: number;
+  pagada: boolean;
   tipo: "FCA" | "NCA";
   numero: string;
   fecha: string;
@@ -240,6 +274,7 @@ export type ResumenComisionVendedor = {
   fleteTotal: number;
   comisionPorcentaje: number;
   ventasTotal: number;
+  ventasCobradas: number;
   comisionTotal: number;
   totalACobrar: number;
   cantidadClientesAsignados: number;
@@ -270,6 +305,7 @@ export type ClientePanelVendedor = {
   cliente: string;
   stock: number;
   vendido: number;
+  modelos: Array<{ modelo: string; cantidad: number }>;
   pagado: number;
   pendiente: number;
   entregado: number;

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { getMisVendedores, getVendedorResumen } from "../../services/comprobantes";
+import ClienteDetalleCompletoModal from "./ClienteDetalleCompletoModal";
 
 const money = (n) =>
   n == null ? "—" : Number(n).toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 0 });
@@ -26,6 +27,7 @@ export default function ClientesDeDistribuidorPanel({ distribuidorUid }) {
   const [listaError, setListaError] = useState("");
   const [detalles, setDetalles] = useState({}); // uid -> { loading, error, data }
   const [abierto, setAbierto] = useState(null);
+  const [detalleCompleto, setDetalleCompleto] = useState(null); // { uid, nombre } del cliente con el modal de detalle completo abierto
 
   const cargarDetalle = useCallback((uid) => {
     setDetalles((prev) => ({ ...prev, [uid]: { loading: true, error: "", data: prev[uid]?.data || null } }));
@@ -120,6 +122,12 @@ export default function ClientesDeDistribuidorPanel({ distribuidorUid }) {
 
                 {isOpen && d && (
                   <div className="border-t border-slate-100 px-4 py-3 dark:border-neutral-800">
+                    <button
+                      onClick={() => setDetalleCompleto({ uid: v.uid, nombre: v.name || v.depositoNombre })}
+                      className="mb-3 rounded-lg bg-sky-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-sky-700"
+                    >
+                      📋 Ver todo (cobranzas, auditorías, ventas/pagos reportados, etc.)
+                    </button>
                     <p className="mb-2 text-xs font-semibold text-slate-500 dark:text-neutral-400">Bicicletas consignadas</p>
                     {d.bicis.length === 0 ? (
                       <p className="mb-3 text-xs text-slate-400 dark:text-neutral-500">Sin stock.</p>
@@ -134,6 +142,22 @@ export default function ClientesDeDistribuidorPanel({ distribuidorUid }) {
                       </div>
                     )}
 
+                    <p className="mb-2 text-xs font-semibold text-slate-500 dark:text-neutral-400">Vendidas (qué modelo)</p>
+                    {(d.modelosVendidos || []).length === 0 ? (
+                      <p className="mb-3 text-xs text-slate-400 dark:text-neutral-500">Sin ventas.</p>
+                    ) : (
+                      <div className="mb-3 flex flex-wrap gap-1.5">
+                        {d.modelosVendidos.map((m) => (
+                          <span
+                            key={m.modelo}
+                            className="rounded-full bg-sky-50 px-2 py-0.5 text-[11px] text-sky-700 dark:bg-sky-950/30 dark:text-sky-400"
+                          >
+                            {m.modelo} × {m.cantidad}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+
                     <p className="mb-2 text-xs font-semibold text-slate-500 dark:text-neutral-400">Últimas facturas</p>
                     {d.facturasRecientes.length === 0 ? (
                       <p className="text-xs text-slate-400 dark:text-neutral-500">Sin facturas.</p>
@@ -144,11 +168,17 @@ export default function ClientesDeDistribuidorPanel({ distribuidorUid }) {
                             <span className="font-mono text-slate-600 dark:text-neutral-300">
                               {f.numero} · {formatFecha(f.fecha)}
                             </span>
-                            <span className="text-slate-700 dark:text-neutral-300">
-                              {money(f.total)}{" "}
-                              <span className={Number(f.saldo) > 0 ? "font-semibold text-rose-600 dark:text-rose-400" : "text-emerald-600 dark:text-emerald-400"}>
-                                ({money(f.saldo)})
-                              </span>
+                            <span className="flex items-center gap-1.5 text-slate-700 dark:text-neutral-300">
+                              {money(f.total)}
+                              {f.pagada ? (
+                                <span className="rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-400">
+                                  ✓ Pagada
+                                </span>
+                              ) : (
+                                <span className="rounded-full bg-rose-100 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700 dark:bg-rose-950/30 dark:text-rose-400">
+                                  Debe {money(f.saldo)}
+                                </span>
+                              )}
                             </span>
                           </div>
                         ))}
@@ -160,6 +190,14 @@ export default function ClientesDeDistribuidorPanel({ distribuidorUid }) {
             );
           })}
         </div>
+      )}
+
+      {detalleCompleto && (
+        <ClienteDetalleCompletoModal
+          clienteUid={detalleCompleto.uid}
+          nombre={detalleCompleto.nombre}
+          onClose={() => setDetalleCompleto(null)}
+        />
       )}
     </div>
   );

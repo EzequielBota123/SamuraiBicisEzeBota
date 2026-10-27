@@ -8,7 +8,7 @@
 // propio vendedor) y "Cuentas corrientes — Logística" (lo que ve el admin
 // de cualquiera de los 4), para no tener dos lógicas/pantallas distintas
 // dando números distintos.
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { Fragment, useState, useEffect, useCallback, useMemo } from "react";
 import {
   getInformeCompletoVendedor,
   descargarInformeCompletoVendedor,
@@ -54,6 +54,7 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
   const [montoCobradoInput, setMontoCobradoInput] = useState("");
   const [guardandoCobro, setGuardandoCobro] = useState(false);
   const [cerrando, setCerrando] = useState(false);
+  const [clienteModelosAbierto, setClienteModelosAbierto] = useState(null); // nombre del cliente con el desglose de modelos vendidos abierto
 
   const cargar = useCallback(() => {
     setCargando(true);
@@ -438,18 +439,53 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-indigo-50 bg-white dark:divide-indigo-950/30 dark:bg-neutral-900">
-                    {panel.clientes.map((c) => (
-                      <tr key={c.cliente}>
-                        <td className="px-3 py-1.5">{c.cliente}</td>
-                        <td className="px-3 py-1.5 text-right">{c.stock}</td>
-                        <td className="px-3 py-1.5 text-right">{c.vendido}</td>
-                        <td className="px-3 py-1.5 text-right">
-                          {c.pagado}
-                          {c.pendiente > 0 && <span className="ml-1 text-amber-600 dark:text-amber-400">(+{c.pendiente} sin cobrar)</span>}
-                        </td>
-                        <td className="px-3 py-1.5 text-right font-semibold">{c.entregado}</td>
-                      </tr>
-                    ))}
+                    {panel.clientes.map((c) => {
+                      const modelosAbiertos = clienteModelosAbierto === c.cliente;
+                      const tieneModelos = (c.modelos || []).length > 0;
+                      return (
+                        <Fragment key={c.cliente}>
+                          <tr>
+                            <td className="px-3 py-1.5">{c.cliente}</td>
+                            <td className="px-3 py-1.5 text-right">{c.stock}</td>
+                            <td className="px-3 py-1.5 text-right">
+                              {tieneModelos ? (
+                                <button
+                                  type="button"
+                                  onClick={() => setClienteModelosAbierto(modelosAbiertos ? null : c.cliente)}
+                                  className="underline decoration-dotted hover:text-indigo-600 dark:hover:text-indigo-400"
+                                  title="Ver qué modelos vendió"
+                                >
+                                  {c.vendido} {modelosAbiertos ? "▲" : "▾"}
+                                </button>
+                              ) : (
+                                c.vendido
+                              )}
+                            </td>
+                            <td className="px-3 py-1.5 text-right">
+                              {c.pagado}
+                              {c.pendiente > 0 && <span className="ml-1 text-amber-600 dark:text-amber-400">(+{c.pendiente} sin cobrar)</span>}
+                            </td>
+                            <td className="px-3 py-1.5 text-right font-semibold">{c.entregado}</td>
+                          </tr>
+                          {modelosAbiertos && tieneModelos && (
+                            <tr>
+                              <td colSpan={5} className="bg-indigo-50/40 px-3 py-2 dark:bg-indigo-950/10">
+                                <div className="flex flex-wrap gap-1.5">
+                                  {c.modelos.map((m) => (
+                                    <span
+                                      key={m.modelo}
+                                      className="rounded-full bg-white px-2 py-0.5 text-[11px] text-slate-600 shadow-sm dark:bg-neutral-800 dark:text-neutral-300"
+                                    >
+                                      {m.modelo} × {m.cantidad}
+                                    </span>
+                                  ))}
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
+                      );
+                    })}
                   </tbody>
                   <tfoot>
                     <tr className="border-t border-indigo-200 bg-indigo-50/80 font-bold text-slate-900 dark:border-indigo-900 dark:bg-indigo-950/30 dark:text-white">
@@ -484,6 +520,7 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
                         <th className="px-3 py-2 font-semibold">Producto</th>
                         <th className="px-3 py-2 text-right font-semibold">Cant.</th>
                         <th className="px-3 py-2 text-right font-semibold">Monto</th>
+                        <th className="px-3 py-2 text-center font-semibold">Cobrada</th>
                         <th className="px-3 py-2 text-right font-semibold">Comisión</th>
                       </tr>
                     </thead>
@@ -498,7 +535,16 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
                           </td>
                           <td className="px-3 py-1.5 text-right">{v.cantidad ?? "—"}</td>
                           <td className="whitespace-nowrap px-3 py-1.5 text-right">{money(v.monto)}</td>
-                          <td className="whitespace-nowrap px-3 py-1.5 text-right font-semibold">{money(v.comision)}</td>
+                          <td className="whitespace-nowrap px-3 py-1.5 text-center">
+                            {v.pagada ? (
+                              <span className="text-emerald-600 dark:text-emerald-400">✓</span>
+                            ) : (
+                              <span className="text-amber-600 dark:text-amber-400">sin cobrar</span>
+                            )}
+                          </td>
+                          <td className="whitespace-nowrap px-3 py-1.5 text-right font-semibold">
+                            {money(v.comision)}
+                          </td>
                         </tr>
                       ))}
                     </tbody>

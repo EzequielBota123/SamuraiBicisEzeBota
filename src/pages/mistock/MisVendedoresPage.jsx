@@ -137,6 +137,7 @@ function ResumenComision() {
                       <th className="px-3 py-2 font-semibold">Modelo</th>
                       <th className="px-3 py-2 font-semibold">Cant.</th>
                       <th className="px-3 py-2 font-semibold text-right">Monto</th>
+                      <th className="px-3 py-2 font-semibold text-center">Cobrada</th>
                       <th className="px-3 py-2 font-semibold text-right">Comisión</th>
                     </tr>
                   </thead>
@@ -151,7 +152,18 @@ function ResumenComision() {
                         </td>
                         <td className="px-3 py-1.5">{d.cantidad ?? "—"}</td>
                         <td className="whitespace-nowrap px-3 py-1.5 text-right">{money(d.monto)}</td>
-                        <td className="whitespace-nowrap px-3 py-1.5 text-right font-semibold">{money(d.comision)}</td>
+                        <td className="whitespace-nowrap px-3 py-1.5 text-center">
+                          {d.pagada ? (
+                            <span className="text-emerald-600 dark:text-emerald-400">✓</span>
+                          ) : (
+                            <span className="text-amber-600 dark:text-amber-400" title="Reportada pero sin cobrar todavía">
+                              sin cobrar
+                            </span>
+                          )}
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-1.5 text-right font-semibold">
+                          {money(d.comision)}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -161,6 +173,9 @@ function ResumenComision() {
                         Total
                       </td>
                       <td className="whitespace-nowrap px-3 py-2 text-right">{money(resumen.ventasTotal)}</td>
+                      <td className="px-3 py-2 text-center text-[10px] font-normal">
+                        Cobrado: {money(resumen.ventasCobradas)}
+                      </td>
                       <td className="whitespace-nowrap px-3 py-2 text-right">{money(resumen.comisionTotal)}</td>
                     </tr>
                   </tfoot>

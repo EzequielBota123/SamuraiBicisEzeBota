@@ -95,6 +95,21 @@
       "density": "SPARSE_ALL"
     },
     {
+      "collectionGroup": "notasEntrega",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "clienteUid",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ],
+      "density": "SPARSE_ALL"
+    },
+    {
       "collectionGroup": "extractosBancarios",
       "queryScope": "COLLECTION",
       "fields": [

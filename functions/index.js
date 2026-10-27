@@ -2762,6 +2762,7 @@ async function buildVendedorResumen(db, email, apiKey, vendedorUid) {
 
   let saldoTotal = null;
   let facturasRecientes = [];
+  let modelosVendidos = [];
   if (v.contabiliumId) {
     saldoTotal = comprobantesInfo.reduce((acc, c) => {
       const saldoAbs = parseArNumber(c.Saldo);
@@ -2777,7 +2778,32 @@ async function buildVendedorResumen(db, email, apiKey, vendedorUid) {
         fecha: c.FechaEmision,
         total: parseArNumber(c.ImporteTotalNeto),
         saldo: parseArNumber(c.Saldo),
+        pagada: parseArNumber(c.Saldo) === 0,
       }));
+
+    // Qué modelo puntual vendió cada cliente (no solo el total facturado) —
+    // pedido explícito 27/10/2026, para que se vea sin tener que abrir cada
+    // factura una por una.
+    const modelosMap = new Map();
+    const detallesItems = await mapWithConcurrency(comprobantesInfo, 3, async (c) => {
+      try {
+        const full = await getComprobanteById(email, apiKey, c.Id);
+        return { c, items: full?.Items || [] };
+      } catch {
+        return { c, items: [] };
+      }
+    });
+    for (const { c, items } of detallesItems) {
+      const signo = TIPOS_NC_NEGATIVOS.includes(c.TipoFc) ? -1 : 1;
+      for (const it of items) {
+        const modelo = it.Concepto || it.Descripcion || "—";
+        modelosMap.set(modelo, (modelosMap.get(modelo) || 0) + signo * (Number(it.Cantidad) || 0));
+      }
+    }
+    modelosVendidos = Array.from(modelosMap.entries())
+      .filter(([, cantidad]) => cantidad !== 0)
+      .map(([modelo, cantidad]) => ({ modelo, cantidad }))
+      .sort((a, b) => b.cantidad - a.cantidad);
   }
 
   return {
@@ -2788,6 +2814,7 @@ async function buildVendedorResumen(db, email, apiKey, vendedorUid) {
     bicis,
     saldoTotal,
     facturasRecientes,
+    modelosVendidos,
   };
 }
 
@@ -2899,6 +2926,155 @@ exports.getVendedorResumen = onRequest(
       return res.json(resumen);
     } catch (err) {
       console.error("[getVendedorResumen] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Detalle completo de SOLO LECTURA de uno de los clientes propios de un
+// distribuidor con equipo (ej. Cuchi) — mismo nivel de información que ve un
+// admin en Clientes 360 (facturas completas, stock, cobranzas, auditorías,
+// ventas/pagos reportados, notas de entrega, teléfono/ubicación), para que
+// no tenga que salir de su cuenta y loguearse como admin para verlo. El
+// distribuidor solo puede pedir el detalle de un cliente que esté en su
+// propio `vendedoresAsignados` — un admin/chofer puede pedir cualquiera.
+exports.getVendedorClienteDetalle = onRequest(
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 60 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "No autorizado" });
+    let uid;
+    try {
+      uid = (await admin.auth().verifyIdToken(idToken)).uid;
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+
+    try {
+      const { clienteUid } = req.body || {};
+      if (!clienteUid) return res.status(400).json({ error: "Falta clienteUid" });
+
+      const db = admin.firestore();
+      const callerSnap = await db.doc(`users/${uid}`).get();
+      if (!callerSnap.exists) return res.status(404).json({ error: "Usuario no encontrado" });
+      const caller = callerSnap.data();
+      const asignados = Array.isArray(caller.vendedoresAsignados) ? caller.vendedoresAsignados : [];
+      if (!["admin", "chofer"].includes(caller.role) && !asignados.includes(clienteUid)) {
+        return res.status(403).json({ error: "Ese cliente no está en tu lista" });
+      }
+
+      const clienteSnap = await db.doc(`users/${clienteUid}`).get();
+      if (!clienteSnap.exists) return res.status(404).json({ error: "Cliente no encontrado" });
+      const cliente = clienteSnap.data();
+
+      const email = CONTABILIUM_EMAIL.value();
+      const apiKey = CONTABILIUM_API_KEY.value();
+      const cuitDigitos = soloDigitos(cliente.cuit);
+
+      const [
+        comprobantesResult,
+        stockResult,
+        auditsSnap,
+        pagosReportadosSnap,
+        chequesSnap,
+        ventasReportadasSnap,
+        cobranzasSnap,
+        notasEntregaSnap,
+        contactoInfo,
+      ] = await Promise.all([
+        cliente.contabiliumId
+          ? getComprobantesByClientId(email, apiKey, cliente.contabiliumId, { tipos: TIPOS_SALDO_CON_COT }).then(
+              async (rawItemsFull) => {
+                const items = rawItemsFull
+                  .filter((c) => TIPOS_SALDO_CON_COT.includes(c.TipoFc))
+                  .map((c) => {
+                    const saldoAbs = parseArNumber(c.Saldo);
+                    return {
+                      ...c,
+                      Tipo: c.TipoFc,
+                      Fecha: c.FechaEmision,
+                      Total: parseArNumber(c.ImporteTotalNeto),
+                      Saldo: TIPOS_NC_NEGATIVOS.includes(c.TipoFc) ? -saldoAbs : saldoAbs,
+                    };
+                  });
+                const saldoTotal = await computeSaldoTotal(db, cliente.contabiliumId, rawItemsFull);
+                return { items, saldoTotal };
+              }
+            )
+          : Promise.resolve({ items: [], saldoTotal: 0 }),
+        cliente.contabiliumDepositoId != null
+          ? getStockByDepositoWithRetry(email, apiKey, cliente.contabiliumDepositoId).then(async (stockItems) => {
+              const pendingSoldBySku = await getPendingSoldBySku(db, { depositoId: cliente.contabiliumDepositoId });
+              return buildDepositoStockItems(db, email, apiKey, stockItems, { pendingSoldBySku, includeZeroStock: false });
+            })
+          : Promise.resolve([]),
+        cliente.contabiliumDepositoId != null
+          ? db
+              .collection("stockAudits")
+              .where("depositoId", "==", String(cliente.contabiliumDepositoId))
+              .orderBy("createdAt", "desc")
+              .limit(20)
+              .get()
+          : Promise.resolve(null),
+        cliente.contabiliumId
+          ? db.collection("pagosReportados").where("contabiliumId", "==", cliente.contabiliumId).get()
+          : Promise.resolve(null),
+        cliente.contabiliumId
+          ? db.collection("chequesRegistrados").where("contabiliumId", "==", cliente.contabiliumId).get()
+          : Promise.resolve(null),
+        db.collection("saleRequests").where("distributorUid", "==", clienteUid).get(),
+        db.collection("cobranzas").orderBy("fecha", "desc").get(),
+        db.collection("notasEntrega").where("clienteUid", "==", clienteUid).orderBy("createdAt", "desc").get(),
+        cliente.contabiliumId ? getClientById(email, apiKey, cliente.contabiliumId) : Promise.resolve(null),
+      ]);
+
+      const pagosReportados = pagosReportadosSnap
+        ? pagosReportadosSnap.docs
+            .map((d) => ({ id: d.id, ...d.data() }))
+            .sort((a, b) => (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0))
+        : [];
+      const cheques = chequesSnap
+        ? chequesSnap.docs.map((d) => ({ id: d.id, ...d.data() })).sort((a, b) => (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0))
+        : [];
+      const ventasReportadas = ventasReportadasSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      const cobranzasList = cuitDigitos
+        ? cobranzasSnap.docs
+            .map((d) => ({ id: d.id, ...d.data() }))
+            .filter((c) => soloDigitos(c.nroDocumento) === cuitDigitos)
+        : [];
+      const notasEntrega = notasEntregaSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      const audits = auditsSnap ? auditsSnap.docs.map((d) => ({ id: d.id, ...d.data() })) : [];
+
+      return res.json({
+        cliente: {
+          uid: clienteUid,
+          name: cliente.name || cliente.username || "",
+          cuit: cliente.cuit || null,
+          contabiliumId: cliente.contabiliumId || null,
+          contabiliumDepositoId: cliente.contabiliumDepositoId || null,
+          contabiliumDepositoNombre: cliente.contabiliumDepositoNombre || null,
+        },
+        comprobantes: comprobantesResult.items,
+        saldoTotal: comprobantesResult.saldoTotal,
+        stock: stockResult,
+        audits,
+        pagosReportados,
+        cheques,
+        ventasReportadas,
+        cobranzas: cobranzasList,
+        notasEntrega,
+        telefono: contactoInfo?.Telefono || null,
+        celular: contactoInfo?.Celular || null,
+        ciudad: contactoInfo ? limpiarCiudad(contactoInfo.Ciudad) || null : null,
+        provincia: contactoInfo?.Provincia || null,
+      });
+    } catch (err) {
+      console.error("[getVendedorClienteDetalle] error:", err);
       return res.status(500).json({ error: err.message || String(err) });
     }
   }
@@ -3089,6 +3265,11 @@ async function buildResumenComision(db, email, apiKey, webEmail, webPassword, ta
         const signo = TIPOS_NC_NEGATIVOS.includes(c.TipoFc) ? -1 : 1;
         const montoComprobante = parseArNumber(c.ImporteTotalNeto) * signo;
         const nombreCliente = nombrePorContabiliumId.get(c.IdCliente) || c.RazonSocial || "(sin nombre)";
+        // La comisión de Cuchi se gana cuando SE COBRA, no cuando se
+        // factura/reporta la venta (pedido explícito 27/10/2026) — pero el
+        // detalle sigue trayendo TODOS los movimientos igual, para poder ver
+        // quién reportó una venta y todavía no pagó.
+        const pagada = parseArNumber(c.Saldo) === 0;
         const entries = [];
         try {
           const full = await getComprobanteById(email, apiKey, c.Id);
@@ -3101,6 +3282,7 @@ async function buildResumenComision(db, email, apiKey, webEmail, webPassword, ta
               cantidad: Number(it.Cantidad || 0),
               monto: montoItem,
               comision: montoItem * (comisionPorcentaje / 100),
+              pagada,
               tipo: c.TipoFc,
               numero: c.Numero,
               fecha: c.FechaEmision,
@@ -3117,6 +3299,7 @@ async function buildResumenComision(db, email, apiKey, webEmail, webPassword, ta
             cantidad: null,
             monto: montoComprobante,
             comision: montoComprobante * (comisionPorcentaje / 100),
+            pagada,
             tipo: c.TipoFc,
             numero: c.Numero,
             fecha: c.FechaEmision,
@@ -3134,6 +3317,12 @@ async function buildResumenComision(db, email, apiKey, webEmail, webPassword, ta
 
   detalle.sort((a, b) => String(b.fecha || "").localeCompare(String(a.fecha || "")));
 
+  // La comisión se paga sobre TODO lo reportado/facturado, se haya cobrado
+  // o no (revertido 27/10/2026 — el filtro "solo lo cobrado" duplicaba lo
+  // que ya hace `totalCobradoPorVendedor` en el informe completo, que resta
+  // lo que el vendedor ya cobró él mismo del total). `detalle` sigue
+  // trayendo el flag `pagada` por ítem para poder ver quién no pagó.
+  const ventasCobradas = detalle.reduce((acc, d) => acc + (d.pagada ? d.monto : 0), 0);
   const comisionTotal = ventasTotal * (comisionPorcentaje / 100);
   const totalACobrar = fleteTotal + comisionTotal;
 
@@ -3145,6 +3334,7 @@ async function buildResumenComision(db, email, apiKey, webEmail, webPassword, ta
     fleteTotal,
     comisionPorcentaje,
     ventasTotal,
+    ventasCobradas,
     comisionTotal,
     totalACobrar,
     cantidadClientesAsignados: asignados.length,
@@ -3446,20 +3636,29 @@ async function buildPanelClientesVendedor(db, email, apiKey, targetUid, desdeOve
     // criterio que en buildResumenComision, para no tardar tanto en
     // clientes con muchos comprobantes sin arriesgarse a un 429.
     let vendidoCliente = 0, pagadoCliente = 0, cobradoDineroCliente = 0;
+    // Qué modelo puntual es cada bici vendida — no alcanza con el número
+    // total, hay que poder ver de dónde sale (pedido explícito 26/10/2026).
+    const modelosMap = new Map(); // modelo -> cantidad (con NC restando)
     const resultadosComprobantesCliente = await mapWithConcurrency(comprobantes, 3, async (c) => {
       let cant = 0;
+      let items = [];
       try {
         const full = await getComprobanteById(email, apiKey, c.Id);
-        cant = (full?.Items || []).reduce((a, it) => a + (Number(it.Cantidad) || 0), 0);
+        items = full?.Items || [];
+        cant = items.reduce((a, it) => a + (Number(it.Cantidad) || 0), 0);
       } catch (err) {
         console.error("[buildPanelClientesVendedor] detalle comprobante falló", c.Id, err.message);
       }
       await new Promise((r) => setTimeout(r, 40));
-      return { c, cant };
+      return { c, cant, items };
     });
-    for (const { c, cant } of resultadosComprobantesCliente) {
+    for (const { c, cant, items } of resultadosComprobantesCliente) {
       const signo = (c.TipoFc || "").startsWith("NC") ? -1 : 1;
       vendidoCliente += signo * cant;
+      for (const it of items) {
+        const modelo = it.Concepto || it.Descripcion || "—";
+        modelosMap.set(modelo, (modelosMap.get(modelo) || 0) + signo * (Number(it.Cantidad) || 0));
+      }
       const pagoManual = pagosPorNumero[c.Numero];
       if (parseArNumber(c.Saldo) === 0 || numerosConfirmados.has(c.Numero) || pagoManual?.tipo === "completo") {
         pagadoCliente += signo * cant;
@@ -3480,10 +3679,16 @@ async function buildPanelClientesVendedor(db, email, apiKey, targetUid, desdeOve
     totalPagado += pagadoCliente;
     totalCobradoDinero += cobradoDineroCliente;
 
+    const modelos = Array.from(modelosMap.entries())
+      .filter(([, cantidad]) => cantidad !== 0)
+      .map(([modelo, cantidad]) => ({ modelo, cantidad }))
+      .sort((a, b) => b.cantidad - a.cantidad);
+
     resultados.push({
       cliente: cliente.contabiliumDepositoNombre || cliente.name || "(sin nombre)",
       stock: stockTotal,
       vendido: vendidoCliente,
+      modelos,
       pagado: pagadoCliente,
       cobradoDinero: cobradoDineroCliente,
       pendiente: vendidoCliente - pagadoCliente,
@@ -7373,6 +7578,54 @@ exports.listCotizaciones = onRequest(
     } catch (err) {
       console.error("[contabilium] listCotizaciones error:", err);
       return res.status(500).json({ error: String(err) });
+    }
+  }
+);
+
+// Para completar a mano un día de la bitácora "Reporte semanal" que quedó
+// vacío (ej. un día que no se cargó en su momento) — trae, directo de
+// Contabilium/Firestore, lo mismo que ya se carga para los otros días:
+// comprobantes emitidos (facturación) y cobranzas reales (cobrado), ambos
+// con número, cliente y monto. Solo lectura, no inventa nada.
+exports.adminComprobantesYCobranzasPorFecha = onRequest(
+  { cors: false, secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 120 },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { fecha } = req.body || {};
+      if (!fecha || !/^\d{4}-\d{2}-\d{2}$/.test(fecha)) return res.status(400).json({ error: "Falta fecha (YYYY-MM-DD)" });
+
+      const email = CONTABILIUM_EMAIL.value();
+      const apiKey = CONTABILIUM_API_KEY.value();
+      const todos = await getAllComprobantes(email, apiKey, { desde: fecha, hasta: fecha });
+      const comprobantes = todos
+        .filter((c) => ["FCA", "FCB", "FCC", "COT", "NCA", "NCB", "NCC", "NCT"].includes(c.TipoFc))
+        .filter((c) => (c.FechaEmision || "").slice(0, 10) === fecha)
+        .map((c) => ({
+          numero: c.Numero,
+          tipo: c.TipoFc,
+          cliente: c.RazonSocial || "(sin nombre)",
+          monto: parseArNumber(c.ImporteTotalNeto) * (TIPOS_NC_NEGATIVOS.includes(c.TipoFc) ? -1 : 1),
+        }));
+
+      const db = admin.firestore();
+      const cobranzasSnap = await db.collection("cobranzas").get();
+      const cobranzas = cobranzasSnap.docs
+        .map((d) => d.data())
+        .filter((c) => (c.fecha || "").slice(0, 10) === fecha)
+        .map((c) => ({
+          numero: c.numero || "(sin número)",
+          cliente: c.razonSocial || "(sin nombre)",
+          monto: Number(c.importeReal ?? c.importeTotal ?? 0),
+        }));
+
+      return res.json({ fecha, comprobantes, cobranzas });
+    } catch (err) {
+      console.error("[adminComprobantesYCobranzasPorFecha] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
     }
   }
 );

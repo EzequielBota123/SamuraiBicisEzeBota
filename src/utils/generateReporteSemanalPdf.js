@@ -95,8 +95,7 @@ function dibujarDia(doc, dia, { margin, contentW, pageHeight, y }) {
   doc.setFontSize(10.3);
   doc.setTextColor(...INK);
   for (const item of dia.items) {
-    const prefijo = `• [${item.hora}] `;
-    const texto = `${prefijo}${item.texto}`;
+    const texto = `• ${item.texto}`;
     const lineas = doc.splitTextToSize(texto, contentW - 10);
     ensureSpace(lineas.length * 13 + 4);
     doc.text(lineas, margin + 10, y);

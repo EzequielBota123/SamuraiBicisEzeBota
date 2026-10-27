@@ -104,6 +104,14 @@ export default function SaleRequests() {
     loadSinCobrar();
   }, []);
 
+  // Ids de ventas ya facturadas que todavía no tienen cobranza cargada —
+  // mismo cruce que la pestaña "Facturadas sin cobrar", pero acá se usa
+  // para marcar cada ítem en la pestaña "Facturadas" con un aviso de
+  // pagó/no pagó, sin tener que entrar a otra pestaña (pedido explícito
+  // 27/10/2026: "da el aviso de quien pago y quien no asi sabemos a quien
+  // insistir").
+  const idsSinCobrar = useMemo(() => new Set((sinCobrar || []).map((it) => it.id)), [sinCobrar]);
+
   const comprobantesPendientes = useMemo(
     () => (items || []).filter((it) => it.comprobantePagoEstado === "pendiente"),
     [items]
@@ -497,6 +505,11 @@ export default function SaleRequests() {
                     <div className="text-right text-xs text-slate-500 dark:text-neutral-400">
                       <p>{group.items.length} ítem{group.items.length === 1 ? "" : "s"}</p>
                       <p className="font-semibold text-slate-700 dark:text-neutral-300">{money(group.subtotal)}</p>
+                      {tab === "facturado" && sinCobrar !== null && group.items.some((it) => idsSinCobrar.has(it.id)) && (
+                        <p className="font-semibold text-amber-600 dark:text-amber-400">
+                          ⚠️ {group.items.filter((it) => idsSinCobrar.has(it.id)).length} sin cobrar
+                        </p>
+                      )}
                     </div>
                     {tab === "pendiente" && (
                       <button
@@ -538,6 +551,17 @@ export default function SaleRequests() {
                           {it.tipoDocumentoEmitido && (
                             <span className="mt-1 inline-flex items-center rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-400">
                               ✓ {it.tipoDocumentoEmitido === "COT" ? "COT" : "Factura"} emitida automática
+                            </span>
+                          )}
+                          {tab === "facturado" && sinCobrar !== null && (
+                            <span
+                              className={`ml-1 mt-1 inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ${
+                                idsSinCobrar.has(it.id)
+                                  ? "bg-amber-50 text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+                                  : "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-400"
+                              }`}
+                            >
+                              {idsSinCobrar.has(it.id) ? "⚠️ Sin cobrar — insistir" : "✓ Cobrada"}
                             </span>
                           )}
                         </div>
@@ -611,6 +635,17 @@ export default function SaleRequests() {
                           {it.tipoDocumentoEmitido && (
                             <span className="mt-1 inline-flex items-center rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-400">
                               ✓ {it.tipoDocumentoEmitido === "COT" ? "COT" : "Factura"} emitida automática
+                            </span>
+                          )}
+                          {tab === "facturado" && sinCobrar !== null && (
+                            <span
+                              className={`ml-1 mt-1 inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ${
+                                idsSinCobrar.has(it.id)
+                                  ? "bg-amber-50 text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+                                  : "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-400"
+                              }`}
+                            >
+                              {idsSinCobrar.has(it.id) ? "⚠️ Sin cobrar — insistir" : "✓ Cobrada"}
                             </span>
                           )}
                           {it.comprobantePagoEstado === "pendiente" && (

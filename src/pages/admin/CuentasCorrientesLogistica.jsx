@@ -13,6 +13,7 @@ import {
   adminGuardarMontoViajeLogistica,
 } from "../../services/comprobantes";
 import InformeCompletoVendedorPanel from "../../components/admin/InformeCompletoVendedorPanel";
+import CredifinMovimientos from "./movimientos/CredifinMovimientos";
 
 const LOGISTICA = [
   { uid: "KGqXe3UmhqWU3AzNdZA6CobTTS33", nombre: "Cuchi", soloFlete: false },
@@ -99,6 +100,8 @@ function TarjetaLogistica({ uid, nombre, mes, soloFlete }) {
   const [tarifaInput, setTarifaInput] = useState("");
   const [guardando, setGuardando] = useState(false);
   const [verInformeCompleto, setVerInformeCompleto] = useState(false);
+  const [verFacturacionReal, setVerFacturacionReal] = useState(false);
+  const esCredifin = uid === "logistica-credifin";
 
   const cargar = useCallback(() => {
     setCargando(true);
@@ -178,6 +181,18 @@ function TarjetaLogistica({ uid, nombre, mes, soloFlete }) {
               >
                 {verInformeCompleto ? "✕ Cerrar informe completo" : "📦 Informe completo (todo)"}
               </button>
+              {esCredifin && (
+                <button
+                  onClick={() => setVerFacturacionReal((v) => !v)}
+                  className={`rounded-lg border px-3 py-1.5 text-xs font-semibold transition ${
+                    verFacturacionReal
+                      ? "border-amber-600 bg-amber-600 text-white"
+                      : "border-amber-200 bg-white text-amber-700 hover:bg-amber-50 dark:border-amber-900 dark:bg-neutral-900 dark:text-amber-400"
+                  }`}
+                >
+                  {verFacturacionReal ? "✕ Cerrar facturación real" : "🧾 Facturación real de Credifin"}
+                </button>
+              )}
             </>
           )}
         </div>
@@ -240,6 +255,7 @@ function TarjetaLogistica({ uid, nombre, mes, soloFlete }) {
                 <div className="rounded-xl border border-sky-100 bg-white p-3 dark:border-sky-900/50 dark:bg-neutral-900">
                   <p className="text-[11px] text-slate-500 dark:text-neutral-400">Ventas de sus clientes</p>
                   <p className="mt-1 text-base font-bold text-slate-900 dark:text-white">{money(resumen.ventasTotal)}</p>
+                  <p className="text-[11px] text-slate-400 dark:text-neutral-500">De eso, cobrado: {money(resumen.ventasCobradas)}</p>
                 </div>
                 <div className="rounded-xl border border-sky-100 bg-white p-3 dark:border-sky-900/50 dark:bg-neutral-900">
                   <p className="text-[11px] text-slate-500 dark:text-neutral-400">Comisión ({resumen.comisionPorcentaje}%)</p>
@@ -292,6 +308,7 @@ function TarjetaLogistica({ uid, nombre, mes, soloFlete }) {
                       <th className="px-3 py-2 font-semibold">Modelo</th>
                       <th className="px-3 py-2 font-semibold">Cant.</th>
                       <th className="px-3 py-2 font-semibold text-right">Monto</th>
+                      <th className="px-3 py-2 font-semibold text-center">Cobrada</th>
                       <th className="px-3 py-2 font-semibold text-right">Comisión</th>
                     </tr>
                   </thead>
@@ -306,7 +323,16 @@ function TarjetaLogistica({ uid, nombre, mes, soloFlete }) {
                         </td>
                         <td className="px-3 py-1.5">{d.cantidad ?? "—"}</td>
                         <td className="whitespace-nowrap px-3 py-1.5 text-right">{money(d.monto)}</td>
-                        <td className="whitespace-nowrap px-3 py-1.5 text-right font-semibold">{money(d.comision)}</td>
+                        <td className="whitespace-nowrap px-3 py-1.5 text-center">
+                          {d.pagada ? (
+                            <span className="text-emerald-600 dark:text-emerald-400">✓</span>
+                          ) : (
+                            <span className="text-amber-600 dark:text-amber-400">sin cobrar</span>
+                          )}
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-1.5 text-right font-semibold">
+                          {money(d.comision)}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -315,6 +341,12 @@ function TarjetaLogistica({ uid, nombre, mes, soloFlete }) {
             </div>
           )}
         </>
+      )}
+
+      {esCredifin && verFacturacionReal && (
+        <div className="mt-4">
+          <CredifinMovimientos />
+        </div>
       )}
 
       {verInformeCompleto && (

@@ -91,18 +91,29 @@ async function loginCredifinWeb({ email, password }) {
       page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 }).catch(() => {}),
       page.click('button[type="submit"]'),
     ]);
-    await new Promise((r) => setTimeout(r, 1500));
 
     if (/\/login/i.test(page.url())) {
       throw new Error(`El login de Credifin no avanzó, seguimos en ${page.url()}`);
     }
 
-    const token = await page.evaluate(() => localStorage.getItem("token"));
+    // En Cloud Functions (red/CPU más lenta que en local) el token y la
+    // respuesta de /clientes/vinculados pueden tardar bastante más en
+    // aparecer que localmente — se espera activamente en vez de un timeout
+    // fijo corto (visto fallar en producción, 26/10/2026).
+    let token = null;
+    for (let i = 0; i < 20 && !token; i++) {
+      token = await page.evaluate(() => localStorage.getItem("token"));
+      if (!token) await new Promise((r) => setTimeout(r, 500));
+    }
     if (!token) {
       throw new Error("Login OK pero no apareció el token en localStorage — puede haber cambiado el mecanismo.");
     }
 
-    const vinc = apiCalls.find((c) => c.url.includes("/clientes/vinculados"));
+    let vinc = apiCalls.find((c) => c.url.includes("/clientes/vinculados"));
+    for (let i = 0; i < 20 && !vinc; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      vinc = apiCalls.find((c) => c.url.includes("/clientes/vinculados"));
+    }
     if (!vinc) {
       throw new Error("No se capturó la respuesta de /clientes/vinculados — no se pudo resolver el cliente FEPA TOP.");
     }
