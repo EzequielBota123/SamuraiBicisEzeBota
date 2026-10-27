@@ -100,7 +100,6 @@ function TarjetaLogistica({ uid, nombre, mes, soloFlete }) {
   const [tarifaInput, setTarifaInput] = useState("");
   const [guardando, setGuardando] = useState(false);
   const [verInformeCompleto, setVerInformeCompleto] = useState(false);
-  const [verFacturacionReal, setVerFacturacionReal] = useState(false);
   const esCredifin = uid === "logistica-credifin";
 
   const cargar = useCallback(() => {
@@ -181,18 +180,6 @@ function TarjetaLogistica({ uid, nombre, mes, soloFlete }) {
               >
                 {verInformeCompleto ? "✕ Cerrar informe completo" : "📦 Informe completo (todo)"}
               </button>
-              {esCredifin && (
-                <button
-                  onClick={() => setVerFacturacionReal((v) => !v)}
-                  className={`rounded-lg border px-3 py-1.5 text-xs font-semibold transition ${
-                    verFacturacionReal
-                      ? "border-amber-600 bg-amber-600 text-white"
-                      : "border-amber-200 bg-white text-amber-700 hover:bg-amber-50 dark:border-amber-900 dark:bg-neutral-900 dark:text-amber-400"
-                  }`}
-                >
-                  {verFacturacionReal ? "✕ Cerrar facturación real" : "🧾 Facturación real de Credifin"}
-                </button>
-              )}
             </>
           )}
         </div>
@@ -239,7 +226,13 @@ function TarjetaLogistica({ uid, nombre, mes, soloFlete }) {
         </div>
       )}
 
-      {resumen && !cargando && (
+      {esCredifin && !cargando && (
+        <div className="mt-4">
+          <CredifinMovimientos mes={mes} />
+        </div>
+      )}
+
+      {resumen && !cargando && !esCredifin && (
         <>
           <div className={`mt-4 grid grid-cols-2 gap-3 ${soloFlete ? "" : "sm:grid-cols-4"}`}>
             <div className="rounded-xl border border-sky-100 bg-white p-3 dark:border-sky-900/50 dark:bg-neutral-900">
@@ -341,12 +334,6 @@ function TarjetaLogistica({ uid, nombre, mes, soloFlete }) {
             </div>
           )}
         </>
-      )}
-
-      {esCredifin && verFacturacionReal && (
-        <div className="mt-4">
-          <CredifinMovimientos />
-        </div>
       )}
 
       {verInformeCompleto && (

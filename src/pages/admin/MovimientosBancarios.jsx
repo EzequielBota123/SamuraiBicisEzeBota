@@ -6,7 +6,6 @@ import { subscribeCobranzas } from "../../services/cobranzas";
 import ConciliacionBancaria from "./cobranzas/ConciliacionBancaria";
 import MercadoPagoMovimientos from "./movimientos/MercadoPagoMovimientos";
 import GaliciaMovimientos from "./movimientos/GaliciaMovimientos";
-import CredifinMovimientos from "./movimientos/CredifinMovimientos";
 
 function onlyDigits(s) {
   return String(s || "").replace(/\D/g, "");
@@ -17,7 +16,6 @@ const TABS = [
   { id: "galicia", label: "🏦 Banco Galicia", sub: "API (Open Galicia) — QA" },
   { id: "supervielle", label: "🏦 Supervielle", sub: "Extracto manual" },
   { id: "santander", label: "🏦 Santander Río", sub: "Extracto manual" },
-  { id: "credifin", label: "🚚 Credifin", sub: "Cuenta corriente FEPA TOP" },
 ];
 
 // Pantalla central de todos los movimientos bancarios, separada por banco —
@@ -89,8 +87,6 @@ export default function MovimientosBancarios() {
       {tab === "supervielle" && <ConciliacionBancaria cobranzas={cobranzas} bancoFiltro="supervielle" />}
 
       {tab === "santander" && <ConciliacionBancaria cobranzas={cobranzas} bancoFiltro="santander" />}
-
-      {tab === "credifin" && <CredifinMovimientos />}
     </div>
   );
 }

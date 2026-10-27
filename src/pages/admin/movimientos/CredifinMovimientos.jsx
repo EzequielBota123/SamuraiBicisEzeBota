@@ -1,12 +1,9 @@
 // src/pages/admin/movimientos/CredifinMovimientos.jsx
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { credifinGetCtaCte, credifinGetComprobantePdf, getResumenComisionVendedor } from "../../../services/comprobantes";
 
 const money = (n) => Number(n || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 2 });
 
-function mesActual() {
-  return new Date().toISOString().slice(0, 7);
-}
 function rangoDelMes(mes) {
   const [y, m] = mes.split("-").map(Number);
   const desde = `${mes}-01`;
@@ -29,10 +26,11 @@ function descargarBase64Pdf(base64, filename) {
 
 // Credifin factura 3 cosas bien distintas bajo el mismo "Concepto" (visto en
 // vivo, 27/10/2026): entregas a clientes ("Venta Fact. de remitos global" /
-// "Venta ENVIOS DE ART. ESPECIFICOS"), alquiler del depósito + logística de
-// importación —ambas vienen con Concepto "Facturacion Industria..."
-// indistinguibles sin abrir el PDF, así que se agrupan juntas—, y
-// cobranzas/cheques rechazados (no son cargos nuevos, informativo).
+// "Venta ENVIOS DE ART. ESPECIFICOS"), alquiler del depósito + a veces
+// logística de importación —ambas vienen con Concepto "Facturacion
+// Industria..." indistinguibles sin abrir el PDF, así que se agrupan
+// juntas como "Almacenamiento"—, y cobranzas/cheques rechazados
+// (no son cargos nuevos de flete/depósito, informativo).
 function categorizar(concepto) {
   const c = concepto || "";
   if (/remitos global|ENVIOS DE ART/i.test(c)) return "flete";
@@ -42,28 +40,28 @@ function categorizar(concepto) {
   return "otros";
 }
 const CATEGORIAS = {
-  flete: { label: "🚚 Flete (entregas a clientes)", color: "sky" },
-  deposito: { label: "📦 Depósito + importación", color: "amber" },
-  rechazo: { label: "❌ Cheques rechazados", color: "rose" },
-  otros: { label: "❓ Otros", color: "slate" },
+  flete: { label: "🚚 Flete (viajes del mes)" },
+  deposito: { label: "📦 Almacenamiento" },
+  rechazo: { label: "❌ Cheques rechazados" },
+  otros: { label: "❓ Otros" },
 };
 
-// Cuenta corriente real de FEPA TOP en Credifin (la logística que nos
-// factura envíos, depósito e importación) — Credifin no tiene API pública,
-// esto sale de reversar su portal de autogestión (ver
-// credifinWebAutomation.js, 26-27/10/2026). Lee en vivo, categoriza
-// automático por tipo de cargo, y cruza el total de flete contra lo que ya
-// está cargado en Cuentas corrientes → Logística (mismos viajes de
-// Contabilium) para avisar si falta cargar algo ahí.
-export default function CredifinMovimientos() {
-  const [mes, setMes] = useState(mesActual);
+// Reemplaza la carga manual viaje por viaje para Credifin: lee su cuenta
+// corriente en vivo (Credifin no tiene API pública, esto sale de reversar
+// su portal de autogestión, ver credifinWebAutomation.js, 26-27/10/2026),
+// categoriza cada factura automático, y tira directo cuánto hay que
+// pagarle — separado en flete (viajes del mes) y almacenamiento, que son
+// los 2 cargos reales — más un cruce contra lo que ya está cargado en
+// Cuentas corrientes → Logística para detectar si falta algo.
+export default function CredifinMovimientos({ mes }) {
   const [reporte, setReporte] = useState(null);
-  const [cargandoEnSistema, setCargandoEnSistema] = useState(null);
+  const [resumenSistema, setResumenSistema] = useState(null);
   const [cargando, setCargando] = useState(false);
   const [error, setError] = useState("");
   const [descargandoId, setDescargandoId] = useState(null);
 
   async function buscar() {
+    if (!mes) return;
     setCargando(true);
     setError("");
     const { desde, hasta } = rangoDelMes(mes);
@@ -73,13 +71,18 @@ export default function CredifinMovimientos() {
         getResumenComisionVendedor(mes, "logistica-credifin").catch(() => null),
       ]);
       setReporte(r.reporte || []);
-      setCargandoEnSistema(sistema);
+      setResumenSistema(sistema);
     } catch (e) {
       setError(e.message || "No se pudo traer la cuenta corriente de Credifin");
     } finally {
       setCargando(false);
     }
   }
+
+  useEffect(() => {
+    buscar();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mes]);
 
   async function descargarPdf(fila) {
     if (!fila.NroAuxiliar) return;
@@ -102,34 +105,20 @@ export default function CredifinMovimientos() {
   const totalFacturado = Object.values(subtotales).reduce((a, b) => a + b, 0);
   const ultimoSaldo = reporte && reporte.length > 0 ? reporte[reporte.length - 1].Saldo : null;
 
-  const fleteCargadoEnSistema = cargandoEnSistema?.fleteTotal ?? null;
+  const fleteCargadoEnSistema = resumenSistema?.fleteTotal ?? null;
   const diferenciaFlete = fleteCargadoEnSistema != null ? subtotales.flete - fleteCargadoEnSistema : null;
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-end gap-3 rounded-2xl border border-slate-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900">
-        <label className="text-xs text-slate-600 dark:text-neutral-400">
-          Mes
-          <input
-            type="month"
-            value={mes}
-            onChange={(e) => setMes(e.target.value)}
-            className="mt-1 block rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-sm dark:border-neutral-700 dark:bg-neutral-800 dark:text-white"
-          />
-        </label>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-xs font-bold text-sky-800 dark:text-sky-400">🧾 Facturación real de Credifin (en vivo)</p>
         <button
           onClick={buscar}
           disabled={cargando}
-          className="rounded-xl bg-sky-600 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-700 disabled:opacity-60"
+          className="rounded-lg border border-sky-200 bg-white px-3 py-1.5 text-xs font-semibold text-sky-700 transition hover:bg-sky-50 disabled:opacity-60 dark:border-sky-900 dark:bg-neutral-900 dark:text-sky-400"
         >
-          {cargando ? "Buscando…" : "Buscar"}
+          {cargando ? "Actualizando…" : "🔄 Actualizar"}
         </button>
-        {ultimoSaldo != null && (
-          <div className="ml-auto text-right">
-            <p className="text-[11px] text-slate-400 dark:text-neutral-500">Saldo de cuenta (histórico) al cierre del mes</p>
-            <p className="text-lg font-bold text-slate-900 dark:text-white">{money(ultimoSaldo)}</p>
-          </div>
-        )}
       </div>
 
       {error && (
@@ -138,9 +127,7 @@ export default function CredifinMovimientos() {
         </div>
       )}
 
-      {reporte === null && !cargando && (
-        <p className="text-sm text-slate-400 dark:text-neutral-500">Elegí un mes y tocá "Buscar".</p>
-      )}
+      {cargando && reporte === null && <p className="text-sm text-slate-400 dark:text-neutral-500">Leyendo Credifin…</p>}
 
       {reporte && facturas.length === 0 && (
         <p className="text-sm text-slate-400 dark:text-neutral-500">No hay facturas ese mes.</p>
@@ -148,21 +135,44 @@ export default function CredifinMovimientos() {
 
       {reporte && facturas.length > 0 && (
         <>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
-            {Object.entries(CATEGORIAS).map(([key, { label }]) => (
-              <div key={key} className="rounded-2xl border border-slate-200 bg-white p-3 dark:border-neutral-800 dark:bg-neutral-900">
-                <p className="text-[11px] text-slate-500 dark:text-neutral-400">{label}</p>
-                <p className="mt-1 text-sm font-bold text-slate-900 dark:text-white">{money(subtotales[key])}</p>
-              </div>
-            ))}
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <div className="rounded-2xl border border-sky-100 bg-white p-3 dark:border-sky-900/50 dark:bg-neutral-900">
+              <p className="text-[11px] text-slate-500 dark:text-neutral-400">{CATEGORIAS.flete.label}</p>
+              <p className="mt-1 text-lg font-bold text-slate-900 dark:text-white">{money(subtotales.flete)}</p>
+            </div>
+            <div className="rounded-2xl border border-sky-100 bg-white p-3 dark:border-sky-900/50 dark:bg-neutral-900">
+              <p className="text-[11px] text-slate-500 dark:text-neutral-400">{CATEGORIAS.deposito.label}</p>
+              <p className="mt-1 text-lg font-bold text-slate-900 dark:text-white">{money(subtotales.deposito)}</p>
+            </div>
             <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-3 dark:border-emerald-900 dark:bg-emerald-950/20">
-              <p className="text-[11px] text-emerald-700 dark:text-emerald-400">Total facturado este mes</p>
-              <p className="mt-1 text-sm font-bold text-emerald-700 dark:text-emerald-400">{money(totalFacturado)}</p>
+              <p className="text-[11px] text-emerald-700 dark:text-emerald-400">Total a pagar este mes</p>
+              <p className="mt-1 text-lg font-bold text-emerald-700 dark:text-emerald-400">{money(totalFacturado)}</p>
             </div>
           </div>
 
+          {(subtotales.rechazo > 0 || subtotales.otros > 0) && (
+            <div className="flex flex-wrap gap-3 text-xs text-slate-500 dark:text-neutral-400">
+              {subtotales.rechazo > 0 && (
+                <span className="rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1 text-rose-700 dark:border-rose-900 dark:bg-rose-950/20 dark:text-rose-400">
+                  {CATEGORIAS.rechazo.label}: {money(subtotales.rechazo)}
+                </span>
+              )}
+              {subtotales.otros > 0 && (
+                <span className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 dark:border-neutral-700 dark:bg-neutral-900">
+                  {CATEGORIAS.otros.label}: {money(subtotales.otros)}
+                </span>
+              )}
+            </div>
+          )}
+
+          {ultimoSaldo != null && (
+            <p className="text-[11px] text-slate-400 dark:text-neutral-500">
+              Saldo histórico de cuenta al cierre del mes: {money(ultimoSaldo)}
+            </p>
+          )}
+
           <div className="rounded-2xl border border-sky-200 bg-sky-50/60 p-4 dark:border-sky-900 dark:bg-sky-950/10">
-            <p className="text-xs font-bold text-sky-800 dark:text-sky-400">🔄 Cruce contra "Cuentas corrientes — Logística"</p>
+            <p className="text-xs font-bold text-sky-800 dark:text-sky-400">🔄 Cruce contra lo ya cargado en el sistema</p>
             {fleteCargadoEnSistema == null ? (
               <p className="mt-1 text-xs text-slate-500 dark:text-neutral-400">No se pudo traer lo cargado en el sistema para este mes.</p>
             ) : (
@@ -173,7 +183,7 @@ export default function CredifinMovimientos() {
                 </div>
                 <div>
                   <p className="text-[11px] text-slate-500 dark:text-neutral-400">
-                    Flete cargado en el sistema ({cargandoEnSistema.viajesDetalle?.length ?? 0} viaje(s))
+                    Flete ya cargado en el sistema ({resumenSistema.viajesDetalle?.length ?? 0} viaje(s))
                   </p>
                   <p className="text-sm font-bold text-slate-900 dark:text-white">{money(fleteCargadoEnSistema)}</p>
                 </div>
