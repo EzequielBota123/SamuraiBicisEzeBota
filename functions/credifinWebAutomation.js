@@ -219,10 +219,43 @@ async function getComprobantePdfCredifin(db, email, password, comprobantesId) {
   }
 }
 
+// Listado real de envíos (guías) de FEPA TOP — el "Seguí tu envío" del
+// propio portal de Credifin está roto (no dispara ningún pedido sin
+// importar lo que se tipee, confirmado a mano), pero esta API sí funciona:
+// trae código de seguimiento, origen/destino y, cuando ya se facturó, el
+// comprobante real asociado (`relacion_guia_comprobantes.comprobantes_ventas_id`,
+// el mismo id que usa getComprobantePdfCredifin). No hay estado de entrega
+// en este endpoint — Credifin no lo expone acá.
+async function getGuiasCredifin(db, email, password, { page = 1, limit = 50, searchValue = "" } = {}) {
+  async function pedir(token) {
+    const url = `${API_BASE}/guias/${CREDIFIN_IDCLIENTE_FEPA_TOP}?limit=${limit}&page=${page}&searchValue=${encodeURIComponent(searchValue)}&searchedColumn=&sortField=&sortOrder=`;
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (res.status === 401) {
+      const err = new Error("401");
+      err.unauthorized = true;
+      throw err;
+    }
+    if (!res.ok) throw new Error(`Credifin guias respondió ${res.status}`);
+    const json = await res.json();
+    return { guias: json?.data?.guias || [], totalDataSize: json?.data?.totalDataSize ?? null };
+  }
+
+  const token = await getCredifinToken(db, email, password);
+  try {
+    return await pedir(token);
+  } catch (err) {
+    if (!err.unauthorized) throw err;
+    await invalidarCredifinToken(db);
+    const tokenNuevo = await getCredifinToken(db, email, password);
+    return await pedir(tokenNuevo);
+  }
+}
+
 module.exports = {
   CREDIFIN_IDCLIENTE_FEPA_TOP,
   getCredifinToken,
   invalidarCredifinToken,
   getCtaCteCredifin,
   getComprobantePdfCredifin,
+  getGuiasCredifin,
 };

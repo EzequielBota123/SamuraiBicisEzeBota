@@ -12953,3 +12953,31 @@ exports.credifinGetComprobantePdf = onRequest(
     }
   }
 );
+
+// Listado real de envíos (guías) de FEPA TOP en Credifin — el "Seguí tu
+// envío" del propio portal está confirmado roto (no dispara ningún pedido
+// sin importar lo que se tipee), pero esta API funciona: trae código de
+// seguimiento, destinatario y el comprobante real asociado cuando ya se
+// facturó (sin estado de entrega en vivo, Credifin no lo expone acá).
+exports.credifinGetGuias = onRequest(
+  { cors: false, secrets: [CREDIFIN_EMAIL, CREDIFIN_PASSWORD], timeoutSeconds: 120, memory: "1GiB" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const { page, limit, searchValue } = req.body || {};
+      const { getGuiasCredifin } = require("./credifinWebAutomation");
+      const resultado = await getGuiasCredifin(admin.firestore(), CREDIFIN_EMAIL.value(), CREDIFIN_PASSWORD.value(), {
+        page: page ? Number(page) : 1,
+        limit: limit ? Number(limit) : 50,
+        searchValue: searchValue || "",
+      });
+      return res.json(resultado);
+    } catch (err) {
+      console.error("[credifin] credifinGetGuias error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);

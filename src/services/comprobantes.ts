@@ -638,6 +638,27 @@ export async function credifinGetComprobantePdf(comprobantesId: number): Promise
   return callFunction("credifinGetComprobantePdf", { comprobantesId }, 120000);
 }
 
+// Listado real de envíos (guías) de FEPA TOP en Credifin — sin estado de
+// entrega en vivo (Credifin no lo expone en esta API), pero con código de
+// seguimiento y el comprobante real asociado una vez facturado.
+export type CredifinGuia = {
+  id: number;
+  fecha: string;
+  codigo_seguimiento: string;
+  onombre: string;
+  olocalidad: string;
+  dnombre: string;
+  dlocalidad: string;
+  guias_comprobantes: { id: number; guias_id: number; valor: string; conformar: boolean }[];
+  relacion_guia_comprobantes?: { id: number; referencias_id: number; comprobantes_ventas_id: number };
+};
+export async function credifinGetGuias(params: { page?: number; limit?: number; searchValue?: string } = {}): Promise<{
+  guias: CredifinGuia[];
+  totalDataSize: number | null;
+}> {
+  return callFunction("credifinGetGuias", params, 120000);
+}
+
 export async function adminDescargarPdfComprobante(idComprobante: number): Promise<{
   ok: boolean;
   pdfBase64: string | null;

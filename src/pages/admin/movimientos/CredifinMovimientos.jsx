@@ -1,6 +1,6 @@
 // src/pages/admin/movimientos/CredifinMovimientos.jsx
 import { useEffect, useState } from "react";
-import { credifinGetCtaCte, credifinGetComprobantePdf, getResumenComisionVendedor } from "../../../services/comprobantes";
+import { credifinGetCtaCte, credifinGetComprobantePdf, credifinGetGuias, getResumenComisionVendedor } from "../../../services/comprobantes";
 
 const money = (n) => Number(n || 0).toLocaleString("es-AR", { style: "currency", currency: "ARS", maximumFractionDigits: 2 });
 
@@ -60,6 +60,13 @@ export default function CredifinMovimientos({ mes }) {
   const [error, setError] = useState("");
   const [descargandoId, setDescargandoId] = useState(null);
 
+  const [mostrarEnvios, setMostrarEnvios] = useState(false);
+  const [guias, setGuias] = useState(null);
+  const [totalGuias, setTotalGuias] = useState(null);
+  const [paginaGuias, setPaginaGuias] = useState(1);
+  const [cargandoGuias, setCargandoGuias] = useState(false);
+  const [errorGuias, setErrorGuias] = useState("");
+
   async function buscar() {
     if (!mes) return;
     setCargando(true);
@@ -92,6 +99,40 @@ export default function CredifinMovimientos({ mes }) {
       descargarBase64Pdf(r.pdfBase64, `Credifin ${fila.Comprobante || fila.NroAuxiliar}.pdf`);
     } catch (e) {
       setError(e.message || "No se pudo descargar el PDF del comprobante");
+    } finally {
+      setDescargandoId(null);
+    }
+  }
+
+  const LIMIT_GUIAS = 50;
+  async function buscarGuias(pagina) {
+    setCargandoGuias(true);
+    setErrorGuias("");
+    try {
+      const r = await credifinGetGuias({ page: pagina, limit: LIMIT_GUIAS });
+      setGuias((prev) => (pagina === 1 ? r.guias : [...(prev || []), ...r.guias]));
+      setTotalGuias(r.totalDataSize);
+      setPaginaGuias(pagina);
+    } catch (e) {
+      setErrorGuias(e.message || "No se pudieron traer los envíos de Credifin");
+    } finally {
+      setCargandoGuias(false);
+    }
+  }
+
+  function toggleEnvios() {
+    const next = !mostrarEnvios;
+    setMostrarEnvios(next);
+    if (next && guias === null) buscarGuias(1);
+  }
+
+  async function descargarPdfPorComprobante(comprobantesId, label) {
+    setDescargandoId(comprobantesId);
+    try {
+      const r = await credifinGetComprobantePdf(comprobantesId);
+      descargarBase64Pdf(r.pdfBase64, `Credifin ${label || comprobantesId}.pdf`);
+    } catch (e) {
+      setErrorGuias(e.message || "No se pudo descargar el PDF del comprobante");
     } finally {
       setDescargandoId(null);
     }
@@ -236,6 +277,91 @@ export default function CredifinMovimientos({ mes }) {
           </div>
         </>
       )}
+
+      <div className="rounded-2xl border border-slate-200 dark:border-neutral-800">
+        <button
+          onClick={toggleEnvios}
+          className="flex w-full items-center justify-between px-4 py-3 text-left text-xs font-bold text-sky-800 dark:text-sky-400"
+        >
+          <span>📦 Envíos de Credifin{totalGuias != null ? ` (${totalGuias})` : ""}</span>
+          <span className="text-slate-400">{mostrarEnvios ? "▲" : "▼"}</span>
+        </button>
+
+        {mostrarEnvios && (
+          <div className="space-y-3 border-t border-slate-200 px-4 py-3 dark:border-neutral-800">
+            <p className="text-[11px] text-slate-400 dark:text-neutral-500">
+              Código de seguimiento real de cada envío, con link a la factura asociada cuando ya está facturado. Credifin no
+              expone estado de entrega en vivo por esta vía — su buscador "Seguí tu envío" está confirmado roto en el portal.
+            </p>
+
+            {errorGuias && (
+              <div className="rounded-xl border border-rose-300 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-400">
+                {errorGuias}
+              </div>
+            )}
+
+            {cargandoGuias && guias === null && <p className="text-xs text-slate-400 dark:text-neutral-500">Leyendo envíos…</p>}
+
+            {guias && guias.length > 0 && (
+              <>
+                <div className="overflow-x-auto rounded-xl border border-slate-200 dark:border-neutral-800">
+                  <table className="w-full min-w-[800px] text-sm">
+                    <thead className="bg-slate-50 text-left text-xs uppercase text-slate-500 dark:bg-neutral-900 dark:text-neutral-400">
+                      <tr>
+                        <th className="px-3 py-2">Fecha</th>
+                        <th className="px-3 py-2">Código</th>
+                        <th className="px-3 py-2">Remito</th>
+                        <th className="px-3 py-2">Destinatario</th>
+                        <th className="px-3 py-2">Destino</th>
+                        <th className="px-3 py-2"></th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 dark:divide-neutral-800">
+                      {guias.map((g) => {
+                        const idFactura = g.relacion_guia_comprobantes?.comprobantes_ventas_id;
+                        return (
+                          <tr key={g.id} className="hover:bg-slate-50 dark:hover:bg-neutral-900/50">
+                            <td className="whitespace-nowrap px-3 py-2">{g.fecha?.slice(0, 10)}</td>
+                            <td className="px-3 py-2 font-mono text-xs">{g.codigo_seguimiento}</td>
+                            <td className="px-3 py-2 text-xs">{g.guias_comprobantes?.map((c) => c.valor).join(", ") || "—"}</td>
+                            <td className="px-3 py-2 text-xs">{g.dnombre}</td>
+                            <td className="px-3 py-2 text-xs text-slate-500 dark:text-neutral-400">{g.dlocalidad}</td>
+                            <td className="whitespace-nowrap px-3 py-2 text-right">
+                              {idFactura ? (
+                                <button
+                                  onClick={() => descargarPdfPorComprobante(idFactura, g.codigo_seguimiento)}
+                                  disabled={descargandoId === idFactura}
+                                  className="rounded-lg border border-slate-200 px-2 py-1 text-xs font-semibold text-slate-600 hover:border-sky-300 hover:text-sky-700 disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-300"
+                                >
+                                  {descargandoId === idFactura ? "…" : "📄 Factura"}
+                                </button>
+                              ) : (
+                                <span className="text-xs text-slate-400 dark:text-neutral-500">Sin facturar</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                {totalGuias != null && guias.length < totalGuias && (
+                  <button
+                    onClick={() => buscarGuias(paginaGuias + 1)}
+                    disabled={cargandoGuias}
+                    className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:border-sky-300 hover:text-sky-700 disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-300"
+                  >
+                    {cargandoGuias ? "Cargando…" : `Cargar más (${guias.length} de ${totalGuias})`}
+                  </button>
+                )}
+              </>
+            )}
+
+            {guias && guias.length === 0 && <p className="text-xs text-slate-400 dark:text-neutral-500">No hay envíos registrados.</p>}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
