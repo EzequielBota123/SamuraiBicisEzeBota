@@ -659,6 +659,19 @@ export async function credifinGetGuias(params: { page?: number; limit?: number; 
   return callFunction("credifinGetGuias", params, 120000);
 }
 
+// "Gestionar como" desde Clientes 360 — devuelve un custom token de
+// Firebase Auth para loguearse como ese usuario en una pestaña aparte, sin
+// pedir ni ver su contraseña real. Solo admin, nunca contra otra cuenta
+// admin (ver adminCrearSesionImpersonada en functions/index.js).
+export async function adminCrearSesionImpersonada(targetUid: string): Promise<{
+  customToken: string;
+  targetRole: string | null;
+  appSimpleHabilitada: boolean;
+  targetNombre: string | null;
+}> {
+  return callFunction("adminCrearSesionImpersonada", { targetUid }, 30000);
+}
+
 export async function adminDescargarPdfComprobante(idComprobante: number): Promise<{
   ok: boolean;
   pdfBase64: string | null;

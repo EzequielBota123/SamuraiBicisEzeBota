@@ -31,6 +31,7 @@ const StreetHome = lazy(() => import("./pages/mistock/StreetHome"))
 const MiCuentaPage = lazy(() => import("./pages/micuenta/MiCuentaPage"))
 const Login = lazy(() => import("./pages/auth/Login"))
 const ResetPassword = lazy(() => import("./pages/auth/ResetPassword"))
+const ImpersonarPage = lazy(() => import("./pages/admin/ImpersonarPage"))
 
 // ADMIN pages
 const AdminDashboard = lazy(() => import('./pages/admin/AdminDashboard'))
@@ -151,6 +152,7 @@ export default function App() {
               <Route path="/mi-cuenta" component={MiCuentaPage} />
               <Route path="/login" component={Login} />
               <Route path="/reset-password" component={ResetPassword} />
+              <Route path="/impersonar" component={ImpersonarPage} />
             </Switch>
           </Layout>
         )}

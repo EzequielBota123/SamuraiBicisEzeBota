@@ -7522,6 +7522,60 @@ exports.adminActualizarTelefonosCliente = onRequest(
   }
 );
 
+// Para que un admin pueda "entrar como" un cliente/vendedor desde Clientes
+// 360 (ej. Cuchi) y gestionar su cuenta con su propio panel, en vez de tener
+// que pedirle la contraseña o recrear a mano lo que ve. Devuelve un custom
+// token de Firebase Auth que el navegador usa para loguearse como esa
+// cuenta en una pestaña aparte — nunca se devuelve ni se pide la contraseña
+// real. Solo admin (no chofer, aunque pase requireStaff) puede impersonar,
+// y nunca a otra cuenta con rol admin. Pedido explícito 28/10/2026.
+exports.adminCrearSesionImpersonada = onRequest(
+  { cors: false },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const db = admin.firestore();
+      const staffSnap = await db.doc(`users/${staffUid}`).get();
+      if (staffSnap.data()?.role !== "admin") {
+        return res.status(403).json({ error: "Solo un admin puede gestionar como otro usuario" });
+      }
+
+      const { targetUid } = req.body || {};
+      if (!targetUid) return res.status(400).json({ error: "Falta targetUid" });
+
+      const targetSnap = await db.doc(`users/${targetUid}`).get();
+      if (!targetSnap.exists) return res.status(404).json({ error: "Usuario no encontrado" });
+      const target = targetSnap.data();
+      if (target.role === "admin") {
+        return res.status(403).json({ error: "No se puede gestionar como otra cuenta admin" });
+      }
+
+      const customToken = await admin.auth().createCustomToken(targetUid, { impersonadoPor: staffUid });
+      await db.collection("impersonaciones").add({
+        staffUid,
+        staffNombre: staffSnap.data()?.name || null,
+        targetUid,
+        targetNombre: target.name || null,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return res.json({
+        customToken,
+        targetRole: target.role || null,
+        appSimpleHabilitada: target.appSimpleHabilitada === true,
+        targetNombre: target.name || null,
+      });
+    } catch (err) {
+      console.error("[adminCrearSesionImpersonada] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
 // ─────────────────────────────────────────────────────────────
 // Facturas/saldo de CUALQUIER cliente (staff-only) — para el reporte
 // "Clientes 360" del admin. Mismo mapeo de campos que getClientComprobantes.

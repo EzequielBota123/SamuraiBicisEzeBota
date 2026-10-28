@@ -14,6 +14,7 @@ import {
   getAuth,
   setPersistence,
   browserLocalPersistence,
+  browserSessionPersistence,
   onAuthStateChanged,
   onIdTokenChanged,
 } from "firebase/auth";
@@ -35,7 +36,20 @@ const firebaseConfig = {
   messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
 };
 
-export const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
+// "Gestionar como X" (admin entrando como un cliente/vendedor desde
+// Clientes 360, ver ImpersonarPage.jsx) abre una pestaña nueva en
+// /impersonar — necesita loguearse con una identidad DISTINTA a la del
+// admin sin pisarle su sesión, así que en vez de reusar la app/persistencia
+// de siempre (local, compartida entre todas las pestañas por diseño de
+// Firebase) arranca una segunda app con su propia sesión, acotada solo a
+// esa pestaña (sessionStorage) — se pierde sola al cerrarla.
+const esPestanaImpersonada = typeof window !== "undefined" && window.location.pathname.startsWith("/impersonar");
+
+export const app = esPestanaImpersonada
+  ? initializeApp(firebaseConfig, "impersonacion")
+  : getApps().length
+  ? getApp()
+  : initializeApp(firebaseConfig);
 
 // 🔐 App Check
 // En DEV: usá debug token. La primera vez poné `true` para que te lo imprima y registralo en la consola.
@@ -61,7 +75,7 @@ getAppCheckToken(appCheck, true)
 
 // 🔒 Auth con persistencia (misma app en todos lados)
 export const auth = getAuth(app);
-setPersistence(auth, browserLocalPersistence);
+setPersistence(auth, esPestanaImpersonada ? browserSessionPersistence : browserLocalPersistence);
 // @ts-ignore — acceso rápido desde la consola del navegador para diagnósticos puntuales
 window.__auth = auth;
 

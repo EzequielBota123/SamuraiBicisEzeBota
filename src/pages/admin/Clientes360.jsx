@@ -14,7 +14,7 @@ import { subscribeBusinessDashboardDetail } from "../../services/comprobantes";
 import { nombreBanco, listaBancos } from "../../services/bancos";
 import { listAuditsByDeposito, getAuditProgramStart, nextAuditDate, isAuditOverdue, isAuditDueSoon, contarVistas } from "../../services/stockAudits";
 import AuditVideoPlayer from "../../components/stock/AuditVideoPlayer";
-import { adminGetClientComprobantes, adminGetClientPhone, adminActualizarTelefonosCliente, adminGetComprobanteDetail, adminDescargarPdfComprobante, getDepositoStockAdmin, adminLinkClientesByCuit, emitirFacturaManual, emitirFacturaVenta, cobrarComprobante, verificarCondicionAfip, subscribeClientesReportDetail, adminAsignarVendedor, searchContabiliumClientes, leerComprobantePagoAdmin, adminListDistribuidoresConEquipo, adminAsignarClienteADistribuidor, adminBuscarClientePorTelefono, cargarCobranzaACuentaManual, listarChequesDisponiblesContabilium, deleteSaleRequest, listSubcuentasVendedor, facturarSubcuenta, registrarPagoSubcuenta } from "../../services/comprobantes";
+import { adminGetClientComprobantes, adminGetClientPhone, adminActualizarTelefonosCliente, adminGetComprobanteDetail, adminDescargarPdfComprobante, getDepositoStockAdmin, adminLinkClientesByCuit, emitirFacturaManual, emitirFacturaVenta, cobrarComprobante, verificarCondicionAfip, subscribeClientesReportDetail, adminAsignarVendedor, searchContabiliumClientes, leerComprobantePagoAdmin, adminListDistribuidoresConEquipo, adminAsignarClienteADistribuidor, adminBuscarClientePorTelefono, cargarCobranzaACuentaManual, listarChequesDisponiblesContabilium, deleteSaleRequest, listSubcuentasVendedor, facturarSubcuenta, registrarPagoSubcuenta, adminCrearSesionImpersonada } from "../../services/comprobantes";
 import { limpiarNombreBici, extraerTalle, extraerModelo } from "../../utils/bikeName";
 import { getContabiliumDepositos, labelDeposito } from "../../services/contabiliumDepositos";
 import { addNotaEntrega, subscribeNotasEntregaPorCliente } from "../../services/notasEntrega";
@@ -991,6 +991,25 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
   const [notasEntrega, setNotasEntrega] = useState([]);
   const [nuevaNotaChofer, setNuevaNotaChofer] = useState("");
   const [guardandoNotaChofer, setGuardandoNotaChofer] = useState(false);
+  const [gestionandoComo, setGestionandoComo] = useState(false);
+  const [errorGestionarComo, setErrorGestionarComo] = useState("");
+
+  // Abre una pestaña nueva logueada como este cliente/vendedor (ver
+  // ImpersonarPage.jsx) — para gestionarlo con su propio panel tal cual lo
+  // ve él, sin pedirle la contraseña. El custom token es de un solo uso y
+  // expira solo, no queda nada reutilizable dando vueltas.
+  async function handleGestionarComo() {
+    setGestionandoComo(true);
+    setErrorGestionarComo("");
+    try {
+      const r = await adminCrearSesionImpersonada(cliente.id);
+      window.open(`/impersonar?token=${encodeURIComponent(r.customToken)}`, "_blank");
+    } catch (e) {
+      setErrorGestionarComo(e.message || "No se pudo abrir su panel");
+    } finally {
+      setGestionandoComo(false);
+    }
+  }
 
   useEffect(() => {
     getAuditProgramStart().then(setProgramStart).catch(() => setProgramStart(null));
@@ -1759,7 +1778,20 @@ export function ClienteDetalle({ cliente, onClose, soloLectura = false }) {
               .toUpperCase()}
           </div>
           <div className="min-w-0 flex-1">
-            <h2 className="truncate text-lg font-bold text-slate-900 dark:text-white">{cliente.name || "Sin nombre"}</h2>
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="truncate text-lg font-bold text-slate-900 dark:text-white">{cliente.name || "Sin nombre"}</h2>
+              {!soloLectura && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); handleGestionarComo(); }}
+                  disabled={gestionandoComo}
+                  className="shrink-0 rounded-lg border border-sky-200 bg-sky-50 px-2.5 py-1 text-xs font-semibold text-sky-700 transition hover:bg-sky-100 disabled:opacity-60 dark:border-sky-900 dark:bg-sky-950/30 dark:text-sky-400"
+                  title="Abre su panel en una pestaña nueva, logueado como él"
+                >
+                  {gestionandoComo ? "Abriendo…" : "🔑 Gestionar como"}
+                </button>
+              )}
+            </div>
+            {errorGestionarComo && <p className="text-xs text-rose-600 dark:text-rose-400">{errorGestionarComo}</p>}
             <p className="text-sm text-slate-500 dark:text-neutral-400">{cliente.cuit || "sin CUIT"}</p>
             {cliente.contabiliumDepositoId != null && (
               <p className="text-xs text-slate-400 dark:text-neutral-500">
