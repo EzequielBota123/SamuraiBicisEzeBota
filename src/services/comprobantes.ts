@@ -647,6 +647,18 @@ export async function adminDescargarPdfComprobante(idComprobante: number): Promi
   return callFunction("adminDescargarPdfComprobante", { idComprobante }, 60000);
 }
 
+// Igual que la de arriba, pero para que el propio cliente baje el PDF real
+// (con CAE) de UNA DE SUS facturas desde "Mi cuenta" — el backend verifica
+// que esa factura sea suya antes de devolverla.
+export async function clienteDescargarPdfComprobante(idComprobante: number): Promise<{
+  ok: boolean;
+  pdfBase64: string | null;
+  archivo?: string;
+  intentos: any[];
+}> {
+  return callFunction("clienteDescargarPdfComprobante", { idComprobante }, 60000);
+}
+
 // Le pide a Claude que lea una foto de comprobante de pago (ya subida a
 // Storage) y devuelva monto/fecha/banco/referencia — para precargar el
 // formulario de recibo en Clientes 360 sin tipear a mano. El staff siempre

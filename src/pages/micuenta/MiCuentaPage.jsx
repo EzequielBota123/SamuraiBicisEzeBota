@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useHistory } from 'react-router-dom';
 import { useAuth } from '../../auth/AuthContext';
-import { getClientComprobantes, getComprobanteDetail } from '../../services/comprobantes';
+import { getClientComprobantes, getComprobanteDetail, clienteDescargarPdfComprobante } from '../../services/comprobantes';
 import { printComprobante } from '../../utils/printComprobante';
 
 
@@ -127,7 +127,29 @@ let cancelled = false;
   const handlePdf = async (c) => {
     setDownloading(c.Id);
     try {
-const detalle = await getComprobanteDetail(c.Id);
+      // Primero intenta el PDF real de Contabilium (con CAE de AFIP) — si
+      // ningún endpoint candidato funciona, cae al render propio de Samurai
+      // como respaldo, para no dejar al cliente sin nada.
+      try {
+        const pdfResultado = await clienteDescargarPdfComprobante(c.Id);
+        if (pdfResultado.ok && pdfResultado.pdfBase64) {
+          const bytes = atob(pdfResultado.pdfBase64);
+          const arr = new Uint8Array(bytes.length);
+          for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+          const blob = new Blob([arr], { type: 'application/pdf' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `${c.Numero || c.Id}.pdf`;
+          a.click();
+          URL.revokeObjectURL(url);
+          return;
+        }
+        console.warn('[MiCuentaPage] PDF real de Contabilium no disponible, intentos:', pdfResultado.intentos);
+      } catch (e2) {
+        console.warn('[MiCuentaPage] falló la descarga del PDF real, usando el propio de Samurai:', e2.message);
+      }
+      const detalle = await getComprobanteDetail(c.Id);
       printComprobante(detalle);
     } catch (err) {
       alert(`No se pudo obtener el comprobante: ${err.message}`);

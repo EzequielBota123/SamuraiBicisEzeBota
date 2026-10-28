@@ -6087,6 +6087,59 @@ exports.adminRenombrarDeposito = onRequest(
 // endpoints/nombres candidatos (ver obtenerPdfComprobante en
 // contabiliumWebAutomation.js); si ninguno funciona, devuelve el detalle de
 // qué se probó para poder ajustar los candidatos.
+// Para que el propio cliente baje el PDF REAL de Contabilium (con CAE) de
+// una de SUS facturas — hasta ahora "Mi cuenta" solo ofrecía el render
+// propio de Samurai (printComprobante), que no sirve como factura fiscal
+// de verdad. Pedido explícito 28/10/2026 (reclamo de Bicicletas Araoz).
+// Mismo chequeo de pertenencia que getComprobanteDetail.
+exports.clienteDescargarPdfComprobante = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY, CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 120, memory: "1GiB" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "No autorizado" });
+    let uid;
+    try {
+      uid = (await admin.auth().verifyIdToken(idToken)).uid;
+    } catch {
+      return res.status(401).json({ error: "Token inválido" });
+    }
+
+    try {
+      const { idComprobante } = req.body || {};
+      if (!idComprobante) return res.status(400).json({ error: "Falta idComprobante" });
+
+      const db = admin.firestore();
+      const userSnap = await db.doc(`users/${uid}`).get();
+      if (!userSnap.exists) return res.status(404).json({ error: "Usuario no encontrado" });
+      const { contabiliumId } = userSnap.data();
+      if (!contabiliumId) return res.status(400).json({ error: "Usuario sin vinculación Contabilium" });
+
+      const comprobante = await getComprobanteById(CONTABILIUM_EMAIL.value(), CONTABILIUM_API_KEY.value(), Number(idComprobante));
+      if (!comprobante) return res.status(404).json({ error: "Comprobante no encontrado" });
+      if (comprobante.IdCliente !== contabiliumId) {
+        return res.status(403).json({ error: "Acceso denegado" });
+      }
+
+      const { obtenerPdfComprobante } = require("./contabiliumWebAutomation");
+      const resultado = await obtenerPdfComprobante({
+        db,
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+        idComprobante: Number(idComprobante),
+      });
+      return res.json(resultado);
+    } catch (err) {
+      console.error("[clienteDescargarPdfComprobante] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
 exports.adminDescargarPdfComprobante = onRequest(
   { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 120, memory: "1GiB" },
   async (req, res) => {
@@ -7737,6 +7790,117 @@ exports.remitosBicicletasDespachadas = onRequest(
     } catch (err) {
       console.error("[contabilium] remitosBicicletasDespachadas error:", err);
       return res.status(500).json({ error: String(err) });
+    }
+  }
+);
+
+// Diagnóstico (SOLO LECTURA): para cada Nota de Crédito real (NCA/NCB/NCC —
+// contra una factura, no contra un COT) emitida en la empresa, trae su
+// detalle completo (ítems, depósito usado, comprobante original asociado)
+// para poder cruzarlo después contra los movimientos de stock reales
+// (obtenerMovimientosStock) y confirmar si las bicicletas efectivamente
+// volvieron al depósito al anular la factura — pedido 28/10/2026, chequeo
+// general de todos los clientes. Primera pasada: trae el detalle crudo
+// (`raw`) solo de las primeras `muestra` para poder ver qué campos usa
+// Contabilium de verdad (ej. cómo se llama el campo del comprobante
+// asociado) antes de armar el cruce automático.
+exports.diagNotasCreditoStock = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_EMAIL, CONTABILIUM_API_KEY], timeoutSeconds: 540, memory: "1GiB" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const email = CONTABILIUM_EMAIL.value();
+      const apiKey = CONTABILIUM_API_KEY.value();
+      const desde = req.query.desde ? String(req.query.desde) : undefined;
+      const hasta = req.query.hasta ? String(req.query.hasta) : undefined;
+      const muestra = req.query.muestra ? Number(req.query.muestra) : 5;
+      const limit = req.query.limit ? Number(req.query.limit) : 500;
+
+      const all = await getAllComprobantes(email, apiKey, { desde, hasta });
+      const notasCredito = all.filter((c) => ["NCA", "NCB", "NCC"].includes(c.TipoFc)).slice(0, limit);
+
+      let i = 0;
+      const detalles = await mapWithConcurrency(notasCredito, 5, async (nc) => {
+        const idx = i++;
+        try {
+          const full = await getComprobanteById(email, apiKey, nc.Id);
+          const base = {
+            id: nc.Id,
+            numero: nc.Numero,
+            tipo: nc.TipoFc,
+            fecha: nc.FechaEmision,
+            cliente: nc.RazonSocial,
+            idCliente: nc.IdCliente,
+            inventario: full?.Inventario ?? null,
+            idComprobanteAsociado:
+              full?.IdComprobanteAsociado ?? full?.ComprobanteAsociado ?? full?.IdComprobanteOrigen ?? null,
+            items: (full?.Items || []).map((it) => ({
+              sku: it.Codigo,
+              descripcion: it.Concepto || it.Descripcion,
+              cantidad: it.Cantidad,
+            })),
+          };
+          if (idx < muestra) base.raw = full;
+          return base;
+        } catch (err) {
+          return { id: nc.Id, numero: nc.Numero, error: String(err) };
+        }
+      });
+
+      return res.json({ totalNotasCredito: notasCredito.length, totalEnPeriodo: all.filter((c) => ["NCA", "NCB", "NCC"].includes(c.TipoFc)).length, detalles });
+    } catch (err) {
+      console.error("[diagNotasCreditoStock] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
+  }
+);
+
+// Diagnóstico (SOLO LECTURA): trae el historial REAL de movimientos de
+// stock de un depósito puntual (pantalla clásica historicoStock.aspx, vía
+// obtenerHistoricoStockReal) en un rango de fechas — para cruzarlo a mano
+// contra las Notas de Crédito de ese depósito (diagNotasCreditoStock) y
+// confirmar si la mercadería realmente volvió al stock al anular una
+// factura. Recibe el id numérico del depósito (como viene en el campo
+// "Inventario" de un comprobante) y lo resuelve a su nombre real usando
+// internalData/contabiliumDepositos (mismo mapeo que ya usa el resto del
+// sistema) antes de navegar la pantalla clásica.
+exports.diagHistoricoStockDeposito = onRequest(
+  { cors: false, invoker: "public", secrets: [CONTABILIUM_WEB_EMAIL, CONTABILIUM_WEB_PASSWORD], timeoutSeconds: 540, memory: "1GiB" },
+  async (req, res) => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    const staffUid = await requireStaff(req, res);
+    if (!staffUid) return;
+    try {
+      const depositoId = Number(req.query.depositoId);
+      const fechaDesde = req.query.fechaDesde ? String(req.query.fechaDesde) : undefined;
+      const fechaHasta = req.query.fechaHasta ? String(req.query.fechaHasta) : undefined;
+      if (!depositoId) return res.status(400).json({ error: "Falta ?depositoId= (el id numérico, ej. el campo Inventario de un comprobante)" });
+      if (!fechaDesde || !fechaHasta) return res.status(400).json({ error: "Faltan ?fechaDesde= y ?fechaHasta= (DD/MM/YYYY)" });
+
+      const db = admin.firestore();
+      const depositosSnap = await db.doc("internalData/contabiliumDepositos").get();
+      const depositos = depositosSnap.exists ? depositosSnap.data().depositos || [] : [];
+      const depo = depositos.find((d) => d.id === depositoId);
+      if (!depo) return res.status(404).json({ error: `No se encontró el depósito id=${depositoId} en internalData/contabiliumDepositos` });
+
+      const { obtenerHistoricoStockReal } = require("./contabiliumWebAutomation");
+      const resultado = await obtenerHistoricoStockReal({
+        email: CONTABILIUM_WEB_EMAIL.value(),
+        password: CONTABILIUM_WEB_PASSWORD.value(),
+        depositoNombre: depo.nombre,
+        fechaDesde,
+        fechaHasta,
+        leerTodo: true,
+      });
+
+      return res.json({ depositoId, depositoNombre: depo.nombre, ...resultado });
+    } catch (err) {
+      console.error("[diagHistoricoStockDeposito] error:", err);
+      return res.status(500).json({ error: err.message || String(err) });
     }
   }
 );

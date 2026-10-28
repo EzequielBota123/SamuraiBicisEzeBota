@@ -28,6 +28,10 @@ function nombreDiaCorto(fechaISO) {
 // Bitácora de trabajo: anotás en el momento lo que vas haciendo durante el
 // día, se agrupa solo por semana (lunes a domingo), y al cerrar la semana se
 // baja todo junto en PDF — mismo formato que se venía armando a mano.
+function borradorKey(fecha) {
+  return `reporteSemanal_borrador_${fecha}`;
+}
+
 export default function ReporteSemanal() {
   const { user, profile } = useAuth();
   const [inicioSemana, setInicioSemana] = useState(() => lunesDeLaSemana(new Date()));
@@ -36,6 +40,28 @@ export default function ReporteSemanal() {
   const [texto, setTexto] = useState("");
   const [fechaEntrada, setFechaEntrada] = useState(() => toISO(new Date()));
   const [guardando, setGuardando] = useState(false);
+
+  // Mientras se escribe se va guardando un borrador en el navegador, así si
+  // se refresca la página por accidente antes de apretar "Agregar al día"
+  // no se pierde lo tipeado — se restaura solo al volver a entrar.
+  useEffect(() => {
+    let borrador = "";
+    try {
+      borrador = localStorage.getItem(borradorKey(fechaEntrada)) || "";
+    } catch {
+      // localStorage no disponible — se sigue sin borrador
+    }
+    setTexto(borrador);
+  }, [fechaEntrada]);
+
+  useEffect(() => {
+    try {
+      if (texto) localStorage.setItem(borradorKey(fechaEntrada), texto);
+      else localStorage.removeItem(borradorKey(fechaEntrada));
+    } catch {
+      // localStorage no disponible — no es crítico, solo no persiste
+    }
+  }, [texto, fechaEntrada]);
 
   const finSemana = useMemo(() => {
     const d = new Date(inicioSemana);
@@ -81,6 +107,11 @@ export default function ReporteSemanal() {
     setError("");
     try {
       await agregarEntradaReporte(fechaEntrada, texto, profile?.name || user?.email || "Admin");
+      try {
+        localStorage.removeItem(borradorKey(fechaEntrada));
+      } catch {
+        // no crítico
+      }
       setTexto("");
     } catch (err) {
       setError(err.message || String(err));
