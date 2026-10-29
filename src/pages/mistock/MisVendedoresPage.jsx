@@ -427,7 +427,7 @@ export default function MisVendedoresPage() {
 
       <ResumenComision />
 
-      <InformeCompletoVendedorPanel />
+      <InformeCompletoVendedorPanel soloLectura />
 
       <ClientesDeDistribuidorPanel key={refreshKey} />
     </div>

@@ -11,6 +11,11 @@ const TILE_BASE =
 export default function StreetHome() {
   const { profile } = useAuth();
   const tieneEquipo = !!profile?.vendedoresAsignados?.length;
+  // "Mis clientes" también sirve para ver el informe propio (comisión,
+  // flete, ventas) aunque no tenga un equipo de sub-vendedores propio (ej.
+  // Cuchi, que solo tiene depósito propio) — MisVendedoresPage.jsx ya
+  // acepta este caso, antes solo faltaba mostrar el acceso acá.
+  const tieneDepositoPropio = !!profile?.contabiliumDepositoId;
 
   return (
     <div className="mx-auto max-w-3xl px-4 py-8 sm:px-6">
@@ -34,11 +39,13 @@ export default function StreetHome() {
           <p className="text-sm text-slate-600 dark:text-neutral-400">Traer bicis de Lavalle{tieneEquipo ? " o mandarle a un cliente" : ""}.</p>
         </Link>
 
-        {tieneEquipo && (
+        {(tieneEquipo || tieneDepositoPropio) && (
           <Link to="/mis-vendedores" className={`${TILE_BASE} border-emerald-300 bg-emerald-50 dark:border-emerald-800 dark:bg-emerald-950/20`}>
             <span className="text-4xl">👥</span>
-            <p className="mt-2 text-xl font-bold text-slate-900 dark:text-white">Mis clientes</p>
-            <p className="text-sm text-slate-600 dark:text-neutral-400">Tu cartera, con el stock de cada uno.</p>
+            <p className="mt-2 text-xl font-bold text-slate-900 dark:text-white">{tieneEquipo ? "Mis clientes" : "Mi informe"}</p>
+            <p className="text-sm text-slate-600 dark:text-neutral-400">
+              {tieneEquipo ? "Tu cartera, con el stock de cada uno." : "Flete, ventas y comisión — entregado, cobrado y detalle venta por venta."}
+            </p>
           </Link>
         )}
 

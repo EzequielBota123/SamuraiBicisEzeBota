@@ -39,7 +39,11 @@ function formatFechaCorta(s) {
   return d.toLocaleDateString("es-AR", { day: "2-digit", month: "2-digit", year: "2-digit" });
 }
 
-export default function InformeCompletoVendedorPanel({ vendedorUid }) {
+// `soloLectura`: true cuando lo ve el propio vendedor desde su panel (ej.
+// Cuchi en "Mis Vendedores") — mismo informe, mismos números, pero sin las
+// acciones de staff (confirmar/quitar cobro a mano, cerrar liquidación),
+// que el backend igual le rechazaría (requireStaff solo admin/chofer).
+export default function InformeCompletoVendedorPanel({ vendedorUid, soloLectura = false }) {
   const [informe, setInforme] = useState(null);
   const [cargando, setCargando] = useState(true);
   const [error, setError] = useState("");
@@ -175,13 +179,15 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
             >
               {descargando ? "Generando…" : "📥 Descargar Excel"}
             </button>
-            <button
-              onClick={cerrarLiquidacion}
-              disabled={cerrando}
-              className="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-100 disabled:opacity-60 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-400"
-            >
-              {cerrando ? "Cerrando…" : "✅ Cerrar y marcar como pagado"}
-            </button>
+            {!soloLectura && (
+              <button
+                onClick={cerrarLiquidacion}
+                disabled={cerrando}
+                className="rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-100 disabled:opacity-60 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-400"
+              >
+                {cerrando ? "Cerrando…" : "✅ Cerrar y marcar como pagado"}
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -206,13 +212,15 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
                     </span>
                   )}
                 </span>
-                <button
-                  onClick={() => quitarCobro(p.numero)}
-                  disabled={guardandoCobro}
-                  className="text-[11px] text-rose-600 underline hover:text-rose-700 disabled:opacity-50 dark:text-rose-400"
-                >
-                  Quitar
-                </button>
+                {!soloLectura && (
+                  <button
+                    onClick={() => quitarCobro(p.numero)}
+                    disabled={guardandoCobro}
+                    className="text-[11px] text-rose-600 underline hover:text-rose-700 disabled:opacity-50 dark:text-rose-400"
+                  >
+                    Quitar
+                  </button>
+                )}
               </li>
             ))}
           </ul>
@@ -221,7 +229,7 @@ export default function InformeCompletoVendedorPanel({ vendedorUid }) {
 
       {/* Confirmar un cobro nuevo a mano — buscar cliente, elegir la venta,
           cargar cuánto se cobró (completo o parcial). */}
-      {informe && !cargando && (
+      {!soloLectura && informe && !cargando && (
         <div className="mt-3">
           <button
             onClick={() => setVerConfirmarCobro((v) => !v)}
